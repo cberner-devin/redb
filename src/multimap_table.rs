@@ -814,18 +814,26 @@ impl<'a, V: Key + 'static> Iterator for MultimapValue<'a, V> {
     type Item = Result<AccessGuard<'a, V>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // TODO: optimize out this copy
-        let bytes = match self.inner.as_mut().unwrap() {
+        match self.inner.as_mut().unwrap() {
             ValueIterState::Subtree(iter) => match iter.next()? {
-                Ok(e) => e.key_data(),
-                Err(err) => {
-                    return Some(Err(err));
+                Ok(e) => {
+                    let bytes = e.key_data();
+                    self.remaining -= 1;
+                    Some(Ok(AccessGuard::with_owned_value(bytes)))
                 }
+                Err(err) => Some(Err(err)),
             },
-            ValueIterState::InlineLeaf(iter) => iter.next_key()?.to_vec(),
-        };
-        self.remaining -= 1;
-        Some(Ok(AccessGuard::with_owned_value(bytes)))
+            ValueIterState::InlineLeaf(iter) => {
+                let key_bytes = iter.next_key()?;
+                let bytes_vec = key_bytes.to_vec();
+                let bytes_arc: Arc<[u8]> = Arc::from(bytes_vec);
+                self.remaining -= 1;
+                Some(Ok(AccessGuard::with_arc_page(
+                    bytes_arc,
+                    0..key_bytes.len(),
+                )))
+            }
+        }
     }
 }
 
