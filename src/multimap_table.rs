@@ -825,8 +825,7 @@ impl<'a, V: Key + 'static> Iterator for MultimapValue<'a, V> {
             },
             ValueIterState::InlineLeaf(iter) => {
                 let key_bytes = iter.next_key()?;
-                let bytes_vec = key_bytes.to_vec();
-                let bytes_arc: Arc<[u8]> = Arc::from(bytes_vec);
+                let bytes_arc: Arc<[u8]> = key_bytes.to_vec().into();
                 self.remaining -= 1;
                 Some(Ok(AccessGuard::with_arc_page(
                     bytes_arc,
@@ -849,8 +848,7 @@ impl<V: Key + 'static> DoubleEndedIterator for MultimapValue<'_, V> {
             },
             ValueIterState::InlineLeaf(iter) => {
                 let key_bytes = iter.next_key_back()?;
-                let bytes_vec = key_bytes.to_vec();
-                let bytes_arc: Arc<[u8]> = Arc::from(bytes_vec);
+                let bytes_arc: Arc<[u8]> = key_bytes.to_vec().into();
                 Some(Ok(AccessGuard::with_arc_page(
                     bytes_arc,
                     0..key_bytes.len(),
