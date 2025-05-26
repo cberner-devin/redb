@@ -1620,13 +1620,6 @@ impl WriteTransaction {
         // Mark any pending non-durable commits as fully committed.
         self.transaction_tracker.clear_pending_non_durable_commits();
 
-        for page in data_freed_pages {
-            self.mem.free(page, &mut PageTrackerPolicy::Ignore);
-        }
-        for page in system_freed_pages {
-            self.mem.free(page, &mut PageTrackerPolicy::Ignore);
-        }
-
         // Immediately free the pages that were freed from the system-tree. These are only
         // accessed by write transactions, so it's safe to free them as soon as the commit is done.
         for page in current_system_freed_pages.lock().unwrap().drain(..) {
