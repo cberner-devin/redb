@@ -1558,43 +1558,10 @@ impl WriteTransaction {
             .oldest_live_read_transaction()
             .map_or(self.transaction_id, |x| x.next());
 
-        let data_freed_pages = {
-            let mut system_tables = self.system_tables.lock().unwrap();
-            let mut data_freed = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
-            let key = TransactionIdWithPagination {
-                transaction_id: free_until_transaction.raw_id(),
-                pagination_id: 0,
-            };
-            let mut pages_to_free = Vec::new();
-            for entry in data_freed.extract_from_if(..key, |_, _| true)? {
-                let (_, page_list) = entry?;
-                for i in 0..page_list.value().len() {
-                    pages_to_free.push(page_list.value().get(i));
-                }
-            }
-            pages_to_free
-        };
-
-        // Handle system freed tree separately
-        let system_freed_pages = {
-            let mut system_tables = self.system_tables.lock().unwrap();
-            let mut system_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
-            let key = TransactionIdWithPagination {
-                transaction_id: free_until_transaction.raw_id(),
-                pagination_id: 0,
-            };
-            let mut pages_to_free = Vec::new();
-            for entry in system_freed.extract_from_if(..key, |_, _| true)? {
-                let (_, page_list) = entry?;
-                for i in 0..page_list.value().len() {
-                    pages_to_free.push(page_list.value().get(i));
-                }
-            }
-            pages_to_free
-        };
+        self.process_freed_pages(free_until_transaction)?;
 
         let mut system_tables = self.system_tables.lock().unwrap();
-        let current_system_freed_pages = system_tables.system_freed_pages();
+        let system_freed_pages = system_tables.system_freed_pages();
         let system_tree = system_tables.table_tree.flush_table_root_updates()?;
         system_tree
             .delete_table(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
@@ -1616,7 +1583,7 @@ impl WriteTransaction {
                         // free mechanism
                         self.store_system_freed_pages(
                             system_tree_ref,
-                            current_system_freed_pages.clone(),
+                            system_freed_pages.clone(),
                             &mut pagination_counter,
                         )?;
 
@@ -1651,17 +1618,9 @@ impl WriteTransaction {
         // Mark any pending non-durable commits as fully committed.
         self.transaction_tracker.clear_pending_non_durable_commits();
 
-        // in the next transaction
-        for page in data_freed_pages {
-            self.mem.free(page, &mut PageTrackerPolicy::Ignore);
-        }
-        for page in system_freed_pages {
-            self.mem.free(page, &mut PageTrackerPolicy::Ignore);
-        }
-
         // Immediately free the pages that were freed from the system-tree. These are only
         // accessed by write transactions, so it's safe to free them as soon as the commit is done.
-        for page in current_system_freed_pages.lock().unwrap().drain(..) {
+        for page in system_freed_pages.lock().unwrap().drain(..) {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
 
