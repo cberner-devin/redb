@@ -1557,7 +1557,19 @@ impl WriteTransaction {
         let free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
-            .map_or(self.transaction_id.next(), |x| x.next());
+            .map_or_else(
+                || {
+                    let oldest_savepoint = self.transaction_tracker.oldest_savepoint()
+                        .map(|(_, id)| id.raw_id());
+                    
+                    if let Some(oldest_id) = oldest_savepoint {
+                        TransactionId::new(oldest_id)
+                    } else {
+                        self.transaction_id.next()
+                    }
+                },
+                |x| x.next()
+            );
 
         // Free pages from previous transactions before we save the allocator state
         // This ensures the freed pages are available for reuse in the next transaction
