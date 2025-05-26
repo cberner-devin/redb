@@ -1565,7 +1565,6 @@ impl WriteTransaction {
                 transaction_id: free_until_transaction.raw_id(),
                 pagination_id: 0,
             };
-            
             let mut pages_to_free = Vec::new();
             for entry in data_freed.extract_from_if(..key, |_, _| true)? {
                 let (_, page_list) = entry?;
@@ -1584,7 +1583,6 @@ impl WriteTransaction {
                 transaction_id: free_until_transaction.raw_id(),
                 pagination_id: 0,
             };
-            
             let mut pages_to_free = Vec::new();
             for entry in system_freed.extract_from_if(..key, |_, _| true)? {
                 let (_, page_list) = entry?;
@@ -1657,7 +1655,6 @@ impl WriteTransaction {
         for page in data_freed_pages {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
-        
         for page in system_freed_pages {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
