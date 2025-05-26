@@ -1553,14 +1553,17 @@ impl WriteTransaction {
         user_root: Option<BtreeHeader>,
         eventual: bool,
     ) -> Result {
+        // If there are no active read transactions, we can free pages from the current transaction
         let free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
-            .map_or(self.transaction_id, |x| x.next());
+            .map_or(self.transaction_id.next(), |x| x.next());
 
         // Free pages from previous transactions before we save the allocator state
         // This ensures the freed pages are available for reuse in the next transaction
         self.process_freed_pages(free_until_transaction)?;
+
+        self.process_freed_pages(self.transaction_id)?;
 
         let mut system_tables = self.system_tables.lock().unwrap();
         let current_system_freed_pages = system_tables.system_freed_pages();
@@ -1622,9 +1625,21 @@ impl WriteTransaction {
 
         // Immediately free the pages that were freed from the system-tree. These are only
         // accessed by write transactions, so it's safe to free them as soon as the commit is done.
-        for page in current_system_freed_pages.lock().unwrap().drain(..) {
+        let system_freed_pages = current_system_freed_pages
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+
+        // Drop the system_tables lock before calling process_freed_pages
+        drop(system_tables);
+
+        for page in system_freed_pages {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
+
+        // This makes them available for reuse in the next transaction
+        self.process_freed_pages(self.transaction_id)?;
 
         Ok(())
     }
