@@ -1558,40 +1558,9 @@ impl WriteTransaction {
             .oldest_live_read_transaction()
             .map_or(self.transaction_id, |x| x.next());
 
-        let data_freed_pages = {
-            let mut system_tables = self.system_tables.lock().unwrap();
-            let mut data_freed = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
-            let key = TransactionIdWithPagination {
-                transaction_id: free_until_transaction.raw_id(),
-                pagination_id: 0,
-            };
-            let mut pages_to_free = Vec::new();
-            for entry in data_freed.extract_from_if(..key, |_, _| true)? {
-                let (_, page_list) = entry?;
-                for i in 0..page_list.value().len() {
-                    pages_to_free.push(page_list.value().get(i));
-                }
-            }
-            pages_to_free
-        };
-
-        // Handle system freed tree separately
-        let system_freed_pages = {
-            let mut system_tables = self.system_tables.lock().unwrap();
-            let mut system_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
-            let key = TransactionIdWithPagination {
-                transaction_id: free_until_transaction.raw_id(),
-                pagination_id: 0,
-            };
-            let mut pages_to_free = Vec::new();
-            for entry in system_freed.extract_from_if(..key, |_, _| true)? {
-                let (_, page_list) = entry?;
-                for i in 0..page_list.value().len() {
-                    pages_to_free.push(page_list.value().get(i));
-                }
-            }
-            pages_to_free
-        };
+        // Free pages from previous transactions before we save the allocator state
+        // This ensures the freed pages are available for reuse in the next transaction
+        self.process_freed_pages(free_until_transaction)?;
 
         let mut system_tables = self.system_tables.lock().unwrap();
         let current_system_freed_pages = system_tables.system_freed_pages();
