@@ -1553,7 +1553,7 @@ impl WriteTransaction {
         user_root: Option<BtreeHeader>,
         eventual: bool,
     ) -> Result {
-        // If there are no active read transactions, we can free pages from the current transaction
+        // If there are no active read transactions, we can free pages from previous transactions
         let free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
@@ -1562,8 +1562,6 @@ impl WriteTransaction {
         // Free pages from previous transactions before we save the allocator state
         // This ensures the freed pages are available for reuse in the next transaction
         self.process_freed_pages(free_until_transaction)?;
-
-        self.process_freed_pages(self.transaction_id)?;
 
         let mut system_tables = self.system_tables.lock().unwrap();
         let current_system_freed_pages = system_tables.system_freed_pages();
@@ -1637,9 +1635,6 @@ impl WriteTransaction {
         for page in system_freed_pages {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
-
-        // This makes them available for reuse in the next transaction
-        self.process_freed_pages(self.transaction_id)?;
 
         Ok(())
     }
