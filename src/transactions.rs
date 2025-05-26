@@ -1654,7 +1654,6 @@ impl WriteTransaction {
         for page in data_freed_pages {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
-        
         for page in system_freed_pages {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
