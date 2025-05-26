@@ -1556,7 +1556,7 @@ impl WriteTransaction {
         let free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
-            .map_or(self.transaction_id, |x| x.next());
+            .map_or(self.transaction_id.next(), |x| x.next());
         self.process_freed_pages(free_until_transaction)?;
 
         let mut system_tables = self.system_tables.lock().unwrap();
