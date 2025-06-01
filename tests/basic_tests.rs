@@ -886,6 +886,35 @@ fn insert_reserve() {
 }
 
 #[test]
+fn get_mut() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(STR_TABLE).unwrap();
+        assert!(table.insert("hello", "world").unwrap().is_none());
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(STR_TABLE).unwrap();
+    assert_eq!("world", table.get("hello").unwrap().unwrap().value());
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(STR_TABLE).unwrap();
+        let mut value = table.get_mut("hello").unwrap().unwrap();
+        assert_eq!(value.value(), "world");
+        value.insert("replaced");
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(STR_TABLE).unwrap();
+    assert_eq!("replaced", table.get("hello").unwrap().unwrap().value());
+}
+
+#[test]
 fn delete() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();

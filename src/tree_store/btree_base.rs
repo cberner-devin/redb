@@ -2,6 +2,7 @@ use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory
 use crate::tree_store::{PageNumber, PageTrackerPolicy};
 use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{Result, StorageError};
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -246,6 +247,35 @@ impl<V: Value + 'static> Drop for AccessGuard<'_, V> {
             }
         }
     }
+}
+
+pub struct AccessGuardMut<'a, V: Value + 'static> {
+    page: PageMut,
+    offset: usize,
+    len: usize,
+    _value_type: PhantomData<V>,
+    // Used so that logical references into a Table respect the appropriate lifetime
+    _lifetime: PhantomData<&'a ()>,
+}
+
+impl<V: Value + 'static> AccessGuardMut<'_, V> {
+    pub(crate) fn new(page: PageMut, offset: usize, len: usize) -> Self {
+        AccessGuardMut {
+            page,
+            offset,
+            len,
+            _value_type: Default::default(),
+            _lifetime: Default::default(),
+        }
+    }
+
+    /// Access the stored value
+    pub fn value(&self) -> V::SelfType<'_> {
+        V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
+    }
+
+    /// Replace the stored value
+    pub fn insert<'v>(&mut self, value: impl Borrow<V::SelfType<'v>>) -> Result {}
 }
 
 pub struct AccessGuardMutInPlace<'a, V: Value + 'static> {
