@@ -1,6 +1,6 @@
 use crate::db::TransactionGuard;
 use crate::tree_store::btree_base::{
-    BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF, LeafAccessor,
+    AccessGuardMut, MutationPath, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF, LeafAccessor,
     branch_checksum, leaf_checksum,
 };
 use crate::tree_store::btree_iters::BtreeExtractIf;
@@ -494,6 +494,43 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
 
     pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'_, V>>> {
         self.read_tree()?.get(key)
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &K::SelfType<'_>) -> Result<Option<AccessGuardMut<V>>> {
+        if let Some(root) = self.root {
+            let key_bytes = K::as_bytes(key);
+            let query = key_bytes.as_ref();
+            let page_mut = self.mem.get_page_mut(root.root)?;
+            self.get_mut_helper(page_mut, query)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_mut_helper(&mut self, page: PageMut, query: &[u8]) -> Result<Option<AccessGuardMut<V>>> {
+        let node_mem = page.memory();
+        match node_mem[0] {
+            LEAF => {
+                let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+                if let Some(entry_index) = accessor.find_key::<K>(query) {
+                    let (start, end) = accessor.value_range(entry_index).unwrap();
+                    let guard = AccessGuardMut::new(page, start, end - start, entry_index);
+                    Ok(Some(guard))
+                } else {
+                    Ok(None)
+                }
+            }
+            BRANCH => {
+                let child_page = {
+                    let accessor = BranchAccessor::new(&page, K::fixed_width());
+                    let (_, child_page) = accessor.child_for_key::<K>(query);
+                    child_page
+                };
+                let child_page_mut = self.mem.get_page_mut(child_page)?;
+                self.get_mut_helper(child_page_mut, query)
+            }
+            _ => unreachable!(),
+        }
     }
 
     pub(crate) fn first(
