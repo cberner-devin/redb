@@ -298,12 +298,13 @@ pub struct AccessGuardMut<'a, V: Value + 'static> {
     mutation_path: MutationPath,
     mem: Arc<TransactionalMemory>,
     allocated: Arc<Mutex<PageTrackerPolicy>>,
+    root_ref: Option<&'a mut Option<BtreeHeader>>,
     _value_type: PhantomData<V>,
-    // Used so that logical references into a Table respect the appropriate lifetime
     _lifetime: PhantomData<&'a ()>,
 }
 
-impl<V: Value + 'static> AccessGuardMut<'_, V> {
+impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         page: PageMut,
         offset: usize,
@@ -312,6 +313,7 @@ impl<V: Value + 'static> AccessGuardMut<'_, V> {
         mutation_path: MutationPath,
         mem: Arc<TransactionalMemory>,
         allocated: Arc<Mutex<PageTrackerPolicy>>,
+        root_ref: Option<&'a mut Option<BtreeHeader>>,
     ) -> Self {
         AccessGuardMut {
             page,
@@ -321,6 +323,7 @@ impl<V: Value + 'static> AccessGuardMut<'_, V> {
             mutation_path,
             mem,
             allocated,
+            root_ref,
             _value_type: Default::default(),
             _lifetime: Default::default(),
         }
@@ -391,10 +394,47 @@ impl<V: Value + 'static> AccessGuardMut<'_, V> {
 
             let new_page = builder.build()?;
 
-            Err(StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Parent branch page updates not yet implemented for larger values",
-            )))
+            // Calculate checksum for the new leaf page
+            let new_checksum =
+                leaf_checksum(&new_page, self.mutation_path.key_width, V::fixed_width())?;
+
+            // Update parent branch page if it exists, otherwise update root
+            if self.mutation_path.pages.len() > 1 {
+                let parent_page_number =
+                    self.mutation_path.pages[self.mutation_path.pages.len() - 2];
+                let parent_entry_index =
+                    self.mutation_path.indices[self.mutation_path.indices.len() - 2];
+
+                let mut parent_page = self.mem.get_page_mut(parent_page_number)?;
+                let mut mutator = BranchMutator::new(&mut parent_page);
+                mutator.write_child_page(
+                    parent_entry_index,
+                    new_page.get_page_number(),
+                    new_checksum,
+                );
+            } else if let Some(root_ref) = &mut self.root_ref {
+                // Update root reference for single-page tree
+                let current_length = root_ref.as_ref().map_or(0, |h| h.length);
+                **root_ref = Some(BtreeHeader::new(
+                    new_page.get_page_number(),
+                    new_checksum,
+                    current_length,
+                ));
+            }
+
+            // Update our page reference to the new page and recalculate offset/length
+            let new_accessor = LeafAccessor::new(
+                new_page.memory(),
+                self.mutation_path.key_width,
+                V::fixed_width(),
+            );
+            let (new_start, new_end) = new_accessor.value_range(self.entry_index).unwrap();
+
+            self.page = new_page;
+            self.offset = new_start;
+            self.len = new_end - new_start;
+
+            Ok(())
         }
     }
 }

@@ -533,6 +533,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
                         path,
                         self.mem.clone(),
                         self.allocated_pages.clone(),
+                        Some(&mut self.root),
                     );
                     Ok(Some(guard))
                 } else {
