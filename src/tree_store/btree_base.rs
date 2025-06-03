@@ -249,56 +249,23 @@ impl<V: Value + 'static> Drop for AccessGuard<'_, V> {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct MutationPath {
-    pages: Vec<PageNumber>,
-    indices: Vec<usize>,
-}
 
-impl MutationPath {
-    pub(crate) fn new() -> Self {
-        Self {
-            pages: Vec::new(),
-            indices: Vec::new(),
-        }
-    }
-
-    pub(crate) fn push_branch(&mut self, page: PageNumber, child_index: usize) {
-        self.pages.push(page);
-        self.indices.push(child_index);
-    }
-
-    pub(crate) fn push_leaf(&mut self, page: PageNumber, entry_index: usize) {
-        self.pages.push(page);
-        self.indices.push(entry_index);
-    }
-
-    pub(crate) fn leaf_page(&self) -> PageNumber {
-        *self.pages.last().expect("Path should have at least one page")
-    }
-
-    pub(crate) fn leaf_entry_index(&self) -> usize {
-        *self.indices.last().expect("Path should have at least one index")
-    }
-}
 
 pub struct AccessGuardMut<'a, V: Value + 'static> {
     page: PageMut,
     offset: usize,
     len: usize,
-    entry_index: usize,
     _value_type: PhantomData<V>,
     // Used so that logical references into a Table respect the appropriate lifetime
     _lifetime: PhantomData<&'a ()>,
 }
 
 impl<V: Value + 'static> AccessGuardMut<'_, V> {
-    pub(crate) fn new(page: PageMut, offset: usize, len: usize, entry_index: usize) -> Self {
+    pub(crate) fn new(page: PageMut, offset: usize, len: usize) -> Self {
         AccessGuardMut {
             page,
             offset,
             len,
-            entry_index,
             _value_type: Default::default(),
             _lifetime: Default::default(),
         }

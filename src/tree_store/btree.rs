@@ -1,6 +1,6 @@
 use crate::db::TransactionGuard;
 use crate::tree_store::btree_base::{
-    AccessGuardMut, MutationPath, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF, LeafAccessor,
+    AccessGuardMut, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF, LeafAccessor,
     branch_checksum, leaf_checksum,
 };
 use crate::tree_store::btree_iters::BtreeExtractIf;
@@ -514,7 +514,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 if let Some(entry_index) = accessor.find_key::<K>(query) {
                     let (start, end) = accessor.value_range(entry_index).unwrap();
-                    let guard = AccessGuardMut::new(page, start, end - start, entry_index);
+                    let guard = AccessGuardMut::new(page, start, end - start);
                     Ok(Some(guard))
                 } else {
                     Ok(None)
