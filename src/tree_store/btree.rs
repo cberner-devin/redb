@@ -1,7 +1,7 @@
 use crate::db::TransactionGuard;
 use crate::tree_store::btree_base::{
-    AccessGuardMut, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF, LeafAccessor,
-    branch_checksum, leaf_checksum,
+    AccessGuardMut, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF,
+    LeafAccessor, MutationPath, branch_checksum, leaf_checksum,
 };
 use crate::tree_store::btree_iters::BtreeExtractIf;
 use crate::tree_store::btree_mutator::MutateHelper;
@@ -508,13 +508,24 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
     }
 
     fn get_mut_helper(&mut self, page: PageMut, query: &[u8]) -> Result<Option<AccessGuardMut<V>>> {
+        self.get_mut_helper_with_path(page, query, MutationPath::new(K::fixed_width()))
+    }
+
+    fn get_mut_helper_with_path(
+        &mut self,
+        page: PageMut,
+        query: &[u8],
+        mut path: MutationPath,
+    ) -> Result<Option<AccessGuardMut<V>>> {
+        let page_number = page.get_page_number();
         let node_mem = page.memory();
         match node_mem[0] {
             LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 if let Some(entry_index) = accessor.find_key::<K>(query) {
+                    path.push_leaf(page_number, entry_index);
                     let (start, end) = accessor.value_range(entry_index).unwrap();
-                    let guard = AccessGuardMut::new(page, start, end - start);
+                    let guard = AccessGuardMut::new(page, start, end - start, entry_index, path);
                     Ok(Some(guard))
                 } else {
                     Ok(None)
@@ -523,11 +534,12 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
             BRANCH => {
                 let child_page = {
                     let accessor = BranchAccessor::new(&page, K::fixed_width());
-                    let (_, child_page) = accessor.child_for_key::<K>(query);
+                    let (child_index, child_page) = accessor.child_for_key::<K>(query);
+                    path.push_branch(page_number, child_index);
                     child_page
                 };
                 let child_page_mut = self.mem.get_page_mut(child_page)?;
-                self.get_mut_helper(child_page_mut, query)
+                self.get_mut_helper_with_path(child_page_mut, query, path)
             }
             _ => unreachable!(),
         }
