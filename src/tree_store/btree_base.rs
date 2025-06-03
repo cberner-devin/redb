@@ -2,6 +2,7 @@ use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory
 use crate::tree_store::{PageNumber, PageTrackerPolicy};
 use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{Result, StorageError};
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -244,6 +245,196 @@ impl<V: Value + 'static> Drop for AccessGuard<'_, V> {
                     unreachable!();
                 }
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MutationPath {
+    pages: Vec<PageNumber>,
+    indices: Vec<usize>,
+    key_width: Option<usize>,
+}
+
+impl MutationPath {
+    pub(crate) fn new(key_width: Option<usize>) -> Self {
+        Self {
+            pages: Vec::new(),
+            indices: Vec::new(),
+            key_width,
+        }
+    }
+
+    pub(crate) fn push_branch(&mut self, page: PageNumber, child_index: usize) {
+        self.pages.push(page);
+        self.indices.push(child_index);
+    }
+
+    pub(crate) fn push_leaf(&mut self, page: PageNumber, entry_index: usize) {
+        self.pages.push(page);
+        self.indices.push(entry_index);
+    }
+
+    pub(crate) fn leaf_page(&self) -> PageNumber {
+        *self
+            .pages
+            .last()
+            .expect("Path should have at least one page")
+    }
+
+    pub(crate) fn leaf_entry_index(&self) -> usize {
+        *self
+            .indices
+            .last()
+            .expect("Path should have at least one index")
+    }
+}
+
+pub struct AccessGuardMut<'a, V: Value + 'static> {
+    page: PageMut,
+    offset: usize,
+    len: usize,
+    entry_index: usize,
+    mutation_path: MutationPath,
+    mem: Arc<TransactionalMemory>,
+    allocated: Arc<Mutex<PageTrackerPolicy>>,
+    root_ref: Option<&'a mut Option<BtreeHeader>>,
+    _value_type: PhantomData<V>,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        page: PageMut,
+        offset: usize,
+        len: usize,
+        entry_index: usize,
+        mutation_path: MutationPath,
+        mem: Arc<TransactionalMemory>,
+        allocated: Arc<Mutex<PageTrackerPolicy>>,
+        root_ref: Option<&'a mut Option<BtreeHeader>>,
+    ) -> Self {
+        AccessGuardMut {
+            page,
+            offset,
+            len,
+            entry_index,
+            mutation_path,
+            mem,
+            allocated,
+            root_ref,
+            _value_type: Default::default(),
+            _lifetime: Default::default(),
+        }
+    }
+
+    /// Access the stored value
+    pub fn value(&self) -> V::SelfType<'_> {
+        V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
+    }
+
+    /// Replace the stored value
+    pub fn insert<'v>(&mut self, value: impl Borrow<V::SelfType<'v>>) -> Result<()> {
+        let value_bytes = V::as_bytes(value.borrow());
+        let value_len = value_bytes.as_ref().len();
+
+        if value_len <= self.len {
+            let key_bytes = {
+                let accessor = LeafAccessor::new(
+                    self.page.memory(),
+                    self.mutation_path.key_width,
+                    V::fixed_width(),
+                );
+                let key = accessor.key_unchecked(self.entry_index).to_vec();
+
+                key
+            };
+            let mut mutator = LeafMutator::new(
+                &mut self.page,
+                self.mutation_path.key_width,
+                V::fixed_width(),
+            );
+            mutator.insert(self.entry_index, true, &key_bytes, value_bytes.as_ref());
+            Ok(())
+        } else {
+            // Handle larger values by creating a new leaf page
+            let key_bytes = {
+                let accessor = LeafAccessor::new(
+                    self.page.memory(),
+                    self.mutation_path.key_width,
+                    V::fixed_width(),
+                );
+                accessor.key_unchecked(self.entry_index).to_vec()
+            };
+
+            let mut builder = LeafBuilder::new(
+                &self.mem,
+                &self.allocated,
+                4096, // capacity - using default page size
+                self.mutation_path.key_width,
+                V::fixed_width(),
+            );
+
+            let accessor = LeafAccessor::new(
+                self.page.memory(),
+                self.mutation_path.key_width,
+                V::fixed_width(),
+            );
+
+            for i in 0..accessor.num_pairs() {
+                if i == self.entry_index {
+                    // Insert the new key-value pair with larger value
+                    builder.push(&key_bytes, value_bytes.as_ref());
+                } else {
+                    let entry = accessor.entry(i).unwrap();
+                    builder.push(entry.key(), entry.value());
+                }
+            }
+
+            let new_page = builder.build()?;
+
+            // Calculate checksum for the new leaf page
+            let new_checksum =
+                leaf_checksum(&new_page, self.mutation_path.key_width, V::fixed_width())?;
+
+            // Update parent branch page if it exists, otherwise update root
+            if self.mutation_path.pages.len() > 1 {
+                let parent_page_number =
+                    self.mutation_path.pages[self.mutation_path.pages.len() - 2];
+                let parent_entry_index =
+                    self.mutation_path.indices[self.mutation_path.indices.len() - 2];
+
+                let mut parent_page = self.mem.get_page_mut(parent_page_number)?;
+                let mut mutator = BranchMutator::new(&mut parent_page);
+                mutator.write_child_page(
+                    parent_entry_index,
+                    new_page.get_page_number(),
+                    new_checksum,
+                );
+            } else if let Some(root_ref) = &mut self.root_ref {
+                // Update root reference for single-page tree
+                let current_length = root_ref.as_ref().map_or(0, |h| h.length);
+                **root_ref = Some(BtreeHeader::new(
+                    new_page.get_page_number(),
+                    new_checksum,
+                    current_length,
+                ));
+            }
+
+            // Update our page reference to the new page and recalculate offset/length
+            let new_accessor = LeafAccessor::new(
+                new_page.memory(),
+                self.mutation_path.key_width,
+                V::fixed_width(),
+            );
+            let (new_start, new_end) = new_accessor.value_range(self.entry_index).unwrap();
+
+            self.page = new_page;
+            self.offset = new_start;
+            self.len = new_end - new_start;
+
+            Ok(())
         }
     }
 }
