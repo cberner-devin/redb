@@ -296,6 +296,8 @@ pub struct AccessGuardMut<'a, V: Value + 'static> {
     len: usize,
     entry_index: usize,
     mutation_path: MutationPath,
+    mem: Arc<TransactionalMemory>,
+    allocated: Arc<Mutex<PageTrackerPolicy>>,
     _value_type: PhantomData<V>,
     // Used so that logical references into a Table respect the appropriate lifetime
     _lifetime: PhantomData<&'a ()>,
@@ -308,6 +310,8 @@ impl<V: Value + 'static> AccessGuardMut<'_, V> {
         len: usize,
         entry_index: usize,
         mutation_path: MutationPath,
+        mem: Arc<TransactionalMemory>,
+        allocated: Arc<Mutex<PageTrackerPolicy>>,
     ) -> Self {
         AccessGuardMut {
             page,
@@ -315,6 +319,8 @@ impl<V: Value + 'static> AccessGuardMut<'_, V> {
             len,
             entry_index,
             mutation_path,
+            mem,
+            allocated,
             _value_type: Default::default(),
             _lifetime: Default::default(),
         }
@@ -330,9 +336,7 @@ impl<V: Value + 'static> AccessGuardMut<'_, V> {
         let value_bytes = V::as_bytes(value.borrow());
         let value_len = value_bytes.as_ref().len();
 
-
-
-        if value_len == self.len {
+        if value_len <= self.len {
             let key_bytes = {
                 let accessor = LeafAccessor::new(
                     self.page.memory(),
@@ -351,9 +355,45 @@ impl<V: Value + 'static> AccessGuardMut<'_, V> {
             mutator.insert(self.entry_index, true, &key_bytes, value_bytes.as_ref());
             Ok(())
         } else {
+            // Handle larger values by creating a new leaf page
+            let key_bytes = {
+                let accessor = LeafAccessor::new(
+                    self.page.memory(),
+                    self.mutation_path.key_width,
+                    V::fixed_width(),
+                );
+                accessor.key_unchecked(self.entry_index).to_vec()
+            };
+
+            let mut builder = LeafBuilder::new(
+                &self.mem,
+                &self.allocated,
+                4096, // capacity - using default page size
+                self.mutation_path.key_width,
+                V::fixed_width(),
+            );
+
+            let accessor = LeafAccessor::new(
+                self.page.memory(),
+                self.mutation_path.key_width,
+                V::fixed_width(),
+            );
+
+            for i in 0..accessor.num_pairs() {
+                if i == self.entry_index {
+                    // Insert the new key-value pair with larger value
+                    builder.push(&key_bytes, value_bytes.as_ref());
+                } else {
+                    let entry = accessor.entry(i).unwrap();
+                    builder.push(entry.key(), entry.value());
+                }
+            }
+
+            let new_page = builder.build()?;
+
             Err(StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "Value size increase not yet supported in AccessGuardMut",
+                "Parent branch page updates not yet implemented for larger values",
             )))
         }
     }

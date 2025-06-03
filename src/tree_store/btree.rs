@@ -525,7 +525,15 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
                 if let Some(entry_index) = accessor.find_key::<K>(query) {
                     path.push_leaf(page_number, entry_index);
                     let (start, end) = accessor.value_range(entry_index).unwrap();
-                    let guard = AccessGuardMut::new(page, start, end - start, entry_index, path);
+                    let guard = AccessGuardMut::new(
+                        page,
+                        start,
+                        end - start,
+                        entry_index,
+                        path,
+                        self.mem.clone(),
+                        self.allocated_pages.clone(),
+                    );
                     Ok(Some(guard))
                 } else {
                     Ok(None)
