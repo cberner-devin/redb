@@ -1553,12 +1553,6 @@ impl WriteTransaction {
         user_root: Option<BtreeHeader>,
         eventual: bool,
     ) -> Result {
-        let free_until_transaction = self
-            .transaction_tracker
-            .oldest_live_read_transaction()
-            .map_or(self.transaction_id, |x| x.next());
-        self.process_freed_pages(free_until_transaction)?;
-
         let mut system_tables = self.system_tables.lock().unwrap();
         let system_freed_pages = system_tables.system_freed_pages();
         let system_tree = system_tables.table_tree.flush_table_root_updates()?;
@@ -1616,6 +1610,15 @@ impl WriteTransaction {
 
         // Mark any pending non-durable commits as fully committed.
         self.transaction_tracker.clear_pending_non_durable_commits();
+
+        let free_until_transaction = self
+            .transaction_tracker
+            .oldest_live_read_transaction()
+            .map_or(self.transaction_id, |x| x.next());
+        drop(system_tables);
+        self.process_freed_pages(free_until_transaction)?;
+
+        self.mem.non_durable_commit(user_root, system_root, self.transaction_id)?;
 
         // Immediately free the pages that were freed from the system-tree. These are only
         // accessed by write transactions, so it's safe to free them as soon as the commit is done.
