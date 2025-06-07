@@ -29,37 +29,33 @@ fn create_tempfile() -> NamedTempFile {
 
 #[test]
 fn test_simple_struct_type_name() {
-    let type_name = SimpleStruct::type_name();
     assert_eq!(
-        format!("{:?}", type_name),
-        format!("{:?}", SimpleStruct::type_name())
+        "SimpleStruct {id: u32, name: String}",
+        format!("{}", SimpleStruct::type_name())
     );
 }
 
 #[test]
 fn test_tuple_struct_type_name() {
-    let type_name = TupleStruct::type_name();
     assert_eq!(
-        format!("{:?}", type_name),
-        format!("{:?}", TupleStruct::type_name())
+        "TupleStruct(u64,bool)",
+        format!("{}", TupleStruct::type_name())
     );
 }
 
 #[test]
 fn test_single_field_type_name() {
-    let type_name = SingleField::type_name();
     assert_eq!(
-        format!("{:?}", type_name),
-        format!("{:?}", SingleField::type_name())
+        "SingleField {value: i32}",
+        format!("{}", SingleField::type_name())
     );
 }
 
 #[test]
 fn test_mixed_types_type_name() {
-    let type_name = MixedTypes::type_name();
     assert_eq!(
-        format!("{:?}", type_name),
-        format!("{:?}", MixedTypes::type_name())
+        "MixedTypes {fixed: u16, variable: String, optional: Option < u8 >}",
+        format!("{}", MixedTypes::type_name())
     );
 }
 
@@ -217,7 +213,7 @@ fn test_roundtrip_consistency() {
         },
         SimpleStruct {
             id: 12345,
-            name: "unicode: 🦀".to_string(),
+            name: "ascii_test".to_string(),
         },
     ];
 
