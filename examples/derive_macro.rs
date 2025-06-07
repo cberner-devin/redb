@@ -1,14 +1,14 @@
 #[cfg(feature = "derive")]
-use redb::{Database, TableDefinition};
+use redb::{Database, TableDefinition, Value};
 
 #[cfg(feature = "derive")]
-use redb_derive::Value;
+use redb_derive::Value as DeriveValue;
 
 #[cfg(feature = "derive")]
 use tempfile::NamedTempFile;
 
 #[cfg(feature = "derive")]
-#[derive(Debug, Value)]
+#[derive(Debug, DeriveValue)]
 #[redb(type_name = "User")]
 struct User {
     id: u64,
@@ -18,12 +18,12 @@ struct User {
 }
 
 #[cfg(feature = "derive")]
-#[derive(Debug, Value)]
+#[derive(Debug, DeriveValue)]
 #[redb(type_name = "Point")]
 struct Point(f64, f64);
 
 #[cfg(feature = "derive")]
-#[derive(Debug, Value)]
+#[derive(Debug, DeriveValue)]
 #[redb(type_name = "Config")]
 struct Config {
     max_connections: u32,
@@ -57,12 +57,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let point = Point(3.14, 2.71);
         points.insert(&"origin".to_string(), &point)?;
 
-        let config = Config {
+        let config_data = Config {
             max_connections: 100,
             timeout_seconds: Some(30),
             server_name: "my-server".to_string(),
         };
-        config.insert("main", &config)?;
+        config.insert("main", &config_data)?;
     }
     write_txn.commit()?;
 
@@ -74,17 +74,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(user) = users.get(&1)? {
             println!("User: {:?}", user.value());
-            println!("User type name: {}", User::type_name().name());
+            println!("User type name: {:?}", User::type_name());
         }
 
-        if let Some(point) = points.get("origin")? {
+        if let Some(point) = points.get(&"origin".to_string())? {
             println!("Point: {:?}", point.value());
-            println!("Point type name: {}", Point::type_name().name());
+            println!("Point type name: {:?}", Point::type_name());
         }
 
         if let Some(config) = config.get("main")? {
             println!("Config: {:?}", config.value());
-            println!("Config type name: {}", Config::type_name().name());
+            println!("Config type name: {:?}", Config::type_name());
         }
     }
 

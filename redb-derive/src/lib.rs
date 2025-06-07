@@ -59,9 +59,9 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
         let field_names: Vec<_> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
         let struct_to_tuple = if field_count == 1 {
             let field = &field_names[0];
-            quote! { (&value.#field,) }
+            quote! { (value.#field.clone(),) }
         } else {
-            quote! { (#(&value.#field_names),*) }
+            quote! { (#(value.#field_names.clone()),*) }
         };
 
         let tuple_to_struct = {
@@ -76,9 +76,9 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
     } else {
         let indices: Vec<Index> = (0..field_count).map(Index::from).collect();
         let struct_to_tuple = if field_count == 1 {
-            quote! { (&value.0,) }
+            quote! { (value.0.clone(),) }
         } else {
-            quote! { (#(&value.#indices),*) }
+            quote! { (#(value.#indices.clone()),*) }
         };
 
         let tuple_to_struct = quote! {
