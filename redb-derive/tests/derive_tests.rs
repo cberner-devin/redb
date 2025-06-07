@@ -3,24 +3,20 @@ use redb_derive::Value as DeriveValue;
 use tempfile::NamedTempFile;
 
 #[derive(Debug, DeriveValue)]
-#[redb(type_name = "SimpleStruct")]
 struct SimpleStruct {
     id: u32,
     name: String,
 }
 
 #[derive(Debug, DeriveValue)]
-#[redb(type_name = "TupleStruct")]
 struct TupleStruct(u64, bool);
 
 #[derive(Debug, DeriveValue)]
-#[redb(type_name = "SingleField")]
 struct SingleField {
     value: i32,
 }
 
 #[derive(Debug, DeriveValue)]
-#[redb(type_name = "MixedTypes")]
 struct MixedTypes {
     fixed: u16,
     variable: String,
@@ -173,6 +169,39 @@ fn test_tuple_struct_database_integration() {
 
     assert_eq!(retrieved.value().0, 999);
     assert_eq!(retrieved.value().1, false);
+}
+
+#[test]
+fn test_vec_tuple_struct_database_integration() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u32, Vec<TupleStruct>> = TableDefinition::new("vec_tuple_table");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(table_def).unwrap();
+        let values = vec![
+            TupleStruct(100, true),
+            TupleStruct(200, false),
+            TupleStruct(300, true),
+        ];
+        table.insert(&1, &values).unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(table_def).unwrap();
+    let retrieved = table.get(&1).unwrap().unwrap();
+    let vec_values = retrieved.value();
+
+    assert_eq!(vec_values.len(), 3);
+    assert_eq!(vec_values[0].0, 100);
+    assert_eq!(vec_values[0].1, true);
+    assert_eq!(vec_values[1].0, 200);
+    assert_eq!(vec_values[1].1, false);
+    assert_eq!(vec_values[2].0, 300);
+    assert_eq!(vec_values[2].1, true);
 }
 
 #[test]

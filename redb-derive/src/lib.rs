@@ -1,8 +1,8 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Index, Lit, Meta};
+use syn::{parse_macro_input, Data, DeriveInput, Fields, Index};
 
-#[proc_macro_derive(Value, attributes(redb))]
+#[proc_macro_derive(Value)]
 pub fn derive_value(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -14,8 +14,7 @@ pub fn derive_value(input: TokenStream) -> TokenStream {
 
 fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let struct_name = &input.ident;
-
-    let type_name = extract_type_name(&input.attrs)?;
+    let struct_name_str = struct_name.to_string();
 
     let fields = match &input.data {
         Data::Struct(data_struct) => match &data_struct.fields {
@@ -87,12 +86,24 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
         (struct_to_tuple, tuple_to_struct)
     };
 
-    let type_name_with_fields = {
+    let type_name_with_fields = if is_named_fields {
+        let field_names: Vec<_> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+        let field_type_names = field_types.iter().map(|ty| {
+            quote! { stringify!(#ty) }
+        });
+        let field_name_strs = field_names.iter().map(|name| {
+            quote! { stringify!(#name) }
+        });
+        quote! {
+            format!("{} {{{}}}", #struct_name_str,
+                [#((format!("{}: {}", #field_name_strs, #field_type_names))),*].join(", "))
+        }
+    } else {
         let field_type_names = field_types.iter().map(|ty| {
             quote! { stringify!(#ty) }
         });
         quote! {
-            format!("{}({})", #type_name, [#(#field_type_names),*].join(","))
+            format!("{}({})", #struct_name_str, [#(#field_type_names),*].join(","))
         }
     };
 
@@ -128,29 +139,4 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
     };
 
     Ok(expanded)
-}
-
-fn extract_type_name(attrs: &[syn::Attribute]) -> syn::Result<String> {
-    for attr in attrs {
-        if attr.path().is_ident("redb") {
-            match &attr.meta {
-                Meta::List(meta_list) => {
-                    let nested = meta_list.parse_args::<syn::MetaNameValue>()?;
-                    if nested.path.is_ident("type_name") {
-                        if let syn::Expr::Lit(expr_lit) = &nested.value {
-                            if let Lit::Str(lit_str) = &expr_lit.lit {
-                                return Ok(lit_str.value());
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Err(syn::Error::new(
-        proc_macro2::Span::call_site(),
-        "Missing required attribute: #[redb(type_name = \"...\")]",
-    ))
 }
