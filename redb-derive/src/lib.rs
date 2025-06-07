@@ -89,7 +89,7 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
     let type_name_with_fields = if is_named_fields {
         let field_names: Vec<_> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
         let field_type_names = field_types.iter().map(|ty| {
-            quote! { stringify!(#ty) }
+            quote! { stringify!(#ty).replace(" ", "") }
         });
         let field_name_strs = field_names.iter().map(|name| {
             quote! { stringify!(#name) }
@@ -100,7 +100,7 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
         }
     } else {
         let field_type_names = field_types.iter().map(|ty| {
-            quote! { stringify!(#ty) }
+            quote! { stringify!(#ty).replace(" ", "") }
         });
         quote! {
             format!("{}({})", #struct_name_str, [#(#field_type_names),*].join(","))

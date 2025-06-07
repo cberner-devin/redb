@@ -54,7 +54,7 @@ fn test_single_field_type_name() {
 #[test]
 fn test_mixed_types_type_name() {
     assert_eq!(
-        "MixedTypes {fixed: u16, variable: String, optional: Option < u8 >}",
+        "MixedTypes {fixed: u16, variable: String, optional: Option<u8>}",
         format!("{}", MixedTypes::type_name())
     );
 }
