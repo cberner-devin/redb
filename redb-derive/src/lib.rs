@@ -1,6 +1,5 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use std::borrow::Borrow;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Index};
 
 #[proc_macro_derive(Value)]
@@ -110,25 +109,27 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let expanded = quote! {
+        use std::borrow::Borrow;
+
         impl #impl_generics redb::Value for #struct_name #ty_generics #where_clause {
-            type SelfType<'a> = #struct_name #ty_generics where Self: 'a;
-            type AsBytes<'a> = <#tuple_type as redb::Value>::AsBytes<'a> where Self: 'a;
+            type SelfType<'b> = #struct_name #ty_generics where Self: 'b;
+            type AsBytes<'b> = <#tuple_type as redb::Value>::AsBytes<'b> where Self: 'b;
 
             fn fixed_width() -> Option<usize> {
                 <#tuple_type as redb::Value>::fixed_width()
             }
 
-            fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+            fn from_bytes<'b>(data: &'b [u8]) -> Self::SelfType<'b>
             where
-                Self: 'a,
+                Self: 'b,
             {
                 let tuple = <#tuple_type as redb::Value>::from_bytes(data);
                 #tuple_to_struct
             }
 
-            fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+            fn as_bytes<'b, 'c: 'b>(value: &'b Self::SelfType<'c>) -> Self::AsBytes<'b>
             where
-                Self: 'b,
+                Self: 'c,
             {
                 let tuple = #struct_to_tuple;
                 <#tuple_type as redb::Value>::as_bytes(&tuple)
