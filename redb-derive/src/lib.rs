@@ -1,5 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
+use std::borrow::Borrow;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Index};
 
 #[proc_macro_derive(Value)]
@@ -15,6 +16,7 @@ pub fn derive_value(input: TokenStream) -> TokenStream {
 fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let struct_name = &input.ident;
     let struct_name_str = struct_name.to_string();
+    let generics = &input.generics;
 
     let fields = match &input.data {
         Data::Struct(data_struct) => match &data_struct.fields {
@@ -58,16 +60,16 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
         let field_names: Vec<_> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
         let struct_to_tuple = if field_count == 1 {
             let field = &field_names[0];
-            quote! { (value.#field.clone(),) }
+            quote! { (value.#field.borrow(),) }
         } else {
-            quote! { (#(value.#field_names.clone()),*) }
+            quote! { (#(value.#field_names.borrow()),*) }
         };
 
         let tuple_to_struct = {
             let indices: Vec<Index> = (0..field_count).map(Index::from).collect();
             quote! {
                 #struct_name {
-                    #(#field_names: tuple.#indices.clone()),*
+                    #(#field_names: tuple.#indices),*
                 }
             }
         };
@@ -75,22 +77,23 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
     } else {
         let indices: Vec<Index> = (0..field_count).map(Index::from).collect();
         let struct_to_tuple = if field_count == 1 {
-            quote! { (value.0.clone(),) }
+            quote! { (value.0.borrow(),) }
         } else {
-            quote! { (#(value.#indices.clone()),*) }
+            quote! { (#(value.#indices.borrow()),*) }
         };
 
         let tuple_to_struct = quote! {
-            #struct_name(#(tuple.#indices.clone()),*)
+            #struct_name(#(tuple.#indices),*)
         };
         (struct_to_tuple, tuple_to_struct)
     };
 
+    let field_type_names = field_types.iter().map(|ty| {
+        quote! { format!("{}", <#ty as redb::Value>::type_name()) }
+    });
+
     let type_name_with_fields = if is_named_fields {
         let field_names: Vec<_> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
-        let field_type_names = field_types.iter().map(|ty| {
-            quote! { stringify!(#ty).replace(" ", "") }
-        });
         let field_name_strs = field_names.iter().map(|name| {
             quote! { stringify!(#name) }
         });
@@ -99,17 +102,16 @@ fn expand_derive_value(input: DeriveInput) -> syn::Result<proc_macro2::TokenStre
                 [#((format!("{}: {}", #field_name_strs, #field_type_names))),*].join(", "))
         }
     } else {
-        let field_type_names = field_types.iter().map(|ty| {
-            quote! { stringify!(#ty).replace(" ", "") }
-        });
         quote! {
             format!("{}({})", #struct_name_str, [#(#field_type_names),*].join(","))
         }
     };
 
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
     let expanded = quote! {
-        impl redb::Value for #struct_name {
-            type SelfType<'a> = #struct_name where Self: 'a;
+        impl #impl_generics redb::Value for #struct_name #ty_generics #where_clause {
+            type SelfType<'a> = #struct_name #ty_generics where Self: 'a;
             type AsBytes<'a> = <#tuple_type as redb::Value>::AsBytes<'a> where Self: 'a;
 
             fn fixed_width() -> Option<usize> {

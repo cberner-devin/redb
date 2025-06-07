@@ -23,6 +23,13 @@ struct MixedTypes {
     optional: Option<u8>,
 }
 
+#[derive(Debug, DeriveValue)]
+struct ComplexStruct<'a> {
+    tuple_field: (u8, u16, u32),
+    array_field: [(u8, Option<u16>); 2],
+    reference: &'a str,
+}
+
 fn create_tempfile() -> NamedTempFile {
     NamedTempFile::new().unwrap()
 }
@@ -56,6 +63,14 @@ fn test_mixed_types_type_name() {
     assert_eq!(
         "MixedTypes {fixed: u16, variable: String, optional: Option<u8>}",
         format!("{}", MixedTypes::type_name())
+    );
+}
+
+#[test]
+fn test_complex_struct_type_name() {
+    assert_eq!(
+        "ComplexStruct {tuple_field: (u8, u16, u32), array_field: [(u8, Option<u16>); 2], reference: &str}",
+        format!("{}", ComplexStruct::type_name())
     );
 }
 
@@ -198,6 +213,50 @@ fn test_vec_tuple_struct_database_integration() {
     assert_eq!(vec_values[1].1, false);
     assert_eq!(vec_values[2].0, 300);
     assert_eq!(vec_values[2].1, true);
+}
+
+#[test]
+fn test_complex_struct_serialization() {
+    let original = ComplexStruct {
+        tuple_field: (1, 2, 3),
+        array_field: [(4, Some(5)), (6, None)],
+        reference: "test",
+    };
+
+    let bytes = ComplexStruct::as_bytes(&original);
+    let deserialized = ComplexStruct::from_bytes(bytes.as_ref());
+
+    assert_eq!(deserialized.tuple_field, (1, 2, 3));
+    assert_eq!(deserialized.array_field, [(4, Some(5)), (6, None)]);
+    assert_eq!(deserialized.reference, "test");
+}
+
+#[test]
+fn test_complex_struct_database_integration() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_def: TableDefinition<u32, ComplexStruct> = TableDefinition::new("complex_table");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(table_def).unwrap();
+        let value = ComplexStruct {
+            tuple_field: (10, 20, 30),
+            array_field: [(40, Some(50)), (60, None)],
+            reference: "database test",
+        };
+        table.insert(&1, &value).unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(table_def).unwrap();
+    let retrieved = table.get(&1).unwrap().unwrap();
+
+    assert_eq!(retrieved.value().tuple_field, (10, 20, 30));
+    assert_eq!(retrieved.value().array_field, [(40, Some(50)), (60, None)]);
+    assert_eq!(retrieved.value().reference, "database test");
 }
 
 #[test]
