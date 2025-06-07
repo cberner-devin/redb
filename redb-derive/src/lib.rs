@@ -1,6 +1,5 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use std::borrow::Borrow;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Index};
 
 #[proc_macro_derive(Value)]
