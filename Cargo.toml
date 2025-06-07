@@ -20,6 +20,7 @@ pyo3-build-config = { version = "0.24.1", optional = true }
 [dependencies]
 log = { version = "0.4.17", optional = true }
 pyo3 = { version = "0.24.1", features=["extension-module", "abi3-py37"], optional = true }
+redb-derive = { path = "redb-derive", version = "0.0.0", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.104"
@@ -58,6 +59,8 @@ python = ["dep:pyo3", "dep:pyo3-build-config"]
 logging = ["dep:log"]
 # Enable cache hit metrics
 cache_metrics = []
+# Enable derive macros for Value trait
+derive = ["dep:redb-derive"]
 
 [profile.bench]
 debug = true
