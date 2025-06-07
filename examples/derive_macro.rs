@@ -9,7 +9,6 @@ use tempfile::NamedTempFile;
 
 #[cfg(feature = "derive")]
 #[derive(Debug, DeriveValue)]
-#[redb(type_name = "User")]
 struct User {
     id: u64,
     username: String,
@@ -19,12 +18,10 @@ struct User {
 
 #[cfg(feature = "derive")]
 #[derive(Debug, DeriveValue)]
-#[redb(type_name = "Point")]
 struct Point(f64, f64);
 
 #[cfg(feature = "derive")]
 #[derive(Debug, DeriveValue)]
-#[redb(type_name = "Config")]
 struct Config {
     max_connections: u32,
     timeout_seconds: Option<u32>,
