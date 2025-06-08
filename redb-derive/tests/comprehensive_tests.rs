@@ -119,7 +119,7 @@ fn test_single_field() {
 // fn test_complex_struct_compilation() {
 //     let test_str = "hello";
 //     let test_bytes = b"world";
-//     
+//
 //     let original = ComplexStruct {
 //         tuple_field: (1, 2, 3),
 //         array_field: [(4, Some(5)), (6, None)],

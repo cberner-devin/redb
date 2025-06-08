@@ -79,7 +79,7 @@ jobs:
         run: just build test
 
       - name: Test redb-derive crate
-        run: cd redb-derive && cargo test
+        run: cargo test --manifest-path redb-derive/Cargo.toml
 
       - name: Clippy
         run: cargo clippy --all --all-targets -- -Dwarnings
