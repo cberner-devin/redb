@@ -82,6 +82,9 @@ pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransact
 pub use tree_store::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace, Savepoint};
 pub use types::{Key, MutInPlaceValue, TypeName, Value};
 
+#[cfg(test)]
+pub use redb_derive::Value;
+
 pub type Result<T = (), E = StorageError> = std::result::Result<T, E>;
 
 #[cfg(feature = "python")]

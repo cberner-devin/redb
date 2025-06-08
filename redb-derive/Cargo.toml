@@ -1,0 +1,15 @@
+[package]
+name = "redb-derive"
+description = "Derive macro for redb Value trait"
+version = "0.0.0"
+edition = "2024"
+authors = ["Christopher Berner <me@cberner.com>"]
+license = "MIT OR Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
