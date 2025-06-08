@@ -1,0 +1,20 @@
+[package]
+name = "redb-derive"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Derive macro for redb Value trait"
+license = "MIT OR Apache-2.0"
+authors = ["Christopher Berner <me@cberner.com>"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+
+[dev-dependencies]
+redb = { path = ".." }
+tempfile = "3.5.0"
