@@ -125,6 +125,8 @@ fn generate_type_name(input: &DeriveInput) -> syn::Result<TokenStream2> {
 }
 
 fn type_to_string(ty: &Type) -> String {
+    use quote::ToTokens;
+    
     match ty {
         Type::Path(type_path) => {
             if let Some(segment) = type_path.path.segments.last() {
@@ -153,7 +155,12 @@ fn type_to_string(ty: &Type) -> String {
             }
         }
         Type::Reference(type_ref) => {
-            format!("&{}", type_to_string(&type_ref.elem))
+            let elem_str = type_to_string(&type_ref.elem);
+            if type_ref.mutability.is_some() {
+                format!("&mut {}", elem_str)
+            } else {
+                format!("&{}", elem_str)
+            }
         }
         Type::Array(type_array) => {
             let elem_type = type_to_string(&type_array.elem);
@@ -168,7 +175,62 @@ fn type_to_string(ty: &Type) -> String {
             let elem_strings: Vec<String> = type_tuple.elems.iter().map(type_to_string).collect();
             format!("({})", elem_strings.join(", "))
         }
-        _ => "Unknown".to_string(),
+        Type::Slice(type_slice) => {
+            format!("[{}]", type_to_string(&type_slice.elem))
+        }
+        _ => {
+            ty.to_token_stream().to_string()
+        }
+    }
+}
+
+fn replace_lifetimes_with_a(ty: &syn::Type) -> syn::Type {
+    use syn::{Type, PathArguments, GenericArgument, Lifetime};
+    
+    match ty {
+        Type::Reference(type_ref) => {
+            let mut new_ref = type_ref.clone();
+            new_ref.lifetime = Some(Lifetime::new("'a", proc_macro2::Span::call_site()));
+            new_ref.elem = Box::new(replace_lifetimes_with_a(&type_ref.elem));
+            Type::Reference(new_ref)
+        }
+        Type::Path(type_path) => {
+            let mut new_path = type_path.clone();
+            for segment in &mut new_path.path.segments {
+                if let PathArguments::AngleBracketed(ref mut args) = segment.arguments {
+                    for arg in &mut args.args {
+                        match arg {
+                            GenericArgument::Lifetime(lifetime) => {
+                                *lifetime = Lifetime::new("'a", proc_macro2::Span::call_site());
+                            }
+                            GenericArgument::Type(ty) => {
+                                *ty = replace_lifetimes_with_a(ty);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Type::Path(new_path)
+        }
+        Type::Array(type_array) => {
+            let mut new_array = type_array.clone();
+            new_array.elem = Box::new(replace_lifetimes_with_a(&type_array.elem));
+            Type::Array(new_array)
+        }
+        Type::Tuple(type_tuple) => {
+            let mut new_tuple = type_tuple.clone();
+            for elem in &mut new_tuple.elems {
+                *elem = replace_lifetimes_with_a(elem);
+            }
+            Type::Tuple(new_tuple)
+        }
+        Type::Slice(type_slice) => {
+            let mut new_slice = type_slice.clone();
+            new_slice.elem = Box::new(replace_lifetimes_with_a(&type_slice.elem));
+            Type::Slice(new_slice)
+        }
+        _ => ty.clone(),
     }
 }
 
@@ -178,7 +240,7 @@ fn generate_serialization(input: &DeriveInput) -> syn::Result<(TokenStream2, Tok
             match &data_struct.fields {
                 Fields::Named(fields) => generate_named_fields_serialization(&fields.named),
                 Fields::Unnamed(fields) => generate_unnamed_fields_serialization(&fields.unnamed),
-                Fields::Unit => generate_unit_serialization(),
+                Fields::Unit => Ok(generate_unit_serialization()),
             }
         }
         _ => Err(syn::Error::new_spanned(input, "Value derive only supports structs")),
@@ -187,7 +249,7 @@ fn generate_serialization(input: &DeriveInput) -> syn::Result<(TokenStream2, Tok
 
 fn generate_named_fields_serialization(fields: &syn::punctuated::Punctuated<syn::Field, syn::Token![,]>) -> syn::Result<(TokenStream2, TokenStream2, TokenStream2)> {
     let field_names: Vec<_> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
-    let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
+    let field_types: Vec<_> = fields.iter().map(|f| f.ty.clone()).collect();
     
     let fixed_width_impl = quote! {
         None
@@ -198,15 +260,15 @@ fn generate_named_fields_serialization(fields: &syn::punctuated::Punctuated<syn:
             let mut result = Vec::new();
             
             #(
-                if <#field_types as redb::Value>::fixed_width().is_none() {
-                    let field_bytes = <#field_types as redb::Value>::as_bytes(&value.#field_names);
+                if #field_types::fixed_width().is_none() {
+                    let field_bytes = #field_types::as_bytes(&value.#field_names);
                     let len = field_bytes.as_ref().len() as u32;
                     result.extend_from_slice(&len.to_le_bytes());
                 }
             )*
             
             #(
-                let field_bytes = <#field_types as redb::Value>::as_bytes(&value.#field_names);
+                let field_bytes = #field_types::as_bytes(&value.#field_names);
                 result.extend_from_slice(field_bytes.as_ref());
             )*
             
@@ -220,7 +282,7 @@ fn generate_named_fields_serialization(fields: &syn::punctuated::Punctuated<syn:
             
             let mut lengths = Vec::new();
             #(
-                if <#field_types as redb::Value>::fixed_width().is_none() {
+                if #field_types::fixed_width().is_none() {
                     let len = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
                     lengths.push(len);
                     offset += 4;
@@ -229,16 +291,16 @@ fn generate_named_fields_serialization(fields: &syn::punctuated::Punctuated<syn:
             
             let mut length_idx = 0;
             #(
-                let #field_names = if let Some(width) = <#field_types as redb::Value>::fixed_width() {
+                let #field_names = if let Some(width) = #field_types::fixed_width() {
                     let field_data = &data[offset..offset+width];
                     offset += width;
-                    <#field_types as redb::Value>::from_bytes(field_data)
+                    #field_types::from_bytes(field_data)
                 } else {
                     let len = lengths[length_idx];
                     length_idx += 1;
                     let field_data = &data[offset..offset+len];
                     offset += len;
-                    <#field_types as redb::Value>::from_bytes(field_data)
+                    #field_types::from_bytes(field_data)
                 };
             )*
             
@@ -251,20 +313,10 @@ fn generate_named_fields_serialization(fields: &syn::punctuated::Punctuated<syn:
 
 fn generate_unnamed_fields_serialization(fields: &syn::punctuated::Punctuated<syn::Field, syn::Token![,]>) -> syn::Result<(TokenStream2, TokenStream2, TokenStream2)> {
     let field_indices: Vec<_> = (0..fields.len()).map(syn::Index::from).collect();
-    let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
+    let field_types: Vec<_> = fields.iter().map(|f| f.ty.clone()).collect();
     
     let fixed_width_impl = quote! {
-        {
-            let mut total = 0;
-            #(
-                if let Some(width) = <#field_types as redb::Value>::fixed_width() {
-                    total += width;
-                } else {
-                    return None;
-                }
-            )*
-            Some(total)
-        }
+        None
     };
     
     let as_bytes_impl = quote! {
@@ -280,17 +332,8 @@ fn generate_unnamed_fields_serialization(fields: &syn::punctuated::Punctuated<sy
             )*
             
             #(
-                if <#field_types as redb::Value>::fixed_width().is_some() {
-                    let field_bytes = <#field_types as redb::Value>::as_bytes(&value.#field_indices);
-                    result.extend_from_slice(field_bytes.as_ref());
-                }
-            )*
-            
-            #(
-                if <#field_types as redb::Value>::fixed_width().is_none() {
-                    let field_bytes = <#field_types as redb::Value>::as_bytes(&value.#field_indices);
-                    result.extend_from_slice(field_bytes.as_ref());
-                }
+                let field_bytes = <#field_types as redb::Value>::as_bytes(&value.#field_indices);
+                result.extend_from_slice(field_bytes.as_ref());
             )*
             
             result
@@ -336,10 +379,10 @@ fn generate_unnamed_fields_serialization(fields: &syn::punctuated::Punctuated<sy
     Ok((fixed_width_impl, from_bytes_impl, as_bytes_impl))
 }
 
-fn generate_unit_serialization() -> syn::Result<(TokenStream2, TokenStream2, TokenStream2)> {
+fn generate_unit_serialization() -> (TokenStream2, TokenStream2, TokenStream2) {
     let fixed_width_impl = quote! { Some(0) };
     let from_bytes_impl = quote! { Self };
     let as_bytes_impl = quote! { Vec::new() };
     
-    Ok((fixed_width_impl, from_bytes_impl, as_bytes_impl))
+    (fixed_width_impl, from_bytes_impl, as_bytes_impl)
 }
