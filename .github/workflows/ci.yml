@@ -78,6 +78,9 @@ jobs:
       - name: Run tests
         run: just build test
 
+      - name: Test redb-derive
+        run: cd redb-derive && cargo test
+
       - name: Clippy
         run: cargo clippy --all --all-targets -- -Dwarnings
 

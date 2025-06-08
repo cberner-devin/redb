@@ -17,9 +17,51 @@ pub fn derive_value(input: TokenStream) -> TokenStream {
             let deserialization_impl = generate_deserialization(&data_struct.fields);
             let fixed_width_impl = generate_fixed_width(&data_struct.fields);
 
+            let mut lifetime_params = Vec::new();
+            let mut type_params = Vec::new();
+            let mut const_params = Vec::new();
+
+            for param in &generics.params {
+                match param {
+                    syn::GenericParam::Lifetime(lt) => lifetime_params.push(lt),
+                    syn::GenericParam::Type(ty) => type_params.push(ty),
+                    syn::GenericParam::Const(ct) => const_params.push(ct),
+                }
+            }
+
+            let (type_generics_with_a, self_type_lifetime) = if lifetime_params.is_empty()
+                && type_params.is_empty()
+                && const_params.is_empty()
+            {
+                (quote! {}, quote! { 'a })
+            } else {
+                let mut params = Vec::new();
+
+                let self_type_lifetime = if !lifetime_params.is_empty() {
+                    let first_lifetime = &lifetime_params[0].lifetime;
+                    params.push(quote! { #first_lifetime });
+                    quote! { #first_lifetime }
+                } else {
+                    params.push(quote! { 'a });
+                    quote! { 'a }
+                };
+
+                params.extend(type_params.iter().map(|tp| {
+                    let ident = &tp.ident;
+                    quote! { #ident }
+                }));
+                params.extend(const_params.iter().map(|cp| {
+                    let ident = &cp.ident;
+                    quote! { #ident }
+                }));
+                (quote! { < #(#params),* > }, self_type_lifetime)
+            };
+
+            let self_type_def = quote! { type SelfType<#self_type_lifetime> = #name #type_generics_with_a where Self: #self_type_lifetime; };
+
             quote! {
                 impl #impl_generics redb::Value for #name #ty_generics #where_clause {
-                    type SelfType<'a> = #name #ty_generics where Self: 'a;
+                    #self_type_def
                     type AsBytes<'a> = Vec<u8> where Self: 'a;
 
                     fn fixed_width() -> Option<usize> {
@@ -33,9 +75,8 @@ pub fn derive_value(input: TokenStream) -> TokenStream {
                         #deserialization_impl
                     }
 
-                    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Vec<u8>
+                    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
                     where
-                        Self: 'a,
                         Self: 'b,
                     {
                         #serialization_impl
@@ -244,8 +285,6 @@ fn generate_deserialization(fields: &Fields) -> proc_macro2::TokenStream {
                             ]) as usize;
                             var_lengths.push(len);
                             offset += 4;
-                        } else {
-                            var_lengths.push(0); // placeholder for fixed-width fields
                         }
                     )*
 
@@ -257,9 +296,9 @@ fn generate_deserialization(fields: &Fields) -> proc_macro2::TokenStream {
                             <#field_types>::from_bytes(field_data)
                         } else {
                             let len = var_lengths[var_index];
-                            var_index += 1;
                             let field_data = &data[offset..offset + len];
                             offset += len;
+                            var_index += 1;
                             <#field_types>::from_bytes(field_data)
                         };
                     )*
@@ -292,8 +331,6 @@ fn generate_deserialization(fields: &Fields) -> proc_macro2::TokenStream {
                             ]) as usize;
                             var_lengths.push(len);
                             offset += 4;
-                        } else {
-                            var_lengths.push(0); // placeholder for fixed-width fields
                         }
                     )*
 
@@ -305,9 +342,9 @@ fn generate_deserialization(fields: &Fields) -> proc_macro2::TokenStream {
                             <#field_types>::from_bytes(field_data)
                         } else {
                             let len = var_lengths[var_index];
-                            var_index += 1;
                             let field_data = &data[offset..offset + len];
                             offset += len;
+                            var_index += 1;
                             <#field_types>::from_bytes(field_data)
                         };
                     )*
@@ -319,156 +356,5 @@ fn generate_deserialization(fields: &Fields) -> proc_macro2::TokenStream {
         Fields::Unit => {
             quote! { Self }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use redb::{Database, TableDefinition, TypeName, Value};
-    use tempfile::NamedTempFile;
-
-    #[derive(Value, Debug, PartialEq)]
-    struct SimpleStruct {
-        id: u32,
-        name: String,
-    }
-
-    #[derive(Value, Debug, PartialEq)]
-    struct TupleStruct(u64, bool);
-
-    #[derive(Value, Debug, PartialEq)]
-    struct SingleField {
-        value: i32,
-    }
-
-    #[derive(Value, Debug, PartialEq)]
-    struct ComplexStruct<'a> {
-        tuple_field: (u8, u16, u32),
-        array_field: [(u8, Option<u16>); 2],
-        reference: &'a str,
-    }
-
-    #[test]
-    fn test_simple_struct() {
-        let original = SimpleStruct {
-            id: 42,
-            name: "test".to_string(),
-        };
-
-        let bytes = SimpleStruct::as_bytes(&original);
-        let deserialized = SimpleStruct::from_bytes(&bytes);
-        assert_eq!(original, deserialized);
-
-        let type_name = SimpleStruct::type_name();
-        let expected_name = "SimpleStruct {id: u32, name: String}";
-        assert_eq!(type_name.to_string(), expected_name);
-
-        let file = NamedTempFile::new().unwrap();
-        let db = Database::create(file.path()).unwrap();
-        const TABLE: TableDefinition<u32, SimpleStruct> = TableDefinition::new("test");
-
-        let write_txn = db.begin_write().unwrap();
-        {
-            let mut table = write_txn.open_table(TABLE).unwrap();
-            table.insert(1, &original).unwrap();
-        }
-        write_txn.commit().unwrap();
-
-        let read_txn = db.begin_read().unwrap();
-        let table = read_txn.open_table(TABLE).unwrap();
-        let retrieved = table.get(1).unwrap().unwrap();
-        assert_eq!(retrieved.value(), original);
-    }
-
-    #[test]
-    fn test_tuple_struct() {
-        let original = TupleStruct(123456789, true);
-
-        let bytes = TupleStruct::as_bytes(&original);
-        let deserialized = TupleStruct::from_bytes(&bytes);
-        assert_eq!(original, deserialized);
-
-        let type_name = TupleStruct::type_name();
-        let expected_name = "TupleStruct(u64, bool)";
-        assert_eq!(type_name.to_string(), expected_name);
-
-        let file = NamedTempFile::new().unwrap();
-        let db = Database::create(file.path()).unwrap();
-        const TABLE: TableDefinition<u32, TupleStruct> = TableDefinition::new("test");
-
-        let write_txn = db.begin_write().unwrap();
-        {
-            let mut table = write_txn.open_table(TABLE).unwrap();
-            table.insert(1, &original).unwrap();
-        }
-        write_txn.commit().unwrap();
-
-        let read_txn = db.begin_read().unwrap();
-        let table = read_txn.open_table(TABLE).unwrap();
-        let retrieved = table.get(1).unwrap().unwrap();
-        assert_eq!(retrieved.value(), original);
-    }
-
-    #[test]
-    fn test_single_field() {
-        let original = SingleField { value: -42 };
-
-        let bytes = SingleField::as_bytes(&original);
-        let deserialized = SingleField::from_bytes(&bytes);
-        assert_eq!(original, deserialized);
-
-        let type_name = SingleField::type_name();
-        let expected_name = "SingleField {value: i32}";
-        assert_eq!(type_name.to_string(), expected_name);
-
-        let file = NamedTempFile::new().unwrap();
-        let db = Database::create(file.path()).unwrap();
-        const TABLE: TableDefinition<u32, SingleField> = TableDefinition::new("test");
-
-        let write_txn = db.begin_write().unwrap();
-        {
-            let mut table = write_txn.open_table(TABLE).unwrap();
-            table.insert(1, &original).unwrap();
-        }
-        write_txn.commit().unwrap();
-
-        let read_txn = db.begin_read().unwrap();
-        let table = read_txn.open_table(TABLE).unwrap();
-        let retrieved = table.get(1).unwrap().unwrap();
-        assert_eq!(retrieved.value(), original);
-    }
-
-    #[test]
-    fn test_complex_struct() {
-        let original = ComplexStruct {
-            tuple_field: (1, 2, 3),
-            array_field: [(4, Some(5)), (6, None)],
-            reference: "hello",
-        };
-
-        let bytes = ComplexStruct::as_bytes(&original);
-        let deserialized = ComplexStruct::from_bytes(&bytes);
-        assert_eq!(original, deserialized);
-
-        let type_name = ComplexStruct::type_name();
-        let expected_name = "ComplexStruct {tuple_field: (u8, u16, u32), array_field: [(u8, Option<u16>); 2], reference: &str}";
-        assert_eq!(type_name.to_string(), expected_name);
-
-        let file = NamedTempFile::new().unwrap();
-        let db = Database::create(file.path()).unwrap();
-        const TABLE: TableDefinition<u32, ComplexStruct> = TableDefinition::new("test");
-
-        let write_txn = db.begin_write().unwrap();
-        {
-            let mut table = write_txn.open_table(TABLE).unwrap();
-            table.insert(1, &original).unwrap();
-        }
-        write_txn.commit().unwrap();
-
-        let read_txn = db.begin_read().unwrap();
-        let table = read_txn.open_table(TABLE).unwrap();
-        let retrieved = table.get(1).unwrap().unwrap();
-        assert_eq!(retrieved.value(), original);
     }
 }
