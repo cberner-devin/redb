@@ -201,8 +201,6 @@ fn type_to_string(ty: &Type) -> String {
     }
 }
 
-
-
 fn generate_serialization(
     input: &DeriveInput,
 ) -> syn::Result<(TokenStream2, TokenStream2, TokenStream2)> {
