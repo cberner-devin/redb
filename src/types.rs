@@ -71,6 +71,12 @@ impl TypeName {
     }
 }
 
+impl std::fmt::Display for TypeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
 pub trait Value: Debug {
     /// `SelfType<'a>` must be the same type as Self with all lifetimes replaced with 'a
     type SelfType<'a>: Debug + 'a
