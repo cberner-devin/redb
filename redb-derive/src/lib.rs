@@ -201,55 +201,7 @@ fn type_to_string(ty: &Type) -> String {
     }
 }
 
-fn replace_lifetimes_with_a(ty: &syn::Type) -> syn::Type {
-    use syn::{GenericArgument, Lifetime, PathArguments, Type};
 
-    match ty {
-        Type::Reference(type_ref) => {
-            let mut new_ref = type_ref.clone();
-            new_ref.lifetime = Some(Lifetime::new("'a", proc_macro2::Span::call_site()));
-            new_ref.elem = Box::new(replace_lifetimes_with_a(&type_ref.elem));
-            Type::Reference(new_ref)
-        }
-        Type::Path(type_path) => {
-            let mut new_path = type_path.clone();
-            for segment in &mut new_path.path.segments {
-                if let PathArguments::AngleBracketed(ref mut args) = segment.arguments {
-                    for arg in &mut args.args {
-                        match arg {
-                            GenericArgument::Lifetime(lifetime) => {
-                                *lifetime = Lifetime::new("'a", proc_macro2::Span::call_site());
-                            }
-                            GenericArgument::Type(ty) => {
-                                *ty = replace_lifetimes_with_a(ty);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Type::Path(new_path)
-        }
-        Type::Array(type_array) => {
-            let mut new_array = type_array.clone();
-            new_array.elem = Box::new(replace_lifetimes_with_a(&type_array.elem));
-            Type::Array(new_array)
-        }
-        Type::Tuple(type_tuple) => {
-            let mut new_tuple = type_tuple.clone();
-            for elem in &mut new_tuple.elems {
-                *elem = replace_lifetimes_with_a(elem);
-            }
-            Type::Tuple(new_tuple)
-        }
-        Type::Slice(type_slice) => {
-            let mut new_slice = type_slice.clone();
-            new_slice.elem = Box::new(replace_lifetimes_with_a(&type_slice.elem));
-            Type::Slice(new_slice)
-        }
-        _ => ty.clone(),
-    }
-}
 
 fn generate_serialization(
     input: &DeriveInput,
