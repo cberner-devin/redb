@@ -2,8 +2,17 @@ build: pre
     cargo build --all-targets
     cargo doc
 
+build_all: pre_all
+    cargo build --all --all-targets
+    cargo doc --all
+
 pre:
-    cargo deny --all-features check licenses
+    cargo deny --workspace --all-features check licenses
+    cargo fmt --all -- --check
+    cargo clippy --all-targets
+
+pre_all:
+    cargo deny --workspace --all-features check licenses
     cargo fmt --all -- --check
     cargo clippy --all --all-targets
 
@@ -16,22 +25,28 @@ flamegraph:
 
 publish_py: test_py
     docker pull quay.io/pypa/manylinux2014_x86_64
-    MATURIN_PYPI_TOKEN=$(cat ~/.pypi/redb_token) docker run -it --rm -e "MATURIN_PYPI_TOKEN" -v `pwd`:/redb-ro:ro quay.io/pypa/manylinux2014_x86_64 /redb-ro/publish_py.sh
+    MATURIN_PYPI_TOKEN=$(cat ~/.pypi/redb_token) docker run -it --rm -e "MATURIN_PYPI_TOKEN" -v `pwd`:/redb-ro:ro quay.io/pypa/manylinux2014_x86_64 /redb-ro/crates/redb-python/py_publish.sh
 
 test_py: install_py
-    python3 -m unittest discover
+    python3 -m unittest discover --start-directory=./crates/redb-python
 
 install_py: pre
-    maturin develop
+    maturin develop --manifest-path=./crates/redb-python/Cargo.toml
 
 test: pre
     RUST_BACKTRACE=1 cargo test
 
+test_all: build_all
+    RUST_BACKTRACE=1 cargo test --all
+
 test_wasi:
-    cargo +nightly-2025-04-06 test --target=wasm32-wasip1-threads -- --nocapture
+    rustup install nightly-2025-05-04 --target wasm32-wasip1-threads
+    # Uses cargo pkgid because "redb" is ambiguous with the test dependency on an old version of redb
+    cargo +nightly-2025-05-04 test -p $(cargo pkgid) --target=wasm32-wasip1-threads -- --nocapture
+    cargo +nightly-2025-05-04 test -p redb-derive --target=wasm32-wasip1-threads -- --nocapture
 
 bench bench='lmdb_benchmark': pre
-    cargo bench --bench {{bench}}
+    cargo bench -p redb-bench --bench {{bench}}
 
 watch +args='test':
     cargo watch --clear --exec "{{args}}"
@@ -42,7 +57,7 @@ fuzz: pre
 fuzz_cmin:
     cargo fuzz cmin --sanitizer=none fuzz_redb -- -max_len=10000
 
-fuzz_ci: pre
+fuzz_ci: pre_all
     cargo fuzz run --sanitizer=none fuzz_redb -- -max_len=10000 -max_total_time=60
 
 fuzz_coverage: pre

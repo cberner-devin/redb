@@ -1,5 +1,58 @@
 # redb - Changelog
 
+## 3.0.0 - 2025-XX-XX
+
+### Removes support for file format v2.
+Use `Database::upgrade()` in redb 2.6 migrate to the v3 file format.
+
+### Optimize storage of tuple types
+Optimize storage of variable width tuple types with arity greater than 1. The new format elides the
+length of any fixed width fields and uses varint encoding for the lengths of all variable width
+fields.
+
+Note that this encoding is not compatible with the serialization of variable width tuples used in prior versions.
+To load tuple data created prior to version 3.0, wrap them in the `Legacy` type.
+For example, `TableDefinition<u64, (&str, u32)>` becomes `TableDefinition<u64, Legacy<(&str, u32)>>`.
+Fixed width tuples, such as `(u32, u64)` are backwards compatible.
+
+### Other changes
+
+* Add `StorageBackend::close()`
+* Add `Table::get_mut()`
+* Add `chrono_v0_4` feature flag which enables serialization of the `NaiveDate`, `NaiveTime`,
+  `NaiveDatetime`, `DateTime<FixedOffset>`, and `FixedOffset` types in the `chrono` crate.
+* Change `TypeName::name()` to be public
+* Change `ReadTransactionStillInUse` to contain a `Box`
+* Change `set_durability()` to return a `Result`
+* Rename `AccessGuardMut` to `AccessGuardMutInPlace`. Note that a new `AccessGuardMut` struct has
+  been added; it serves a different purpose.
+* Remove `Durability::Paranoid`
+* Disallow access to the database from read transactions after the `Database` as been
+  dropped. Access will now return `DatabaseClosed`
+
+## 2.6.0 - 2025-05-22
+
+### Add support for the v3 file format.
+This file format improves savepoints.
+Savepoints in the v3 format have constant, and small, overhead. Creating
+and restoring them is also much faster. The v3 file format also supports
+savepoints on large databases (v2 has a limit around 32TB). This release
+creates v2 databases by default. Use `Builder::create_with_file_format_v3()`
+and `Database::upgrade()`, respectively, to enable and migrate to v3.
+
+**The upcoming 3.0 release will only support the v3 file format.**
+
+* Add `Builder::create_with_file_format_v3()`
+* Add `Database::upgrade()`
+
+## 2.5.0 - 2025-04-21
+* Add `rename_table()` and `rename_multimap_table()`
+* Add `Key` and `Value` implementations for the unary tuple type (i.e. `(T,)`)
+* Fix an issue which could cause a panic when concurrently performing read and write transactions,
+  when `debug_assertions` were enabled
+* Optimize `retain()` and `retain_in()` to use less space in the database file
+* Improve handling of some internal errors to return `LockPoisoned` instead of panicking
+
 ## 2.4.0 - 2024-12-30
 * Add `Database::cache_stats()`
 * Fix `open()` and `create()` to return `InvalidData` when they are called on a database file

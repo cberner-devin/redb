@@ -1,11 +1,12 @@
 use crate::db::TransactionGuard;
 use crate::sealed::Sealed;
 use crate::tree_store::{
-    AccessGuardMut, Btree, BtreeExtractIf, BtreeHeader, BtreeMut, BtreeRangeIter, MAX_PAIR_LENGTH,
-    MAX_VALUE_LENGTH, PageHint, PageNumber, RawBtree, TransactionalMemory,
+    AccessGuardMutInPlace, Btree, BtreeExtractIf, BtreeHeader, BtreeMut, BtreeRangeIter,
+    MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, PageHint, PageNumber, PageTrackerPolicy, RawBtree,
+    TransactionalMemory,
 };
 use crate::types::{Key, MutInPlaceValue, Value};
-use crate::{AccessGuard, StorageError, WriteTransaction};
+use crate::{AccessGuard, AccessGuardMut, StorageError, WriteTransaction};
 use crate::{Result, TableHandle};
 use std::borrow::Borrow;
 use std::fmt::{Debug, Formatter};
@@ -75,6 +76,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         name: &str,
         table_root: Option<BtreeHeader>,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+        allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
         mem: Arc<TransactionalMemory>,
         transaction: &'txn WriteTransaction,
     ) -> Table<'txn, K, V> {
@@ -86,6 +88,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
                 transaction.transaction_guard(),
                 mem,
                 freed_pages,
+                allocated_pages,
             ),
         }
     }
@@ -93,6 +96,14 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     #[allow(dead_code)]
     pub(crate) fn print_debug(&self, include_values: bool) -> Result {
         self.tree.print_debug(include_values)
+    }
+
+    /// Returns an accessor, which allows mutation, to the value corresponding to the given key
+    pub fn get_mut<'k>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'k>>,
+    ) -> Result<Option<AccessGuardMut<V>>> {
+        self.tree.get_mut(key.borrow())
     }
 
     /// Removes and returns the first key-value pair in the table
@@ -228,7 +239,7 @@ impl<K: Key + 'static, V: MutInPlaceValue + 'static> Table<'_, K, V> {
         &mut self,
         key: impl Borrow<K::SelfType<'a>>,
         value_length: u32,
-    ) -> Result<AccessGuardMut<V>> {
+    ) -> Result<AccessGuardMutInPlace<V>> {
         if value_length as usize > MAX_VALUE_LENGTH {
             return Err(StorageError::ValueTooLarge(value_length as usize));
         }
@@ -564,7 +575,7 @@ impl<
     F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
 > ExtractIf<'a, K, V, F>
 {
-    fn new(inner: BtreeExtractIf<'a, K, V, F>) -> Self {
+    pub(crate) fn new(inner: BtreeExtractIf<'a, K, V, F>) -> Self {
         Self { inner }
     }
 }
