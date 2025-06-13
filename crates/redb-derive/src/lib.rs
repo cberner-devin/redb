@@ -20,6 +20,16 @@ pub fn derive_value(input: TokenStream) -> TokenStream {
     }
 }
 
+#[proc_macro_derive(Key)]
+pub fn derive_key(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    match generate_key_impl(&input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
 fn generate_value_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let Data::Struct(data_struct) = &input.data else {
         return Err(syn::Error::new_spanned(
@@ -68,6 +78,34 @@ fn generate_value_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
 
             fn type_name() -> redb::TypeName {
                 #type_name_impl
+            }
+        }
+    })
+}
+
+fn generate_key_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let Data::Struct(_) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            input,
+            "Key can only be derived for structs",
+        ));
+    };
+
+    let name = &input.ident;
+    let generics = &input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let mut where_clause = where_clause
+        .cloned()
+        .unwrap_or_else(|| syn::parse_quote!(where));
+    where_clause.predicates.push(syn::parse_quote!(Self: Ord));
+
+    Ok(quote! {
+        impl #impl_generics redb::Key for #name #ty_generics #where_clause {
+            fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
+                let value1 = Self::from_bytes(data1);
+                let value2 = Self::from_bytes(data2);
+                value1.cmp(&value2)
             }
         }
     })
