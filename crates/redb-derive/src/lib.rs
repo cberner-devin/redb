@@ -185,11 +185,6 @@ fn generate_fixed_width(fields: &Fields) -> proc_macro2::TokenStream {
     }
 }
 
-enum FieldAccessor {
-    Named(proc_macro2::TokenStream),
-    Indexed(proc_macro2::TokenStream),
-}
-
 fn generate_as_bytes(fields: &Fields) -> proc_macro2::TokenStream {
     let (field_accessors, field_types) = match fields {
         Fields::Named(fields_named) => {
