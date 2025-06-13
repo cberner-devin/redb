@@ -138,18 +138,26 @@ fn generate_type_name(struct_name: &Ident, fields: &Fields) -> proc_macro2::Toke
     }
 }
 
-fn generate_fixed_width(fields: &Fields) -> proc_macro2::TokenStream {
-    let field_types: Vec<_> = match fields {
-        Fields::Named(fields_named) => fields_named.named.iter().map(|field| &field.ty).collect(),
+fn get_field_types(fields: &Fields) -> Vec<syn::Type> {
+    match fields {
+        Fields::Named(fields_named) => fields_named
+            .named
+            .iter()
+            .map(|field| &field.ty)
+            .cloned()
+            .collect(),
         Fields::Unnamed(fields_unnamed) => fields_unnamed
             .unnamed
             .iter()
             .map(|field| &field.ty)
+            .cloned()
             .collect(),
-        Fields::Unit => {
-            vec![]
-        }
-    };
+        Fields::Unit => vec![],
+    }
+}
+
+fn generate_fixed_width(fields: &Fields) -> proc_macro2::TokenStream {
+    let field_types = get_field_types(fields);
     quote! {
         {
             let mut total_width = 0usize;
