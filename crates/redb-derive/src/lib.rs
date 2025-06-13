@@ -1,91 +1,95 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, Ident, parse_macro_input};
+use syn::{Data, DeriveInput, Fields, GenericParam, Ident, parse_macro_input};
 
 #[proc_macro_derive(Value)]
 pub fn derive_value(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
+    match generate_value_impl(&input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+fn generate_value_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let Data::Struct(data_struct) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            input,
+            "Value can only be derived for structs",
+        ));
+    };
+
     let name = &input.ident;
     let generics = &input.generics;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-    let expanded = match &input.data {
-        Data::Struct(data_struct) => {
-            let type_name_impl = generate_type_name(&input, &data_struct.fields);
-            let serialization_impl = generate_serialization(&data_struct.fields);
-            let deserialization_impl = generate_deserialization(name, &data_struct.fields);
-            let fixed_width_impl = generate_fixed_width(&data_struct.fields);
+    let self_type = generate_self_type(name, generics);
 
-            let mut lifetime_params = Vec::new();
-            let mut type_params = Vec::new();
-            let mut const_params = Vec::new();
+    let type_name_impl = generate_type_name(name, &data_struct.fields);
+    let as_bytes_impl = generate_as_bytes(&data_struct.fields);
+    let from_bytes_impl = generate_from_bytes(name, &data_struct.fields);
+    let fixed_width_impl = generate_fixed_width(&data_struct.fields);
 
-            for param in &generics.params {
-                match param {
-                    syn::GenericParam::Lifetime(lt) => lifetime_params.push(lt),
-                    syn::GenericParam::Type(ty) => type_params.push(ty),
-                    syn::GenericParam::Const(ct) => const_params.push(ct),
-                }
+    Ok(quote! {
+        impl #impl_generics redb::Value for #name #ty_generics #where_clause {
+            type SelfType<'a> = #self_type
+            where
+                Self: 'a;
+            type AsBytes<'a> = Vec<u8>
+            where
+                Self: 'a;
+
+            fn fixed_width() -> Option<usize> {
+                #fixed_width_impl
             }
 
-            // TODO: support type and const parameters
-            let self_type_lifetime = if lifetime_params.is_empty() {
-                quote! {}
-            } else {
-                let mut params = Vec::new();
+            fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+            where
+                Self: 'a,
+            {
+                #from_bytes_impl
+            }
 
-                for _ in 0..lifetime_params.len() {
-                    params.push(quote! { 'a });
-                }
-                quote! { < #(#params),* > }
-            };
+            fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+            where
+                Self: 'b,
+            {
+                #as_bytes_impl
+            }
 
-            let self_type_def =
-                quote! { type SelfType<'a> = #name #self_type_lifetime where Self: 'a; };
-
-            quote! {
-                impl #impl_generics redb::Value for #name #ty_generics #where_clause {
-                    #self_type_def
-                    type AsBytes<'a> = Vec<u8> where Self: 'a;
-
-                    fn fixed_width() -> Option<usize> {
-                        #fixed_width_impl
-                    }
-
-                    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-                    where
-                        Self: 'a,
-                    {
-                        #deserialization_impl
-                    }
-
-                    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
-                    where
-                        Self: 'b,
-                    {
-                        #serialization_impl
-                    }
-
-                    fn type_name() -> redb::TypeName {
-                        #type_name_impl
-                    }
-                }
+            fn type_name() -> redb::TypeName {
+                #type_name_impl
             }
         }
-        _ => {
-            return syn::Error::new_spanned(&input, "Value can only be derived for structs")
-                .to_compile_error()
-                .into();
-        }
-    };
-
-    TokenStream::from(expanded)
+    })
 }
 
-fn generate_type_name(input: &DeriveInput, fields: &Fields) -> proc_macro2::TokenStream {
-    let struct_name = &input.ident;
+fn generate_self_type(name: &syn::Ident, generics: &syn::Generics) -> proc_macro2::TokenStream {
+    if generics.params.is_empty() {
+        quote! { #name }
+    } else {
+        let params: Vec<_> = generics
+            .params
+            .iter()
+            .map(|param| match param {
+                GenericParam::Lifetime(_) => quote! { 'a },
+                GenericParam::Type(type_param) => {
+                    let ident = &type_param.ident;
+                    quote! { #ident }
+                }
+                GenericParam::Const(const_param) => {
+                    let ident = &const_param.ident;
+                    quote! { #ident }
+                }
+            })
+            .collect();
 
+        quote! { #name<#(#params),*> }
+    }
+}
+
+fn generate_type_name(struct_name: &Ident, fields: &Fields) -> proc_macro2::TokenStream {
     match fields {
         Fields::Named(fields_named) => {
             let field_strings: Vec<_> = fields_named
@@ -135,50 +139,29 @@ fn generate_type_name(input: &DeriveInput, fields: &Fields) -> proc_macro2::Toke
 }
 
 fn generate_fixed_width(fields: &Fields) -> proc_macro2::TokenStream {
-    match fields {
-        Fields::Named(fields_named) => {
-            let field_types: Vec<_> = fields_named.named.iter().map(|field| &field.ty).collect();
-            quote! {
-                {
-                    let mut total_width = 0usize;
-                    #(
-                        if let Some(width) = <#field_types>::fixed_width() {
-                            total_width += width;
-                        } else {
-                            return None;
-                        }
-                    )*
-                    Some(total_width)
-                }
-            }
-        }
-        Fields::Unnamed(fields_unnamed) => {
-            let field_types: Vec<_> = fields_unnamed
-                .unnamed
-                .iter()
-                .map(|field| &field.ty)
-                .collect();
-            quote! {
-                {
-                    let mut total_width = 0usize;
-                    #(
-                        if let Some(width) = <#field_types>::fixed_width() {
-                            total_width += width;
-                        } else {
-                            return None;
-                        }
-                    )*
-                    Some(total_width)
-                }
-            }
-        }
+    let field_types: Vec<_> = match fields {
+        Fields::Named(fields_named) => fields_named.named.iter().map(|field| &field.ty).collect(),
+        Fields::Unnamed(fields_unnamed) => fields_unnamed
+            .unnamed
+            .iter()
+            .map(|field| &field.ty)
+            .collect(),
         Fields::Unit => {
-            quote! { Some(0) }
+            vec![]
+        }
+    };
+    quote! {
+        {
+            let mut total_width = 0usize;
+            #(
+                total_width += <#field_types>::fixed_width()?;
+            )*
+            Some(total_width)
         }
     }
 }
 
-fn generate_serialization(fields: &Fields) -> proc_macro2::TokenStream {
+fn generate_as_bytes(fields: &Fields) -> proc_macro2::TokenStream {
     match fields {
         Fields::Named(fields_named) => {
             let field_names: Vec<_> = fields_named
@@ -308,7 +291,7 @@ fn generate_serialization(fields: &Fields) -> proc_macro2::TokenStream {
     }
 }
 
-fn generate_deserialization(name: &Ident, fields: &Fields) -> proc_macro2::TokenStream {
+fn generate_from_bytes(name: &Ident, fields: &Fields) -> proc_macro2::TokenStream {
     match fields {
         Fields::Named(fields_named) => {
             let field_names: Vec<_> = fields_named
