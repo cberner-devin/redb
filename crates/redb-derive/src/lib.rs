@@ -185,132 +185,102 @@ fn generate_fixed_width(fields: &Fields) -> proc_macro2::TokenStream {
     }
 }
 
+enum FieldAccessor {
+    Named(proc_macro2::TokenStream),
+    Indexed(proc_macro2::TokenStream),
+}
+
 fn generate_as_bytes(fields: &Fields) -> proc_macro2::TokenStream {
-    match fields {
+    let (field_accessors, field_types) = match fields {
         Fields::Named(fields_named) => {
-            let field_names: Vec<_> = fields_named
+            let field_accessors: Vec<_> = fields_named
                 .named
                 .iter()
-                .map(|field| &field.ident)
+                .map(|field| {
+                    let field_name = &field.ident;
+                    quote! { #field_name }
+                })
                 .collect();
             let field_types: Vec<_> = fields_named.named.iter().map(|field| &field.ty).collect();
-            let num_fields = field_types.len();
-
-            if num_fields == 0 {
-                return quote! { Vec::new() };
-            }
-
-            if num_fields == 1 {
-                let field_name = &field_names[0];
-                let field_type = &field_types[0];
-                quote! {
-                    {
-                        let field_bytes = <#field_type>::as_bytes(&value.#field_name);
-                        field_bytes.as_ref().to_vec()
-                    }
-                }
-            } else {
-                let field_names_except_last = &field_names[..num_fields - 1];
-                let field_types_except_last = &field_types[..num_fields - 1];
-
-                quote! {
-                    {
-                        let mut result = Vec::new();
-
-                        #(
-                            if <#field_types_except_last>::fixed_width().is_none() {
-                                let field_bytes = <#field_types_except_last>::as_bytes(&value.#field_names_except_last);
-                                let bytes: &[u8] = field_bytes.as_ref();
-                                let len = bytes.len();
-                                if len < 254 {
-                                    result.push(len.try_into().unwrap());
-                                } else if len <= u16::MAX.into() {
-                                    let u16_len: u16 = len.try_into().unwrap();
-                                    result.push(254u8);
-                                    result.extend_from_slice(&u16_len.to_le_bytes());
-                                } else {
-                                    let u32_len: u32 = len.try_into().unwrap();
-                                    result.push(255u8);
-                                    result.extend_from_slice(&u32_len.to_le_bytes());
-                                }
-                            }
-                        )*
-
-                        #(
-                            {
-                                let field_bytes = <#field_types>::as_bytes(&value.#field_names);
-                                result.extend_from_slice(field_bytes.as_ref());
-                            }
-                        )*
-
-                        result
-                    }
-                }
-            }
+            (field_accessors, field_types)
         }
         Fields::Unnamed(fields_unnamed) => {
+            let field_accessors: Vec<_> = (0..fields_unnamed.unnamed.len())
+                .map(|i| {
+                    let index = syn::Index::from(i);
+                    quote! { #index }
+                })
+                .collect();
             let field_types: Vec<_> = fields_unnamed
                 .unnamed
                 .iter()
                 .map(|field| &field.ty)
                 .collect();
-            let field_indices: Vec<_> = (0..field_types.len()).map(syn::Index::from).collect();
-            let num_fields = field_types.len();
-
-            if num_fields == 0 {
-                return quote! { Vec::new() };
-            }
-
-            if num_fields == 1 {
-                let field_index = &field_indices[0];
-                let field_type = &field_types[0];
-                quote! {
-                    {
-                        let field_bytes = <#field_type>::as_bytes(&value.#field_index);
-                        field_bytes.as_ref().to_vec()
-                    }
-                }
-            } else {
-                let field_types_except_last = &field_types[..num_fields - 1];
-                let field_indices_except_last = &field_indices[..num_fields - 1];
-
-                quote! {
-                    {
-                        let mut result = Vec::new();
-
-                        #(
-                            if <#field_types_except_last>::fixed_width().is_none() {
-                                let field_bytes = <#field_types_except_last>::as_bytes(&value.#field_indices_except_last);
-                                let bytes: &[u8] = field_bytes.as_ref();
-                                let len = bytes.len();
-                                if len < 254 {
-                                    result.push(len.try_into().unwrap());
-                                } else if len <= u16::MAX.into() {
-                                    let u16_len: u16 = len.try_into().unwrap();
-                                    result.push(254u8);
-                                    result.extend_from_slice(&u16_len.to_le_bytes());
-                                } else {
-                                    let u32_len: u32 = len.try_into().unwrap();
-                                    result.push(255u8);
-                                    result.extend_from_slice(&u32_len.to_le_bytes());
-                                }
-                            }
-                        )*
-
-                        #(
-                            {
-                                let field_bytes = <#field_types>::as_bytes(&value.#field_indices);
-                                result.extend_from_slice(field_bytes.as_ref());
-                            }
-                        )*
-
-                        result
-                    }
-                }
-            }
+            (field_accessors, field_types)
         }
         Fields::Unit => {
-            quote! { Vec::new() }
+            return quote! { Vec::new() };
+        }
+    };
+
+    generate_serialization_logic(field_accessors, field_types)
+}
+
+fn generate_serialization_logic(
+    field_accessors: Vec<proc_macro2::TokenStream>,
+    field_types: Vec<&syn::Type>,
+) -> proc_macro2::TokenStream {
+    let num_fields = field_types.len();
+
+    if num_fields == 0 {
+        return quote! { Vec::new() };
+    }
+
+    if num_fields == 1 {
+        let field_accessor = &field_accessors[0];
+        let field_type = &field_types[0];
+        quote! {
+            {
+                let field_bytes = <#field_type>::as_bytes(&value.#field_accessor);
+                field_bytes.as_ref().to_vec()
+            }
+        }
+    } else {
+        let field_types_except_last = &field_types[..num_fields - 1];
+        let field_accessors_except_last = &field_accessors[..num_fields - 1];
+
+        quote! {
+            {
+                let mut result = Vec::new();
+
+                #(
+                    if <#field_types_except_last>::fixed_width().is_none() {
+                        let field_bytes = <#field_types_except_last>::as_bytes(&value.#field_accessors_except_last);
+                        let bytes: &[u8] = field_bytes.as_ref();
+                        let len = bytes.len();
+                        if len < 254 {
+                            result.push(len.try_into().unwrap());
+                        } else if len <= u16::MAX.into() {
+                            let u16_len: u16 = len.try_into().unwrap();
+                            result.push(254u8);
+                            result.extend_from_slice(&u16_len.to_le_bytes());
+                        } else {
+                            let u32_len: u32 = len.try_into().unwrap();
+                            result.push(255u8);
+                            result.extend_from_slice(&u32_len.to_le_bytes());
+                        }
+                    }
+                )*
+
+                #(
+                    {
+                        let field_bytes = <#field_types>::as_bytes(&value.#field_accessors);
+                        result.extend_from_slice(field_bytes.as_ref());
+                    }
+                )*
+
+                result
+            }
         }
     }
 }
