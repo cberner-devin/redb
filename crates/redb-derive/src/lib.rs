@@ -104,11 +104,19 @@ fn generate_type_name(struct_name: &Ident, fields: &Fields) -> proc_macro2::Toke
                 })
                 .collect();
 
-            quote! {
-                redb::TypeName::new(&format!("{} {{{}}}",
-                    stringify!(#struct_name),
-                    [#(#field_strings),*].join(", ")
-                ))
+            if field_strings.is_empty() {
+                quote! {
+                    redb::TypeName::new(&format!("{} {{}}",
+                        stringify!(#struct_name),
+                    ))
+                }
+            } else {
+                quote! {
+                    redb::TypeName::new(&format!("{} {{{}}}",
+                        stringify!(#struct_name),
+                        [#(#field_strings),*].join(", ")
+                    ))
+                }
             }
         }
         Fields::Unnamed(fields_unnamed) => {
@@ -123,11 +131,19 @@ fn generate_type_name(struct_name: &Ident, fields: &Fields) -> proc_macro2::Toke
                 })
                 .collect();
 
-            quote! {
-                redb::TypeName::new(&format!("{}({})",
-                    stringify!(#struct_name),
-                    [#(#field_strings),*].join(", ")
-                ))
+            if field_strings.is_empty() {
+                quote! {
+                    redb::TypeName::new(&format!("{}()",
+                        stringify!(#struct_name),
+                    ))
+                }
+            } else {
+                quote! {
+                    redb::TypeName::new(&format!("{}({})",
+                        stringify!(#struct_name),
+                        [#(#field_strings),*].join(", ")
+                    ))
+                }
             }
         }
         Fields::Unit => {
@@ -300,6 +316,70 @@ fn generate_as_bytes(fields: &Fields) -> proc_macro2::TokenStream {
 }
 
 fn generate_from_bytes(name: &Ident, fields: &Fields) -> proc_macro2::TokenStream {
+    let field_types = get_field_types(fields);
+    let field_vars: Vec<_> = (0..field_types.len())
+        .map(|i| quote::format_ident!("field_{}", i))
+        .collect();
+    let num_fields = field_types.len();
+    let body = if num_fields == 0 {
+        quote! {}
+    } else if num_fields == 1 {
+        let field_var = &field_vars[0];
+        let field_type = &field_types[0];
+        quote! {
+            let #field_var = <#field_type>::from_bytes(data);
+        }
+    } else {
+        let field_types_except_last = &field_types[..num_fields - 1];
+        let field_vars_except_last = &field_vars[..num_fields - 1];
+        let last_field_var = field_vars.last();
+        let last_field_type = field_types.last();
+
+        quote! {
+            let mut offset = 0usize;
+            let mut var_lengths = Vec::new();
+
+            #(
+                if <#field_types_except_last>::fixed_width().is_none() {
+                    let (len, bytes_read) = match data[offset] {
+                        0u8..=253u8 => (data[offset] as usize, 1usize),
+                        254u8 => (
+                            u16::from_le_bytes(data[offset + 1..offset + 3].try_into().unwrap()) as usize,
+                            3usize,
+                        ),
+                        255u8 => (
+                            u32::from_le_bytes(data[offset + 1..offset + 5].try_into().unwrap()) as usize,
+                            5usize,
+                        ),
+                    };
+                    var_lengths.push(len);
+                    offset += bytes_read;
+                }
+            )*
+
+            let mut var_index = 0;
+            #(
+                let #field_vars_except_last = if let Some(fixed_width) = <#field_types_except_last>::fixed_width() {
+                    let field_data = &data[offset..offset + fixed_width];
+                    offset += fixed_width;
+                    <#field_types_except_last>::from_bytes(field_data)
+                } else {
+                    let len = var_lengths[var_index];
+                    let field_data = &data[offset..offset + len];
+                    offset += len;
+                    var_index += 1;
+                    <#field_types_except_last>::from_bytes(field_data)
+                };
+            )*
+
+            let #last_field_var = if let Some(fixed_width) = <#last_field_type>::fixed_width() {
+                let field_data = &data[offset..offset + fixed_width];
+                <#last_field_type>::from_bytes(field_data)
+            } else {
+                <#last_field_type>::from_bytes(&data[offset..])
+            };
+        }
+    };
     match fields {
         Fields::Named(fields_named) => {
             let field_names: Vec<_> = fields_named
@@ -307,159 +387,21 @@ fn generate_from_bytes(name: &Ident, fields: &Fields) -> proc_macro2::TokenStrea
                 .iter()
                 .map(|field| &field.ident)
                 .collect();
-            let field_types: Vec<_> = fields_named.named.iter().map(|field| &field.ty).collect();
-            let num_fields = field_types.len();
 
-            if num_fields == 0 {
-                return quote! { #name {} };
-            }
-
-            if num_fields == 1 {
-                let field_name = &field_names[0];
-                let field_type = &field_types[0];
-                quote! {
-                    {
-                        let #field_name = <#field_type>::from_bytes(data);
-                        #name {
-                            #field_name
-                        }
-                    }
-                }
-            } else {
-                let field_names_except_last = &field_names[..num_fields - 1];
-                let field_types_except_last = &field_types[..num_fields - 1];
-                let last_field_name = field_names.last();
-                let last_field_type = field_types.last();
-
-                quote! {
-                    {
-                        let mut offset = 0usize;
-                        let mut var_lengths = Vec::new();
-
-                        #(
-                            if <#field_types_except_last>::fixed_width().is_none() {
-                                let (len, bytes_read) = match data[offset] {
-                                    0u8..=253u8 => (data[offset] as usize, 1usize),
-                                    254u8 => (
-                                        u16::from_le_bytes(data[offset + 1..offset + 3].try_into().unwrap()) as usize,
-                                        3usize,
-                                    ),
-                                    255u8 => (
-                                        u32::from_le_bytes(data[offset + 1..offset + 5].try_into().unwrap()) as usize,
-                                        5usize,
-                                    ),
-                                };
-                                var_lengths.push(len);
-                                offset += bytes_read;
-                            }
-                        )*
-
-                        let mut var_index = 0;
-                        #(
-                            let #field_names_except_last = if let Some(fixed_width) = <#field_types_except_last>::fixed_width() {
-                                let field_data = &data[offset..offset + fixed_width];
-                                offset += fixed_width;
-                                <#field_types_except_last>::from_bytes(field_data)
-                            } else {
-                                let len = var_lengths[var_index];
-                                let field_data = &data[offset..offset + len];
-                                offset += len;
-                                var_index += 1;
-                                <#field_types_except_last>::from_bytes(field_data)
-                            };
-                        )*
-
-                        let #last_field_name = if let Some(fixed_width) = <#last_field_type>::fixed_width() {
-                            let field_data = &data[offset..offset + fixed_width];
-                            <#last_field_type>::from_bytes(field_data)
-                        } else {
-                            <#last_field_type>::from_bytes(&data[offset..])
-                        };
-
-                        #name {
-                            #(#field_names),*
-                        }
+            quote! {
+                {
+                    #body
+                    #name {
+                        #(#field_names: #field_vars),*
                     }
                 }
             }
         }
-        Fields::Unnamed(fields_unnamed) => {
-            let field_types: Vec<_> = fields_unnamed
-                .unnamed
-                .iter()
-                .map(|field| &field.ty)
-                .collect();
-            let field_vars: Vec<_> = (0..field_types.len())
-                .map(|i| quote::format_ident!("field_{}", i))
-                .collect();
-            let num_fields = field_types.len();
-
-            if num_fields == 0 {
-                return quote! { #name() };
-            }
-
-            if num_fields == 1 {
-                let field_var = &field_vars[0];
-                let field_type = &field_types[0];
-                quote! {
-                    {
-                        let #field_var = <#field_type>::from_bytes(data);
-                        #name(#field_var)
-                    }
-                }
-            } else {
-                let field_types_except_last = &field_types[..num_fields - 1];
-                let field_vars_except_last = &field_vars[..num_fields - 1];
-                let last_field_var = field_vars.last();
-                let last_field_type = field_types.last();
-
-                quote! {
-                    {
-                        let mut offset = 0usize;
-                        let mut var_lengths = Vec::new();
-
-                        #(
-                            if <#field_types_except_last>::fixed_width().is_none() {
-                                let (len, bytes_read) = match data[offset] {
-                                    0u8..=253u8 => (data[offset] as usize, 1usize),
-                                    254u8 => (
-                                        u16::from_le_bytes(data[offset + 1..offset + 3].try_into().unwrap()) as usize,
-                                        3usize,
-                                    ),
-                                    255u8 => (
-                                        u32::from_le_bytes(data[offset + 1..offset + 5].try_into().unwrap()) as usize,
-                                        5usize,
-                                    ),
-                                };
-                                var_lengths.push(len);
-                                offset += bytes_read;
-                            }
-                        )*
-
-                        let mut var_index = 0;
-                        #(
-                            let #field_vars_except_last = if let Some(fixed_width) = <#field_types_except_last>::fixed_width() {
-                                let field_data = &data[offset..offset + fixed_width];
-                                offset += fixed_width;
-                                <#field_types_except_last>::from_bytes(field_data)
-                            } else {
-                                let len = var_lengths[var_index];
-                                let field_data = &data[offset..offset + len];
-                                offset += len;
-                                var_index += 1;
-                                <#field_types_except_last>::from_bytes(field_data)
-                            };
-                        )*
-
-                        let #last_field_var = if let Some(fixed_width) = <#last_field_type>::fixed_width() {
-                            let field_data = &data[offset..offset + fixed_width];
-                            <#last_field_type>::from_bytes(field_data)
-                        } else {
-                            <#last_field_type>::from_bytes(&data[offset..])
-                        };
-
-                        #name(#(#field_vars),*)
-                    }
+        Fields::Unnamed(_) => {
+            quote! {
+                {
+                    #body
+                    #name(#(#field_vars),*)
                 }
             }
         }

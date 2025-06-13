@@ -18,7 +18,16 @@ struct SimpleStruct {
 }
 
 #[derive(Value, Debug, PartialEq)]
-struct TupleStruct(u64, bool);
+struct TupleStruct0();
+
+#[derive(Value, Debug, PartialEq)]
+struct TupleStruct1(u64);
+
+#[derive(Value, Debug, PartialEq)]
+struct TupleStruct2(u64, bool);
+
+#[derive(Value, Debug, PartialEq)]
+struct ZeroField {}
 
 #[derive(Value, Debug, PartialEq)]
 struct SingleField {
@@ -77,13 +86,38 @@ fn test_simple_struct() {
 }
 
 #[test]
-fn test_tuple_struct() {
-    let original = TupleStruct(123456789, true);
-    let bytes = TupleStruct::as_bytes(&original);
+fn test_tuple_struct0() {
+    let original = TupleStruct0();
+    let bytes = TupleStruct0::as_bytes(&original);
+    <()>::from_bytes(&bytes);
+    test_helper::<TupleStruct0>(original, "TupleStruct0()");
+}
+
+#[test]
+fn test_tuple_struct1() {
+    let original = TupleStruct1(123456789);
+    let bytes = TupleStruct1::as_bytes(&original);
+    let (x,) = <(u64,)>::from_bytes(&bytes);
+    assert_eq!(x, original.0);
+    test_helper::<TupleStruct1>(original, "TupleStruct1(u64)");
+}
+
+#[test]
+fn test_tuple_struct2() {
+    let original = TupleStruct2(123456789, true);
+    let bytes = TupleStruct2::as_bytes(&original);
     let (x, y) = <(u64, bool)>::from_bytes(&bytes);
     assert_eq!(x, original.0);
     assert_eq!(y, original.1);
-    test_helper::<TupleStruct>(original, "TupleStruct(u64, bool)");
+    test_helper::<TupleStruct2>(original, "TupleStruct2(u64, bool)");
+}
+
+#[test]
+fn test_zero_fields() {
+    let original = ZeroField {};
+    let bytes = ZeroField::as_bytes(&original);
+    <()>::from_bytes(&bytes);
+    test_helper::<ZeroField>(original, "ZeroField {}");
 }
 
 #[test]
