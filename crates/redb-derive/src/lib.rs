@@ -57,7 +57,11 @@ pub fn derive_value(input: TokenStream) -> TokenStream {
                 (quote! { < #(#params),* > }, self_type_lifetime)
             };
 
-            let self_type_def = quote! { type SelfType<#self_type_lifetime> = #name #type_generics_with_a where Self: #self_type_lifetime; };
+            let self_type_def = if lifetime_params.is_empty() {
+                quote! { type SelfType<'a> = #name #type_generics_with_a; }
+            } else {
+                quote! { type SelfType<#self_type_lifetime> = #name #type_generics_with_a where Self: #self_type_lifetime; }
+            };
 
             quote! {
                 impl #impl_generics redb::Value for #name #ty_generics #where_clause {
