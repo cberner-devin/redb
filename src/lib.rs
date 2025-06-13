@@ -85,6 +85,11 @@ pub use types::{Key, MutInPlaceValue, TypeName, Value};
 
 pub type Result<T = (), E = StorageError> = std::result::Result<T, E>;
 
+#[cfg(feature = "python")]
+pub use crate::python::redb;
+
+#[cfg(feature = "derive")]
+pub use redb_derive::Key;
 pub mod backends;
 mod complex_types;
 mod db;
