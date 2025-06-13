@@ -60,18 +60,30 @@ fn test_simple_struct() {
         id: 42,
         name: "test".to_string(),
     };
+    let bytes = SimpleStruct::as_bytes(&original);
+    let (id, name) = <(u32, String)>::from_bytes(&bytes);
+    assert_eq!(id, original.id);
+    assert_eq!(name, original.name);
+
     test_helper::<SimpleStruct>(original, "SimpleStruct {id: u32, name: String}");
 }
 
 #[test]
 fn test_tuple_struct() {
     let original = TupleStruct(123456789, true);
+    let bytes = TupleStruct::as_bytes(&original);
+    let (x, y) = <(u64, bool)>::from_bytes(&bytes);
+    assert_eq!(x, original.0);
+    assert_eq!(y, original.1);
     test_helper::<TupleStruct>(original, "TupleStruct(u64, bool)");
 }
 
 #[test]
 fn test_single_field() {
     let original = SingleField { value: -42 };
+    let bytes = SingleField::as_bytes(&original);
+    let value = <i32>::from_bytes(&bytes);
+    assert_eq!(value, original.value);
     test_helper::<SingleField>(original, "SingleField {value: i32}");
 }
 
@@ -83,6 +95,13 @@ fn test_complex_struct() {
         reference: "hello",
         reference2: "world",
     };
+    let bytes = ComplexStruct::as_bytes(&original);
+    let (tuple_field, array_field, reference, reference2) =
+        <((u8, u16, u32), [(u8, Option<u16>); 2], &str, &str)>::from_bytes(&bytes);
+    assert_eq!(tuple_field, original.tuple_field);
+    assert_eq!(array_field, original.array_field);
+    assert_eq!(reference, original.reference);
+    assert_eq!(reference2, original.reference2);
 
     let expected_name = "ComplexStruct {tuple_field: (u8,u16,u32), array_field: [(u8,Option<u16>);2], reference: &str, reference2: &str}";
     test_helper::<ComplexStruct>(original, expected_name);
