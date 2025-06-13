@@ -3,6 +3,14 @@ use redb_derive::Value;
 use std::fmt::Debug;
 use tempfile::NamedTempFile;
 
+fn create_tempfile() -> NamedTempFile {
+    if cfg!(target_os = "wasi") {
+        NamedTempFile::new_in("/tmp").unwrap()
+    } else {
+        NamedTempFile::new().unwrap()
+    }
+}
+
 #[derive(Value, Debug, PartialEq)]
 struct SimpleStruct {
     id: u32,
@@ -32,7 +40,7 @@ where
     let type_name = V::type_name();
     assert_eq!(type_name.name(), expected_type_name);
 
-    let file = NamedTempFile::new().unwrap();
+    let file = create_tempfile();
     let db = Database::create(file.path()).unwrap();
     let table_def: TableDefinition<u32, V> = TableDefinition::new("test");
 
