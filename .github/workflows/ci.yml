@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Cache
+      - name: Cache Rust artifacts
         id: rust-cache
         uses: actions/cache@v4
         with:
@@ -29,7 +29,17 @@ jobs:
                 ~/.cargo/registry/cache/
                 ~/.cargo/git/db/
                 target/
-            key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml', 'rust-toolchain') }}
+            key: ${{ runner.os }}-${{ runner.arch }}-rust-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml', 'rust-toolchain') }}
+
+      - name: Cache Python artifacts
+        id: python-cache
+        uses: actions/cache@v4
+        with:
+            path: |
+                ~/.cache/pip
+                venv/
+                crates/redb-python/target/
+            key: ${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('crates/redb-python/Cargo.toml', 'crates/redb-python/pyproject.toml') }}
 
       - name: Check for forbidden words
         if: runner.os != 'Windows'
@@ -87,19 +97,27 @@ jobs:
       - name: Run CPython wrapper tests
         if: runner.os != 'Windows'
         run: |
-          python3 -m venv venv
-          source venv/bin/activate
-          pip3 install --upgrade pip
-          pip3 install maturin
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+            source venv/bin/activate
+            pip3 install --upgrade pip
+            pip3 install maturin
+          else
+            source venv/bin/activate
+          fi
           just test_py
 
       - name: Run CPython wrapper tests
         if: runner.os == 'Windows'
         run: |
-          python3 -m venv venv
-          venv\Scripts\activate
-          pip3 install --upgrade pip
-          pip3 install maturin
+          if (!(Test-Path "venv")) {
+            python3 -m venv venv
+            venv\Scripts\activate
+            pip3 install --upgrade pip
+            pip3 install maturin
+          } else {
+            venv\Scripts\activate
+          }
           just test_py
 
       - name: Run WASI tests

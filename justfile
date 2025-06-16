@@ -31,7 +31,12 @@ test_py: install_py
     python3 -m unittest discover --start-directory=./crates/redb-python
 
 install_py: pre
-    maturin develop --manifest-path=./crates/redb-python/Cargo.toml
+    @if [ ! -f "crates/redb-python/target/.maturin_cache" ]; then \
+        maturin develop --manifest-path=./crates/redb-python/Cargo.toml && \
+        touch crates/redb-python/target/.maturin_cache; \
+    else \
+        echo "Using cached maturin build"; \
+    fi
 
 test: pre
     RUST_BACKTRACE=1 cargo test
