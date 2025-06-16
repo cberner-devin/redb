@@ -33,6 +33,7 @@ test_py: install_py
 install_py: pre
     @if [ ! -f "crates/redb-python/target/.maturin_cache" ]; then \
         maturin develop --manifest-path=./crates/redb-python/Cargo.toml && \
+        mkdir -p crates/redb-python/target && \
         touch crates/redb-python/target/.maturin_cache; \
     else \
         echo "Using cached maturin build"; \

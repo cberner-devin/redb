@@ -99,11 +99,12 @@ jobs:
         run: |
           if [ ! -d "venv" ]; then
             python3 -m venv venv
-            source venv/bin/activate
+          fi
+          source venv/bin/activate
+          if [ ! -f "venv/.installed" ]; then
             pip3 install --upgrade pip
             pip3 install maturin
-          else
-            source venv/bin/activate
+            touch venv/.installed
           fi
           just test_py
 
@@ -112,11 +113,12 @@ jobs:
         run: |
           if (!(Test-Path "venv")) {
             python3 -m venv venv
-            venv\Scripts\activate
+          }
+          venv\Scripts\activate
+          if (!(Test-Path "venv\.installed")) {
             pip3 install --upgrade pip
             pip3 install maturin
-          } else {
-            venv\Scripts\activate
+            New-Item -Path "venv\.installed" -ItemType File
           }
           just test_py
 
