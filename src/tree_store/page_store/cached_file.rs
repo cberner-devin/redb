@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 pub(super) struct WritablePage {
     buffer: Arc<Mutex<LRUWriteCache>>,
     offset: u64,
-    data: Arc<[u8]>,
+    data: Box<[u8]>,
 }
 
 impl WritablePage {
@@ -20,7 +20,7 @@ impl WritablePage {
     }
 
     pub(super) fn mem_mut(&mut self) -> &mut [u8] {
-        Arc::get_mut(&mut self.data).unwrap()
+        &mut self.data
     }
 }
 
@@ -49,7 +49,7 @@ impl<I: SliceIndex<[u8]>> IndexMut<I> for WritablePage {
 
 #[derive(Default)]
 struct LRUWriteCache {
-    cache: LRUCache<Option<Arc<[u8]>>>,
+    cache: LRUCache<Option<Box<[u8]>>>,
 }
 
 impl LRUWriteCache {
@@ -59,15 +59,15 @@ impl LRUWriteCache {
         }
     }
 
-    fn insert(&mut self, key: u64, value: Arc<[u8]>) {
+    fn insert(&mut self, key: u64, value: Box<[u8]>) {
         assert!(self.cache.insert(key, Some(value)).is_none());
     }
 
-    fn get(&self, key: u64) -> Option<&Arc<[u8]>> {
-        self.cache.get(key).map(|x| x.as_ref().unwrap())
+    fn get(&self, key: u64) -> Option<&[u8]> {
+        self.cache.get(key).map(|x| x.as_ref().unwrap().as_ref())
     }
 
-    fn remove(&mut self, key: u64) -> Option<Arc<[u8]>> {
+    fn remove(&mut self, key: u64) -> Option<Box<[u8]>> {
         if let Some(value) = self.cache.remove(key) {
             assert!(value.is_some());
             return value;
@@ -75,11 +75,11 @@ impl LRUWriteCache {
         None
     }
 
-    fn return_value(&mut self, key: u64, value: Arc<[u8]>) {
+    fn return_value(&mut self, key: u64, value: Box<[u8]>) {
         assert!(self.cache.get_mut(key).unwrap().replace(value).is_none());
     }
 
-    fn take_value(&mut self, key: u64) -> Option<Arc<[u8]>> {
+    fn take_value(&mut self, key: u64) -> Option<Box<[u8]>> {
         if let Some(value) = self.cache.get_mut(key) {
             let result = value.take().unwrap();
             return Some(result);
@@ -87,7 +87,7 @@ impl LRUWriteCache {
         None
     }
 
-    fn pop_lowest_priority(&mut self) -> Option<(u64, Arc<[u8]>)> {
+    fn pop_lowest_priority(&mut self) -> Option<(u64, Box<[u8]>)> {
         for _ in 0..self.cache.len() {
             if let Some((k, v)) = self.cache.pop_lowest_priority() {
                 if let Some(v_inner) = v {
@@ -278,7 +278,7 @@ impl PagedCachedFile {
             if cache_size + buffer.len() <= self.max_read_cache_bytes {
                 let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
                 let mut lock = self.read_cache[cache_slot].write().unwrap();
-                if let Some(replaced) = lock.insert(*offset, buffer) {
+                if let Some(replaced) = lock.insert(*offset, buffer.into_vec().into()) {
                     // A race could cause us to replace an existing buffer
                     self.read_cache_bytes
                         .fetch_sub(replaced.len(), Ordering::AcqRel);
@@ -332,7 +332,7 @@ impl PagedCachedFile {
                 #[cfg(feature = "cache_metrics")]
                 self.reads_hits.fetch_add(1, Ordering::Release);
                 debug_assert_eq!(cached.len(), len);
-                return Ok(cached.clone());
+                return Ok(cached.to_vec().into());
             }
         }
 
@@ -462,11 +462,11 @@ impl PagedCachedFile {
                 }
             }
             let result = if let Some(data) = existing {
-                data
+                data.to_vec().into_boxed_slice()
             } else if overwrite {
-                vec![0; len].into()
+                vec![0; len].into_boxed_slice()
             } else {
-                self.read_direct(offset, len)?.into()
+                self.read_direct(offset, len)?.into_boxed_slice()
             };
             lock.insert(offset, result);
             lock.take_value(offset).unwrap()
