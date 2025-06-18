@@ -345,6 +345,9 @@ impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> boo
     for BtreeExtractIf<'_, K, V, F>
 {
     fn drop(&mut self) {
+        self.inner.left = None;
+        self.inner.right = None;
+
         let mut master_free_list = self.master_free_list.lock().unwrap();
         let mut allocated = self.allocated.lock().unwrap();
         for page in self.free_on_drop.drain(..) {
