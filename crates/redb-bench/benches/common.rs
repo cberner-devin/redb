@@ -1545,26 +1545,7 @@ impl BenchReader for SqliteBenchReader {
     }
 
     fn range_from<'a>(&'a self, key: &'a [u8]) -> Self::Iterator<'a> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT key, value FROM kv WHERE key >= ? ORDER BY key")
-            .unwrap();
-        let rows = stmt
-            .query_map([key], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .unwrap();
-
-        let mut results = Vec::new();
-        for row in rows {
-            if let Ok(kv) = row {
-                results.push(kv);
-            }
-        }
-
-        SqliteBenchIterator {
-            results: results.into_iter(),
-        }
+        SqliteBenchIterator::new(Arc::clone(&self.conn), key)
     }
 
     fn len(&self) -> u64 {
@@ -1575,7 +1556,21 @@ impl BenchReader for SqliteBenchReader {
 }
 
 pub struct SqliteBenchIterator {
-    results: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    conn: Arc<Mutex<Connection>>,
+    start_key: Vec<u8>,
+    last_key: Option<Vec<u8>>,
+    exhausted: bool,
+}
+
+impl SqliteBenchIterator {
+    fn new(conn: Arc<Mutex<Connection>>, key: &[u8]) -> Self {
+        SqliteBenchIterator {
+            conn,
+            start_key: key.to_vec(),
+            last_key: None,
+            exhausted: false,
+        }
+    }
 }
 
 impl BenchIterator for SqliteBenchIterator {
@@ -1585,6 +1580,31 @@ impl BenchIterator for SqliteBenchIterator {
         Self: 'out;
 
     fn next(&mut self) -> Option<(Self::Output<'_>, Self::Output<'_>)> {
-        self.results.next()
+        if self.exhausted {
+            return None;
+        }
+
+        let conn = self.conn.lock().unwrap();
+        
+        let (query, key) = if let Some(ref last_key) = self.last_key {
+            ("SELECT key, value FROM kv WHERE key > ? ORDER BY key LIMIT 1", last_key.as_slice())
+        } else {
+            ("SELECT key, value FROM kv WHERE key >= ? ORDER BY key LIMIT 1", self.start_key.as_slice())
+        };
+
+        let mut stmt = conn.prepare(query).unwrap();
+        let mut rows = stmt.query_map([key], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        }).unwrap();
+
+        if let Some(row_result) = rows.next() {
+            if let Ok((key, value)) = row_result {
+                self.last_key = Some(key.clone());
+                return Some((key, value));
+            }
+        }
+        
+        self.exhausted = true;
+        None
     }
 }
