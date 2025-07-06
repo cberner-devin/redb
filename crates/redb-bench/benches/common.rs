@@ -1585,17 +1585,25 @@ impl BenchIterator for SqliteBenchIterator {
         }
 
         let conn = self.conn.lock().unwrap();
-        
+
         let (query, key) = if let Some(ref last_key) = self.last_key {
-            ("SELECT key, value FROM kv WHERE key > ? ORDER BY key LIMIT 1", last_key.as_slice())
+            (
+                "SELECT key, value FROM kv WHERE key > ? ORDER BY key LIMIT 1",
+                last_key.as_slice(),
+            )
         } else {
-            ("SELECT key, value FROM kv WHERE key >= ? ORDER BY key LIMIT 1", self.start_key.as_slice())
+            (
+                "SELECT key, value FROM kv WHERE key >= ? ORDER BY key LIMIT 1",
+                self.start_key.as_slice(),
+            )
         };
 
         let mut stmt = conn.prepare(query).unwrap();
-        let mut rows = stmt.query_map([key], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-        }).unwrap();
+        let mut rows = stmt
+            .query_map([key], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap();
 
         if let Some(row_result) = rows.next() {
             if let Ok((key, value)) = row_result {
@@ -1603,7 +1611,7 @@ impl BenchIterator for SqliteBenchIterator {
                 return Some((key, value));
             }
         }
-        
+
         self.exhausted = true;
         None
     }
