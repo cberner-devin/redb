@@ -3,12 +3,13 @@ use redb::{AccessGuard, ReadableDatabase, ReadableTableMetadata, TableDefinition
 use rocksdb::{
     Direction, IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, WriteOptions,
 };
+use rusqlite::Connection;
 use sanakirja::btree::page_unsized;
 use sanakirja::{Commit, RootDb};
 use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -1406,5 +1407,212 @@ impl BenchInserter for FjallBenchInserter<'_, '_> {
     fn remove(&mut self, key: &[u8]) -> Result<(), ()> {
         self.txn.remove(self.part, key);
         Ok(())
+    }
+}
+
+pub struct SqliteBenchDatabase {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteBenchDatabase {
+    pub fn new(path: &Path) -> Self {
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kv (key BLOB PRIMARY KEY, value BLOB)",
+            [],
+        )
+        .unwrap();
+        conn.execute("PRAGMA synchronous = FULL", []).unwrap();
+        conn.execute("PRAGMA journal_mode = WAL", []).unwrap();
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+        }
+    }
+}
+
+impl BenchDatabase for SqliteBenchDatabase {
+    type W<'db>
+        = SqliteBenchWriteTransaction
+    where
+        Self: 'db;
+    type R<'db>
+        = SqliteBenchReadTransaction
+    where
+        Self: 'db;
+
+    fn db_type_name() -> &'static str {
+        "sqlite"
+    }
+
+    fn write_transaction(&self) -> Self::W<'_> {
+        SqliteBenchWriteTransaction {
+            conn: Arc::clone(&self.conn),
+        }
+    }
+
+    fn read_transaction(&self) -> Self::R<'_> {
+        SqliteBenchReadTransaction {
+            conn: Arc::clone(&self.conn),
+        }
+    }
+
+    fn compact(&mut self) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("VACUUM", []).unwrap();
+        true
+    }
+}
+
+pub struct SqliteBenchWriteTransaction {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl BenchWriteTransaction for SqliteBenchWriteTransaction {
+    type W<'txn>
+        = SqliteBenchInserter
+    where
+        Self: 'txn;
+
+    fn get_inserter(&mut self) -> Self::W<'_> {
+        SqliteBenchInserter {
+            conn: Arc::clone(&self.conn),
+        }
+    }
+
+    fn commit(self) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+pub struct SqliteBenchInserter {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl BenchInserter for SqliteBenchInserter {
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+            [key, value],
+        )
+        .map(|_| ())
+        .map_err(|_| ())
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Result<(), ()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM kv WHERE key = ?", [key])
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+}
+
+pub struct SqliteBenchReadTransaction {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl BenchReadTransaction for SqliteBenchReadTransaction {
+    type T<'txn>
+        = SqliteBenchReader
+    where
+        Self: 'txn;
+
+    fn get_reader(&self) -> Self::T<'_> {
+        SqliteBenchReader {
+            conn: Arc::clone(&self.conn),
+        }
+    }
+}
+
+pub struct SqliteBenchReader {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl BenchReader for SqliteBenchReader {
+    type Output<'out>
+        = Vec<u8>
+    where
+        Self: 'out;
+    type Iterator<'out>
+        = SqliteBenchIterator
+    where
+        Self: 'out;
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM kv WHERE key = ?").unwrap();
+        stmt.query_row([key], |row| row.get(0)).ok()
+    }
+
+    fn range_from<'a>(&'a self, key: &'a [u8]) -> Self::Iterator<'a> {
+        SqliteBenchIterator::new(Arc::clone(&self.conn), key)
+    }
+
+    fn len(&self) -> u64 {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM kv").unwrap();
+        stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap() as u64
+    }
+}
+
+pub struct SqliteBenchIterator {
+    conn: Arc<Mutex<Connection>>,
+    start_key: Vec<u8>,
+    last_key: Option<Vec<u8>>,
+    exhausted: bool,
+}
+
+impl SqliteBenchIterator {
+    fn new(conn: Arc<Mutex<Connection>>, key: &[u8]) -> Self {
+        SqliteBenchIterator {
+            conn,
+            start_key: key.to_vec(),
+            last_key: None,
+            exhausted: false,
+        }
+    }
+}
+
+impl BenchIterator for SqliteBenchIterator {
+    type Output<'out>
+        = Vec<u8>
+    where
+        Self: 'out;
+
+    fn next(&mut self) -> Option<(Self::Output<'_>, Self::Output<'_>)> {
+        if self.exhausted {
+            return None;
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        let (query, key) = if let Some(ref last_key) = self.last_key {
+            (
+                "SELECT key, value FROM kv WHERE key > ? ORDER BY key LIMIT 1",
+                last_key.as_slice(),
+            )
+        } else {
+            (
+                "SELECT key, value FROM kv WHERE key >= ? ORDER BY key LIMIT 1",
+                self.start_key.as_slice(),
+            )
+        };
+
+        let mut stmt = conn.prepare(query).unwrap();
+        let mut rows = stmt
+            .query_map([key], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap();
+
+        if let Some(row_result) = rows.next() {
+            if let Ok((key, value)) = row_result {
+                self.last_key = Some(key.clone());
+                return Some((key, value));
+            }
+        }
+
+        self.exhausted = true;
+        None
     }
 }
