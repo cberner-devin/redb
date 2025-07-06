@@ -3,13 +3,13 @@ use redb::{AccessGuard, ReadableDatabase, ReadableTableMetadata, TableDefinition
 use rocksdb::{
     Direction, IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, WriteOptions,
 };
-use rusqlite::{Connection, Transaction};
+use rusqlite::Connection;
 use sanakirja::btree::page_unsized;
 use sanakirja::{Commit, RootDb};
 use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -1411,7 +1411,7 @@ impl BenchInserter for FjallBenchInserter<'_, '_> {
 }
 
 pub struct SqliteBenchDatabase {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteBenchDatabase {
@@ -1424,17 +1424,19 @@ impl SqliteBenchDatabase {
         .unwrap();
         conn.execute("PRAGMA synchronous = FULL", []).unwrap();
         conn.execute("PRAGMA journal_mode = WAL", []).unwrap();
-        Self { conn }
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+        }
     }
 }
 
 impl BenchDatabase for SqliteBenchDatabase {
     type W<'db>
-        = SqliteBenchWriteTransaction<'db>
+        = SqliteBenchWriteTransaction
     where
         Self: 'db;
     type R<'db>
-        = SqliteBenchReadTransaction<'db>
+        = SqliteBenchReadTransaction
     where
         Self: 'db;
 
@@ -1443,82 +1445,90 @@ impl BenchDatabase for SqliteBenchDatabase {
     }
 
     fn write_transaction(&self) -> Self::W<'_> {
-        let txn = self.conn.unchecked_transaction().unwrap();
-        SqliteBenchWriteTransaction { txn }
+        SqliteBenchWriteTransaction {
+            conn: Arc::clone(&self.conn),
+        }
     }
 
     fn read_transaction(&self) -> Self::R<'_> {
-        SqliteBenchReadTransaction { conn: &self.conn }
+        SqliteBenchReadTransaction {
+            conn: Arc::clone(&self.conn),
+        }
     }
 
     fn compact(&mut self) -> bool {
-        self.conn.execute("VACUUM", []).unwrap();
+        let conn = self.conn.lock().unwrap();
+        conn.execute("VACUUM", []).unwrap();
         true
     }
 }
 
-pub struct SqliteBenchWriteTransaction<'db> {
-    txn: Transaction<'db>,
+pub struct SqliteBenchWriteTransaction {
+    conn: Arc<Mutex<Connection>>,
 }
 
-impl<'db> BenchWriteTransaction for SqliteBenchWriteTransaction<'db> {
+impl BenchWriteTransaction for SqliteBenchWriteTransaction {
     type W<'txn>
-        = SqliteBenchInserter<'txn, 'db>
+        = SqliteBenchInserter
     where
         Self: 'txn;
 
     fn get_inserter(&mut self) -> Self::W<'_> {
-        SqliteBenchInserter { txn: &self.txn }
+        SqliteBenchInserter {
+            conn: Arc::clone(&self.conn),
+        }
     }
 
     fn commit(self) -> Result<(), ()> {
-        self.txn.commit().map_err(|_| ())
+        Ok(())
     }
 }
 
-pub struct SqliteBenchInserter<'txn, 'db> {
-    txn: &'txn Transaction<'db>,
+pub struct SqliteBenchInserter {
+    conn: Arc<Mutex<Connection>>,
 }
 
-impl BenchInserter for SqliteBenchInserter<'_, '_> {
+impl BenchInserter for SqliteBenchInserter {
     fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
-        self.txn
-            .execute(
-                "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
-                [key, value],
-            )
-            .map(|_| ())
-            .map_err(|_| ())
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+            [key, value],
+        )
+        .map(|_| ())
+        .map_err(|_| ())
     }
 
     fn remove(&mut self, key: &[u8]) -> Result<(), ()> {
-        self.txn
-            .execute("DELETE FROM kv WHERE key = ?", [key])
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM kv WHERE key = ?", [key])
             .map(|_| ())
             .map_err(|_| ())
     }
 }
 
-pub struct SqliteBenchReadTransaction<'db> {
-    conn: &'db Connection,
+pub struct SqliteBenchReadTransaction {
+    conn: Arc<Mutex<Connection>>,
 }
 
-impl<'db> BenchReadTransaction for SqliteBenchReadTransaction<'db> {
+impl BenchReadTransaction for SqliteBenchReadTransaction {
     type T<'txn>
-        = SqliteBenchReader<'db>
+        = SqliteBenchReader
     where
         Self: 'txn;
 
     fn get_reader(&self) -> Self::T<'_> {
-        SqliteBenchReader { conn: self.conn }
+        SqliteBenchReader {
+            conn: Arc::clone(&self.conn),
+        }
     }
 }
 
-pub struct SqliteBenchReader<'db> {
-    conn: &'db Connection,
+pub struct SqliteBenchReader {
+    conn: Arc<Mutex<Connection>>,
 }
 
-impl BenchReader for SqliteBenchReader<'_> {
+impl BenchReader for SqliteBenchReader {
     type Output<'out>
         = Vec<u8>
     where
@@ -1529,16 +1539,14 @@ impl BenchReader for SqliteBenchReader<'_> {
         Self: 'out;
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT value FROM kv WHERE key = ?")
-            .unwrap();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM kv WHERE key = ?").unwrap();
         stmt.query_row([key], |row| row.get(0)).ok()
     }
 
     fn range_from<'a>(&'a self, key: &'a [u8]) -> Self::Iterator<'a> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
             .prepare("SELECT key, value FROM kv WHERE key >= ? ORDER BY key")
             .unwrap();
         let rows = stmt
@@ -1560,7 +1568,8 @@ impl BenchReader for SqliteBenchReader<'_> {
     }
 
     fn len(&self) -> u64 {
-        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM kv").unwrap();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM kv").unwrap();
         stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap() as u64
     }
 }
