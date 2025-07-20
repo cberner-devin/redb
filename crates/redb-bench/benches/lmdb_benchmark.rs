@@ -30,6 +30,18 @@ fn main() {
         opts.increase_parallelism(
             std::thread::available_parallelism().map_or(1, |n| n.get()) as i32
         );
+        
+        opts.set_write_buffer_size(16 * 1024 * 1024); // 16 MiB (further reduced)
+        opts.set_max_write_buffer_number(2); // Limit concurrent memtables
+        opts.set_target_file_size_base(16 * 1024 * 1024); // 16 MiB
+        opts.set_max_bytes_for_level_base(64 * 1024 * 1024); // 64 MiB
+        opts.set_db_write_buffer_size(32 * 1024 * 1024); // Global write buffer limit (reduced)
+        opts.set_max_total_wal_size(16 * 1024 * 1024); // Limit WAL memory usage (reduced)
+        opts.set_arena_block_size(2 * 1024 * 1024); // 2 MiB arena blocks (reduced)
+        opts.set_allow_mmap_reads(true); // Use memory mapping for reads
+        opts.set_allow_mmap_writes(false); // Disable mmap writes to save memory
+        opts.set_max_open_files(100); // Limit open file descriptors
+        opts.set_keep_log_file_num(2); // Limit number of log files
 
         let db = rocksdb::OptimisticTransactionDB::open(&opts, tmpfile.path()).unwrap();
         let table = RocksdbBenchDatabase::new(&db);

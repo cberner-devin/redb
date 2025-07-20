@@ -29,7 +29,7 @@ const KEY_SIZE: usize = 24;
 const VALUE_SIZE: usize = 150;
 const RNG_SEED: u64 = 3;
 
-pub const CACHE_SIZE: usize = 512 * 1_024 * 1_024; // 512 MiB
+pub const CACHE_SIZE: usize = 32 * 1_024 * 1_024; // 32 MiB
 
 /// Returns pairs of key, value
 fn random_pair(rng: &mut fastrand::Rng) -> ([u8; KEY_SIZE], Vec<u8>) {
