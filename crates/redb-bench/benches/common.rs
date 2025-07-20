@@ -597,6 +597,7 @@ pub struct SledBenchDatabase<'a> {
 }
 
 impl<'a> SledBenchDatabase<'a> {
+    #[allow(dead_code)]
     pub fn new(db: &'a sled::Db, path: &'a Path) -> Self {
         SledBenchDatabase { db, db_dir: path }
     }
@@ -756,6 +757,7 @@ pub struct HeedBenchDatabase {
 }
 
 impl HeedBenchDatabase {
+    #[allow(dead_code)]
     pub fn new(env: heed::Env) -> Self {
         let mut tx = env.write_txn().unwrap();
         let db = env.create_database(&mut tx, None).unwrap();
@@ -1530,6 +1532,7 @@ pub struct SqliteBenchDatabase {
 }
 
 impl SqliteBenchDatabase {
+    #[allow(dead_code)]
     pub fn new(path: &Path) -> Self {
         let conn = Connection::open(path).unwrap();
         conn.execute(

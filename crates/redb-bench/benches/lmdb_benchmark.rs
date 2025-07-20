@@ -1,6 +1,6 @@
 use std::env::current_dir;
 use std::{fs, process};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 
 mod common;
 use common::*;
@@ -17,7 +17,7 @@ fn main() {
     })
     .unwrap();
 
-    let rocksdb_results = {
+    let _rocksdb_results = {
         let tmpfile: TempDir = tempfile::tempdir_in(&tmpdir).unwrap();
 
         let mut bb = rocksdb::BlockBasedOptions::default();
@@ -30,7 +30,7 @@ fn main() {
         opts.increase_parallelism(
             std::thread::available_parallelism().map_or(1, |n| n.get()) as i32
         );
-        
+
         opts.set_write_buffer_size(16 * 1024 * 1024); // 16 MiB (further reduced)
         opts.set_max_write_buffer_number(2); // Limit concurrent memtables
         opts.set_target_file_size_base(16 * 1024 * 1024); // 16 MiB
