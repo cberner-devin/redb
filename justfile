@@ -48,6 +48,14 @@ test_wasi:
 bench bench='redb_benchmark': pre
     cargo bench -p redb-bench --bench {{bench}}
 
+build_bench_container:
+    docker build -t redb-bench:latest -f Dockerfile.bench .
+
+bench_release bench='lmdb_benchmark': build_bench_container
+    # TODO: reduce the memory limit to something reasonable
+    # Exec the binary directly, because the memory limit is too low to invoke cargo & rustc
+    docker run --rm -it --memory=6g redb-bench:latest bash -c "cd /code/redb && ./target/release/deps/{{bench}}-*"
+
 watch +args='test':
     cargo watch --clear --exec "{{args}}"
 
