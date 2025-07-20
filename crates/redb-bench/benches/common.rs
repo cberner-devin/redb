@@ -17,7 +17,7 @@ use std::{fs, thread};
 const X: TableDefinition<&[u8], &[u8]> = TableDefinition::new("x");
 
 const READ_ITERATIONS: usize = 2;
-const BULK_ELEMENTS: usize = 1_000_000;
+const BULK_ELEMENTS: usize = 5_000_000;
 const INDIVIDUAL_WRITES: usize = 1_000;
 const BATCH_WRITES: usize = 100;
 const BATCH_SIZE: usize = 1000;
@@ -29,7 +29,7 @@ const KEY_SIZE: usize = 24;
 const VALUE_SIZE: usize = 150;
 const RNG_SEED: u64 = 3;
 
-pub const CACHE_SIZE: usize = 4 * 1_024 * 1_024 * 1_024; // 4GB
+pub const CACHE_SIZE: usize = 512 * 1_024 * 1_024; // 512 MiB
 
 /// Returns pairs of key, value
 fn random_pair(rng: &mut fastrand::Rng) -> ([u8; KEY_SIZE], Vec<u8>) {
