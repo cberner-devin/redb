@@ -193,6 +193,7 @@ impl CheckedBackend {
 pub(super) struct PagedCachedFile {
     file: CheckedBackend,
     page_size: u64,
+    page_size_log2: u32,
     max_read_cache_bytes: usize,
     read_cache_bytes: AtomicUsize,
     max_write_buffer_bytes: usize,
@@ -219,6 +220,8 @@ impl PagedCachedFile {
         max_read_cache_bytes: usize,
         max_write_buffer_bytes: usize,
     ) -> Result<Self, DatabaseError> {
+        debug_assert!(page_size.is_power_of_two());
+        let page_size_log2 = page_size.trailing_zeros();
         let read_cache = (0..Self::lock_stripes())
             .map(|_| RwLock::new(LRUCache::new()))
             .collect();
@@ -226,6 +229,7 @@ impl PagedCachedFile {
         Ok(Self {
             file: CheckedBackend::new(file),
             page_size,
+            page_size_log2,
             max_read_cache_bytes,
             read_cache_bytes: AtomicUsize::new(0),
             max_write_buffer_bytes,
@@ -290,8 +294,17 @@ impl PagedCachedFile {
         self.file.len()
     }
 
-    const fn lock_stripes() -> u64 {
-        131
+    const fn lock_stripes() -> usize {
+        128
+    }
+
+    // Compute cache slot from a page offset (always a multiple of page_size).
+    // Uses a right-shift + bitwise-AND instead of integer division for speed.
+    // page_size is a power of two, so shifting by page_size_log2 extracts
+    // the page index, and masking by (lock_stripes-1) gives a uniform distribution.
+    #[inline(always)]
+    fn cache_slot(&self, offset: u64) -> usize {
+        (offset >> self.page_size_log2) as usize & (Self::lock_stripes() - 1)
     }
 
     fn flush_write_buffer(&self) -> Result {
@@ -307,7 +320,7 @@ impl PagedCachedFile {
                 .fetch_add(buffer.len(), Ordering::AcqRel);
 
             if cache_size + buffer.len() <= self.max_read_cache_bytes {
-                let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
+                let cache_slot = self.cache_slot(*offset);
                 let mut lock = self.read_cache[cache_slot].write().unwrap();
                 if let Some(replaced) = lock.insert(*offset, buffer) {
                     // A race could cause us to replace an existing buffer
@@ -371,7 +384,7 @@ impl PagedCachedFile {
             }
         }
 
-        let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
+        let cache_slot = self.cache_slot(offset);
         {
             let read_lock = self.read_cache[cache_slot].read().unwrap();
             if let Some(cached) = read_lock.get(offset) {
@@ -426,7 +439,7 @@ impl PagedCachedFile {
     //
     // NOTE: Invalidating a cached region in subsections is permitted, as long as all subsections are invalidated
     pub(super) fn invalidate_cache(&self, offset: u64, len: usize) {
-        let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
+        let cache_slot = self.cache_slot(offset);
         let mut lock = self.read_cache[cache_slot].write().unwrap();
         if let Some(removed) = lock.remove(offset) {
             assert_eq!(len, removed.len());
@@ -452,7 +465,7 @@ impl PagedCachedFile {
         let mut lock = self.write_buffer.lock().unwrap();
 
         // TODO: allow hint that page is known to be dirty and will not be in the read cache
-        let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
+        let cache_slot = self.cache_slot(offset);
         let existing = {
             let mut lock = self.read_cache[cache_slot].write().unwrap();
             if let Some(removed) = lock.remove(offset) {
