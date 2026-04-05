@@ -451,30 +451,32 @@ impl PagedCachedFile {
         assert_eq!(0, offset % self.page_size);
         let mut lock = self.write_buffer.lock().unwrap();
 
-        // TODO: allow hint that page is known to be dirty and will not be in the read cache
-        let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
-        let existing = {
-            let mut lock = self.read_cache[cache_slot].write().unwrap();
-            if let Some(removed) = lock.remove(offset) {
-                assert_eq!(
-                    len,
-                    removed.len(),
-                    "cache inconsistency {len} != {} for offset {offset}",
-                    removed.len()
-                );
-                self.read_cache_bytes
-                    .fetch_sub(removed.len(), Ordering::AcqRel);
-                Some(removed)
-            } else {
-                None
-            }
-        };
-
+        // Fast path: check write buffer first. Pages being mutated are almost always already in
+        // the write buffer, so we avoid the read-cache RwLock acquisition in that common case.
         let data = if let Some(removed) = lock.take_value(offset) {
             #[cfg(feature = "cache_metrics")]
             self.writes_hits.fetch_add(1, Ordering::AcqRel);
             removed
         } else {
+            // Page is not in the write buffer; check the read cache.
+            let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
+            let existing = {
+                let mut lock = self.read_cache[cache_slot].write().unwrap();
+                if let Some(removed) = lock.remove(offset) {
+                    assert_eq!(
+                        len,
+                        removed.len(),
+                        "cache inconsistency {len} != {} for offset {offset}",
+                        removed.len()
+                    );
+                    self.read_cache_bytes
+                        .fetch_sub(removed.len(), Ordering::AcqRel);
+                    Some(removed)
+                } else {
+                    None
+                }
+            };
+
             let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
             if previous + len > self.max_write_buffer_bytes {
                 let mut removed_bytes = 0;

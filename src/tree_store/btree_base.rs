@@ -1046,19 +1046,19 @@ impl<'b> LeafMutator<'b> {
                 let value_delta: isize = (key_ptr_size + value_ptr_size + key.len())
                     .try_into()
                     .unwrap();
-                self.update_value_end(j, value_delta);
+                self.update_value_end(j, num_pairs, value_delta);
             }
         }
         for j in i..num_pairs {
             if overwrite {
-                self.update_value_end(j, value_delta);
+                self.update_value_end(j, num_pairs, value_delta);
             } else {
                 let key_delta: isize = (key_ptr_size + value_ptr_size + key.len())
                     .try_into()
                     .unwrap();
                 self.update_key_end(j, key_delta);
                 let value_delta = key_delta + isize::try_from(value.len()).unwrap();
-                self.update_value_end(j, value_delta);
+                self.update_value_end(j, num_pairs, value_delta);
             }
         }
 
@@ -1154,14 +1154,14 @@ impl<'b> LeafMutator<'b> {
             self.update_key_end(j, -isize::try_from(key_ptr_size + value_ptr_size).unwrap());
             let value_delta = -isize::try_from(key_ptr_size + value_ptr_size).unwrap()
                 - isize::try_from(key_end - key_start).unwrap();
-            self.update_value_end(j, value_delta);
+            self.update_value_end(j, num_pairs, value_delta);
         }
         for j in (i + 1)..num_pairs {
             let key_delta = -isize::try_from(key_ptr_size + value_ptr_size).unwrap()
                 - isize::try_from(key_end - key_start).unwrap();
             self.update_key_end(j, key_delta);
             let value_delta = key_delta - isize::try_from(value_end - value_start).unwrap();
-            self.update_value_end(j, value_delta);
+            self.update_value_end(j, num_pairs, value_delta);
         }
 
         // Left shift all the pointers & data
@@ -1222,12 +1222,10 @@ impl<'b> LeafMutator<'b> {
         self.page[offset..(offset + size_of::<u32>())].copy_from_slice(&ptr.to_le_bytes());
     }
 
-    fn update_value_end(&mut self, i: usize, delta: isize) {
+    fn update_value_end(&mut self, i: usize, num_pairs: usize, delta: isize) {
         if self.fixed_value_size.is_some() {
             return;
         }
-        let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
-        let num_pairs = accessor.num_pairs();
         let mut offset = 4 + size_of::<u32>() * i;
         if self.fixed_key_size.is_none() {
             offset += size_of::<u32>() * num_pairs;
