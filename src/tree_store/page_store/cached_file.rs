@@ -297,8 +297,37 @@ impl PagedCachedFile {
     fn flush_write_buffer(&self) -> Result {
         let mut write_buffer = self.write_buffer.lock().unwrap();
 
-        for (offset, buffer) in write_buffer.cache.iter() {
-            self.file.write(*offset, buffer.as_ref().unwrap())?;
+        // Collect all dirty pages and sort by file offset so that writes are sequential,
+        // then merge adjacent pages into contiguous runs to reduce syscall count.
+        let mut entries: Vec<(u64, &[u8])> = write_buffer
+            .cache
+            .iter()
+            .map(|(offset, buf)| (*offset, buf.as_ref().unwrap().as_ref()))
+            .collect();
+        entries.sort_unstable_by_key(|(offset, _)| *offset);
+
+        let mut i = 0;
+        while i < entries.len() {
+            let run_start = entries[i].0;
+            let mut run_end = run_start + entries[i].1.len() as u64;
+            let mut j = i + 1;
+            while j < entries.len() && entries[j].0 == run_end {
+                run_end += entries[j].1.len() as u64;
+                j += 1;
+            }
+
+            if j == i + 1 {
+                // Single page, no merge needed
+                self.file.write(run_start, entries[i].1)?;
+            } else {
+                // Merge contiguous pages into a single write
+                let mut merged = Vec::with_capacity((run_end - run_start) as usize);
+                for entry in &entries[i..j] {
+                    merged.extend_from_slice(entry.1);
+                }
+                self.file.write(run_start, &merged)?;
+            }
+            i = j;
         }
         for (offset, buffer) in write_buffer.cache.iter_mut() {
             let buffer = buffer.take().unwrap();
