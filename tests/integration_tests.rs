@@ -2004,11 +2004,11 @@ fn savepoint_restore_freed_page_data_loss() {
     let result = table.get(&0u64).unwrap();
     assert!(
         result.is_some(),
-        "Key 0 should exist after savepoint restore but is missing — data loss!"
+        "Key 0 should exist after savepoint restore but is missing -- data loss!"
     );
     assert_eq!(
         result.unwrap().value(),
         original_value.as_slice(),
-        "Key 0 has corrupted data after savepoint restore — data loss!"
+        "Key 0 has corrupted data after savepoint restore -- data loss!"
     );
 }
