@@ -281,8 +281,11 @@ impl TableTreeMut<'_> {
         table_root: Option<BtreeHeader>,
         length: u64,
     ) {
+        let dirty = table_root
+            .as_ref()
+            .is_some_and(|h| self.mem.uncommitted(h.root));
         self.pending_table_updates
-            .insert(name.to_string(), (table_root, length, true));
+            .insert(name.to_string(), (table_root, length, dirty));
     }
 
     pub(crate) fn clear_root_updates_and_close(&mut self) {
