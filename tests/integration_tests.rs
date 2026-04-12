@@ -2119,21 +2119,15 @@ fn custom_table_type() {
     );
 }
 
-// Regression test: renaming a table with pending (dirty) modifications causes
-// database corruption due to unfinalized checksums.
+// Regression test for a bug where renaming a table with pending (dirty) modifications
+// caused database corruption due to unfinalized checksums.
 //
-// Bug: When a table is modified and then renamed in the same transaction,
-// `rename_table` writes the table definition (with a DEFERRED placeholder checksum)
-// into the master btree AND keeps the identical root in `pending_table_updates`.
-// During commit, `flush_table_root_updates()` compares the btree entry's root with
-// the pending update's root, finds them equal, and skips checksum finalization.
-// The data is persisted with an invalid checksum (DEFERRED = 999).
-//
-// This causes check_integrity() to error with "Primary is corrupted despite 2-phase
-// commit", because the DEFERRED checksum doesn't match the actual page data. If a
-// crash occurs after this corruption, the database may become unrecoverable since
-// the repair process refuses to fall back to the secondary commit slot when 2-phase
-// commit was used.
+// Previously, `rename_table` wrote the table definition (with a DEFERRED placeholder
+// checksum) into the master btree AND kept the identical root in `pending_table_updates`.
+// During commit, `flush_table_root_updates()` compared the btree entry's root with the
+// pending update's root, found them equal, and skipped checksum finalization. The fix
+// adds an explicit dirty flag to pending updates so that checksum finalization is never
+// skipped for tables with uncommitted pages.
 #[test]
 fn rename_table_with_modifications_data_loss() {
     let tmpfile = create_tempfile();
@@ -2153,9 +2147,7 @@ fn rename_table_with_modifications_data_loss() {
         txn.commit().unwrap();
     }
 
-    // Step 2: Open the table, modify it (creating dirty pages with DEFERRED checksums),
-    // then rename it. This triggers the bug: the dirty checksums are never finalized
-    // because flush_table_root_updates() skips the renamed table.
+    // Step 2: Modify the table and rename it in the same transaction.
     {
         let db = Database::create(tmpfile.path()).unwrap();
         let txn = db.begin_write().unwrap();
@@ -2167,7 +2159,7 @@ fn rename_table_with_modifications_data_loss() {
         }
         txn.commit().unwrap();
 
-        // Within the same session, the data is still accessible from in-memory state.
+        // Verify data is accessible within the same session.
         let read_txn = db.begin_read().unwrap();
         let table = read_txn.open_table(RENAMED_TABLE).unwrap();
         assert_eq!(table.get(0).unwrap().unwrap().value(), "initial_value_0");
@@ -2176,31 +2168,19 @@ fn rename_table_with_modifications_data_loss() {
         assert_eq!(table.get(3).unwrap().unwrap().value(), "new_value_3");
         assert_eq!(table.len().unwrap(), 4);
     }
-    // Database::drop writes an allocator-state commit with two_phase_commit=true,
-    // carrying over the same user_root with the corrupted DEFERRED checksum.
 
-    // Step 3: BUG DEMONSTRATION - check_integrity() detects the corruption.
-    // A healthy database would return Ok(true) or Ok(false). Instead, this errors
-    // with "Primary is corrupted despite 2-phase commit" because the DEFERRED
-    // checksum in the renamed table causes verify_primary_checksums() to fail,
-    // and since the last commit used 2-phase (from the clean shutdown's allocator
-    // state commit), the repair process treats it as unrecoverable corruption.
+    // Step 3: Reopen and verify data survives and integrity check passes.
     {
         let mut db = Database::builder().create(tmpfile.path()).unwrap();
-        let result = db.check_integrity();
-        // check_integrity() leaves needs_recovery=true on error, which causes
-        // Database::drop to panic. Leak the handle to avoid the panic.
-        std::mem::forget(db);
-        assert!(
-            result.is_err(),
-            "BUG: check_integrity() should detect the corrupted DEFERRED checksum \
-             in the renamed table, but it returned: {result:?}"
-        );
-        let err = result.unwrap_err();
-        let err_msg = format!("{err}");
-        assert!(
-            err_msg.contains("corrupted"),
-            "Expected a corruption error, got: {err_msg}"
-        );
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(RENAMED_TABLE).unwrap();
+        assert_eq!(table.get(0).unwrap().unwrap().value(), "initial_value_0");
+        assert_eq!(table.get(1).unwrap().unwrap().value(), "initial_value_1");
+        assert_eq!(table.get(2).unwrap().unwrap().value(), "new_value_2");
+        assert_eq!(table.get(3).unwrap().unwrap().value(), "new_value_3");
+        assert_eq!(table.len().unwrap(), 4);
+        drop(table);
+        drop(read_txn);
+        assert!(db.check_integrity().unwrap());
     }
 }
