@@ -2258,3 +2258,94 @@ fn rename_table_with_modifications_data_loss() {
         assert!(db.check_integrity().unwrap());
     }
 }
+
+// Regression test: restore_savepoint does not clear freed_pages entries from modifications
+// made before the restore. Pages freed by pre-restore modifications remain in freed_pages
+// even though the restored data root still references them. On commit, those pages are stored
+// in the freed tree and later freed by process_freed_pages, causing data loss when the pages
+// are reallocated by subsequent transactions.
+//
+// The bug flow:
+// 1. Insert key=0, commit (leaf page P is allocated)
+// 2. In a new transaction: create ephemeral savepoint, delete key=0 (P goes to freed_pages
+//    via copy-on-write), then restore the savepoint.
+//    - restore_savepoint restores the data root to reference P again, but does NOT remove P
+//      from freed_pages
+// 3. On commit, store_freed_pages writes P into the freed tree even though the data root
+//    still references it
+// 4. Database::drop calls ensure_allocator_state_table which runs process_freed_pages,
+//    attempting to free P while it is still part of the live data tree.
+//    In debug builds this is caught by a debug_assert (double-free / free-of-unallocated).
+//    In release builds the page would be silently freed and eventually reallocated,
+//    overwriting key=0's data.
+#[test]
+#[ignore] // Expected to panic on unfixed code: buddy allocator debug_assert catches double-free
+fn savepoint_restore_freed_page_data_loss() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let definition: TableDefinition<u64, &[u8]> = TableDefinition::new("data");
+
+    let original_value = vec![0xABu8; 512];
+
+    // Step 1: Insert key=0 with a known value and commit durably
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.insert(&0u64, original_value.as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Step 2: Create an ephemeral savepoint, then modify the data (which frees the old
+    // leaf page into freed_pages via copy-on-write), then restore the savepoint.
+    // Bug: restore_savepoint does not remove the old page from freed_pages, so it gets
+    // written into the freed tree on commit even though the restored root still
+    // references it.
+    let mut txn = db.begin_write().unwrap();
+    let savepoint = txn.ephemeral_savepoint().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.remove(&0u64).unwrap();
+    }
+    txn.restore_savepoint(&savepoint).unwrap();
+    txn.commit().unwrap();
+
+    // Step 3: Verify the data is still readable immediately (the page hasn't been
+    // freed/reused yet at this point).
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(definition).unwrap();
+    assert_eq!(
+        table.get(&0u64).unwrap().unwrap().value(),
+        original_value.as_slice(),
+    );
+    drop(table);
+    drop(txn);
+
+    // Step 4: Write more data. The next durable commit triggers process_freed_pages which
+    // will free the page that key=0 lives on, even though the data tree still references it.
+    // In debug builds, this causes a panic in the buddy allocator's debug_assert
+    // (free-of-unallocated-page). In release builds the page is silently freed and
+    // subsequent allocations can overwrite key=0's data, causing data loss.
+    for i in 1u64..100 {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(definition).unwrap();
+            table.insert(&i, &[0xCDu8; 512][..]).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    // Step 5: Final data integrity check. If the bug silently corrupted the page
+    // (release mode), this assertion would fail.
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(definition).unwrap();
+    let result = table.get(&0u64).unwrap();
+    assert!(
+        result.is_some(),
+        "Key 0 should exist after savepoint restore but is missing -- data loss!"
+    );
+    assert_eq!(
+        result.unwrap().value(),
+        original_value.as_slice(),
+        "Key 0 has corrupted data after savepoint restore -- data loss!"
+    );
+}
