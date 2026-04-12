@@ -112,6 +112,7 @@ impl LRUWriteCache {
 struct CheckedBackend {
     file: Box<dyn StorageBackend>,
     io_failed: AtomicBool,
+    closed: AtomicBool,
 }
 
 impl CheckedBackend {
@@ -119,15 +120,28 @@ impl CheckedBackend {
         Self {
             file,
             io_failed: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         }
     }
 
     fn check_failure(&self) -> Result<()> {
         if self.io_failed.load(Ordering::Acquire) {
-            Err(StorageError::PreviousIo)
+            if self.closed.load(Ordering::Acquire) {
+                Err(StorageError::DatabaseClosed)
+            } else {
+                Err(StorageError::PreviousIo)
+            }
         } else {
             Ok(())
         }
+    }
+
+    fn close(&self) -> Result {
+        self.closed.store(true, Ordering::Release);
+        self.io_failed.store(true, Ordering::Release);
+        self.file.close()?;
+
+        Ok(())
     }
 
     fn len(&self) -> Result<u64> {
@@ -139,9 +153,9 @@ impl CheckedBackend {
         result.map_err(StorageError::from)
     }
 
-    fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
         self.check_failure()?;
-        let result = self.file.read(offset, len);
+        let result = self.file.read(offset, out);
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
         }
@@ -157,9 +171,9 @@ impl CheckedBackend {
         result.map_err(StorageError::from)
     }
 
-    fn sync_data(&self, eventual: bool) -> Result<()> {
+    fn sync_data(&self) -> Result<()> {
         self.check_failure()?;
-        let result = self.file.sync_data(eventual);
+        let result = self.file.sync_data();
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
         }
@@ -187,6 +201,10 @@ pub(super) struct PagedCachedFile {
     reads_total: AtomicU64,
     #[cfg(feature = "cache_metrics")]
     reads_hits: AtomicU64,
+    #[cfg(feature = "cache_metrics")]
+    writes_total: AtomicU64,
+    #[cfg(feature = "cache_metrics")]
+    writes_hits: AtomicU64,
     #[cfg(feature = "cache_metrics")]
     evictions: AtomicU64,
     read_cache: Vec<RwLock<LRUCache<Arc<[u8]>>>>,
@@ -217,6 +235,10 @@ impl PagedCachedFile {
             #[cfg(feature = "cache_metrics")]
             reads_hits: Default::default(),
             #[cfg(feature = "cache_metrics")]
+            writes_total: Default::default(),
+            #[cfg(feature = "cache_metrics")]
+            writes_hits: Default::default(),
+            #[cfg(feature = "cache_metrics")]
             evictions: Default::default(),
             read_cache,
             write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
@@ -225,12 +247,39 @@ impl PagedCachedFile {
 
     #[allow(clippy::unused_self)]
     pub(crate) fn cache_stats(&self) -> CacheStats {
-        CacheStats {
-            #[cfg(not(feature = "cache_metrics"))]
-            evictions: 0,
-            #[cfg(feature = "cache_metrics")]
-            evictions: self.evictions.load(Ordering::Acquire),
+        #[cfg(not(feature = "cache_metrics"))]
+        {
+            CacheStats {
+                evictions: 0,
+                read_hits: 0,
+                read_misses: 0,
+                write_hits: 0,
+                write_misses: 0,
+                used_bytes: 0,
+            }
         }
+
+        #[cfg(feature = "cache_metrics")]
+        {
+            let read_hits = self.reads_hits.load(Ordering::Acquire);
+            let read_total = self.reads_total.load(Ordering::Acquire);
+            let write_hits = self.writes_hits.load(Ordering::Acquire);
+            let write_total = self.writes_total.load(Ordering::Acquire);
+            let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
+            let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
+            CacheStats {
+                evictions: self.evictions.load(Ordering::Acquire),
+                read_hits,
+                read_misses: read_total - read_hits,
+                write_hits,
+                write_misses: write_total - write_hits,
+                used_bytes: read_bytes + write_bytes,
+            }
+        }
+    }
+
+    pub(crate) fn close(&self) -> Result {
+        self.file.close()
     }
 
     pub(crate) fn check_io_errors(&self) -> Result {
@@ -285,20 +334,24 @@ impl PagedCachedFile {
         self.file.set_len(len)
     }
 
-    pub(super) fn flush(&self, #[allow(unused_variables)] eventual: bool) -> Result {
+    pub(super) fn flush(&self) -> Result {
         self.flush_write_buffer()?;
 
-        self.file.sync_data(eventual)
+        self.file.sync_data()
     }
 
     // Make writes visible to readers, but does not guarantee any durability
     pub(super) fn write_barrier(&self) -> Result {
+        // TODO: non-durable commits would be much faster, if this did not issues writes to disk,
+        // and instead just made the data visible to readers
         self.flush_write_buffer()
     }
 
     // Read directly from the file, ignoring any cached data
     pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        self.file.read(offset, len)
+        let mut buffer = vec![0; len];
+        self.file.read(offset, &mut buffer)?;
+        Ok(buffer)
     }
 
     // Read with caching. Caller must not read overlapping ranges without first calling invalidate_cache().
@@ -418,6 +471,8 @@ impl PagedCachedFile {
         };
 
         let data = if let Some(removed) = lock.take_value(offset) {
+            #[cfg(feature = "cache_metrics")]
+            self.writes_hits.fetch_add(1, Ordering::AcqRel);
             removed
         } else {
             let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
@@ -444,8 +499,12 @@ impl PagedCachedFile {
                 }
             }
             let result = if let Some(data) = existing {
+                #[cfg(feature = "cache_metrics")]
+                self.writes_hits.fetch_add(1, Ordering::AcqRel);
                 data
             } else if overwrite {
+                #[cfg(feature = "cache_metrics")]
+                self.writes_hits.fetch_add(1, Ordering::AcqRel);
                 vec![0; len].into()
             } else {
                 self.read_direct(offset, len)?.into()
@@ -453,6 +512,8 @@ impl PagedCachedFile {
             lock.insert(offset, result);
             lock.take_value(offset).unwrap()
         };
+        #[cfg(feature = "cache_metrics")]
+        self.writes_total.fetch_add(1, Ordering::AcqRel);
         Ok(WritablePage {
             buffer: self.write_buffer.clone(),
             offset,

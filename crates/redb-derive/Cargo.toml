@@ -1,0 +1,22 @@
+[package]
+name = "redb-derive"
+description = "Derive macros for redb"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+
+[dev-dependencies]
+redb = { path = "../.." }
+tempfile = "3.5.0"

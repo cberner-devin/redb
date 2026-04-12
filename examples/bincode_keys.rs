@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 
 use bincode::{Decode, Encode, decode_from_slice, encode_to_vec};
-use redb::{Database, Error, Key, Range, TableDefinition, TypeName, Value};
+use redb::{Database, Error, Key, Range, ReadableDatabase, TableDefinition, TypeName, Value};
 
 #[derive(Debug, Decode, Encode, PartialEq, Eq, PartialOrd, Ord)]
 struct SomeKey {
@@ -20,6 +20,7 @@ struct SomeValue {
 const TABLE: TableDefinition<Bincode<SomeKey>, Bincode<SomeValue>> =
     TableDefinition::new("my_data");
 
+#[allow(clippy::result_large_err)]
 fn main() -> Result<(), Error> {
     let some_key = SomeKey {
         foo: "hello world".to_string(),

@@ -2,11 +2,18 @@ use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::mem::size_of;
+#[cfg(feature = "chrono_v0_4")]
+mod chrono_v0_4;
+#[cfg(feature = "uuid")]
+mod uuid;
 
 #[derive(Eq, PartialEq, Clone, Debug)]
 enum TypeClassification {
     Internal,
     UserDefined,
+    // Used by variable width tuple encoding in version 3.0 and newer. This differentiates the encoding
+    // from the old encoding used previously
+    Internal2,
 }
 
 impl TypeClassification {
@@ -14,6 +21,7 @@ impl TypeClassification {
         match self {
             TypeClassification::Internal => 1,
             TypeClassification::UserDefined => 2,
+            TypeClassification::Internal2 => 3,
         }
     }
 
@@ -21,6 +29,7 @@ impl TypeClassification {
         match value {
             1 => TypeClassification::Internal,
             2 => TypeClassification::UserDefined,
+            3 => TypeClassification::Internal2,
             _ => unreachable!(),
         }
     }
@@ -49,6 +58,13 @@ impl TypeName {
         }
     }
 
+    pub(crate) fn internal2(name: &str) -> Self {
+        Self {
+            classification: TypeClassification::Internal2,
+            name: name.to_string(),
+        }
+    }
+
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut result = Vec::with_capacity(self.name.len() + 1);
         result.push(self.classification.to_byte());
@@ -66,11 +82,12 @@ impl TypeName {
         }
     }
 
-    pub(crate) fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.name
     }
 }
 
+/// Types that implement this trait can be used as values in a redb table
 pub trait Value: Debug {
     /// `SelfType<'a>` must be the same type as Self with all lifetimes replaced with 'a
     type SelfType<'a>: Debug + 'a
@@ -124,6 +141,7 @@ impl MutInPlaceValue for &[u8] {
     }
 }
 
+/// Trait which allows the type to be used as a key in a redb table
 pub trait Key: Value {
     /// Compare data1 with data2
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering;

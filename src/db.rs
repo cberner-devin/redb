@@ -1,25 +1,27 @@
-use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
+use crate::transaction_tracker::{TransactionId, TransactionTracker};
 use crate::tree_store::{
-    AllPageNumbersBtreeIter, BtreeHeader, BtreeRangeIter, FreedPageList, FreedTableKey,
-    InternalTableDefinition, PAGE_SIZE, PageHint, PageNumber, RawBtree, SerializedSavepoint,
-    TableTreeMut, TableType, TransactionalMemory,
+    BtreeHeader, InternalTableDefinition, PAGE_SIZE, PageHint, PageNumber, ReadOnlyBackend,
+    ShrinkPolicy, TableTree, TableType, TransactionalMemory,
 };
 use crate::types::{Key, Value};
-use crate::{CompactionError, DatabaseError, Error, ReadOnlyTable, SavepointError, StorageError};
+use crate::{
+    CompactionError, DatabaseError, Error, ReadOnlyTable, SavepointError, StorageError, TableError,
+};
 use crate::{ReadTransaction, Result, WriteTransaction};
 use std::fmt::{Debug, Display, Formatter};
 
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
-use std::ops::RangeFull;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{io, thread};
 
 use crate::error::TransactionError;
 use crate::sealed::Sealed;
 use crate::transactions::{
-    ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTree, SAVEPOINT_TABLE,
+    ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTree, DATA_ALLOCATED_TABLE,
+    DATA_FREED_TABLE, PageList, SYSTEM_FREED_TABLE, SystemTableDefinition,
+    TransactionIdWithPagination,
 };
 use crate::tree_store::file_backend::FileBackend;
 #[cfg(feature = "logging")]
@@ -33,23 +35,27 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
 
     /// Reads the specified array of bytes from the storage.
     ///
-    /// If `len` + `offset` exceeds the length of the storage an appropriate `Error` should be returned or a panic may occur.
-    fn read(&self, offset: u64, len: usize) -> std::result::Result<Vec<u8>, io::Error>;
+    /// If `out.len()` + `offset` exceeds the length of the storage an appropriate `Error` must be returned.
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), io::Error>;
 
     /// Sets the length of the storage.
     ///
-    /// When extending the storage the new positions should be zero initialized.
+    /// New positions in the storage must be initialized to zero.
     fn set_len(&self, len: u64) -> std::result::Result<(), io::Error>;
 
     /// Syncs all buffered data with the persistent storage.
-    ///
-    /// If `eventual` is true, data may become persistent at some point after this call returns,
-    /// but the storage must gaurantee that a write barrier is inserted: i.e. all writes before this
-    /// call to `sync_data()` will become persistent before any writes that occur after.
-    fn sync_data(&self, eventual: bool) -> std::result::Result<(), io::Error>;
+    fn sync_data(&self) -> std::result::Result<(), io::Error>;
 
     /// Writes the specified array to the storage.
     fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
+
+    /// Release any resources held by the backend
+    ///
+    /// Note: redb will not access the backend after calling this method and will call it exactly
+    /// once when the [`Database`] is dropped
+    fn close(&self) -> std::result::Result<(), io::Error> {
+        Ok(())
+    }
 }
 
 pub trait TableHandle: Sealed {
@@ -215,6 +221,11 @@ impl<K: Key + 'static, V: Key + 'static> Display for MultimapTableDefinition<'_,
 #[derive(Debug)]
 pub struct CacheStats {
     pub(crate) evictions: u64,
+    pub(crate) read_hits: u64,
+    pub(crate) read_misses: u64,
+    pub(crate) write_hits: u64,
+    pub(crate) write_misses: u64,
+    pub(crate) used_bytes: usize,
 }
 
 impl CacheStats {
@@ -223,6 +234,31 @@ impl CacheStats {
     /// To increase the cache size use [`Builder::set_cache_size`]
     pub fn evictions(&self) -> u64 {
         self.evictions
+    }
+
+    /// Number of times that unmodified data has been read from the cache
+    pub fn read_hits(&self) -> u64 {
+        self.read_hits
+    }
+
+    /// Number of times that unmodified data was not in the cache and was read from storage
+    pub fn read_misses(&self) -> u64 {
+        self.read_misses
+    }
+
+    /// Number of times that data modified in a transaction has been read from the cache
+    pub fn write_hits(&self) -> u64 {
+        self.write_hits
+    }
+
+    /// Number of times that data modified in a transaction was not in the cache and was read from storage
+    pub fn write_misses(&self) -> u64 {
+        self.write_misses
+    }
+
+    /// Number of bytes in the cache
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes
     }
 }
 
@@ -294,6 +330,134 @@ impl Drop for TransactionGuard {
     }
 }
 
+pub trait ReadableDatabase {
+    /// Begins a read transaction
+    ///
+    /// Captures a snapshot of the database, so that only data committed before calling this method
+    /// is visible in the transaction
+    ///
+    /// Returns a [`ReadTransaction`] which may be used to read from the database. Read transactions
+    /// may exist concurrently with writes
+    fn begin_read(&self) -> Result<ReadTransaction, TransactionError>;
+
+    /// Information regarding the usage of the in-memory cache
+    ///
+    /// Note: these metrics are only collected when the "`cache_metrics`" feature is enabled
+    fn cache_stats(&self) -> CacheStats;
+}
+
+/// A redb database opened in read-only mode
+///
+/// Use [`Self::begin_read`] to get a [`ReadTransaction`] object that can be used to read from the database
+///
+/// Multiple processes may open a [`ReadOnlyDatabase`], but it may not be opened concurrently
+/// with a [`Database`].
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```rust
+/// use redb::*;
+/// # use tempfile::NamedTempFile;
+/// const TABLE: TableDefinition<u64, u64> = TableDefinition::new("my_data");
+///
+/// # fn main() -> Result<(), Error> {
+/// # #[cfg(not(target_os = "wasi"))]
+/// # let tmpfile = NamedTempFile::new().unwrap();
+/// # #[cfg(target_os = "wasi")]
+/// # let tmpfile = NamedTempFile::new_in("/tmp").unwrap();
+/// # let filename = tmpfile.path();
+/// let db = Database::create(filename)?;
+/// let txn = db.begin_write()?;
+/// {
+///     let mut table = txn.open_table(TABLE)?;
+///     table.insert(&0, &0)?;
+/// }
+/// txn.commit()?;
+/// drop(db);
+///
+/// let db = ReadOnlyDatabase::open(filename)?;
+/// let txn = db.begin_read()?;
+/// {
+///     let mut table = txn.open_table(TABLE)?;
+///     println!("{}", table.get(&0)?.unwrap().value());
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct ReadOnlyDatabase {
+    mem: Arc<TransactionalMemory>,
+    transaction_tracker: Arc<TransactionTracker>,
+}
+
+impl ReadableDatabase for ReadOnlyDatabase {
+    fn begin_read(&self) -> Result<ReadTransaction, TransactionError> {
+        let id = self
+            .transaction_tracker
+            .register_read_transaction(&self.mem)?;
+        #[cfg(feature = "logging")]
+        debug!("Beginning read transaction id={id:?}");
+
+        let guard = TransactionGuard::new_read(id, self.transaction_tracker.clone());
+
+        ReadTransaction::new(self.mem.clone(), guard)
+    }
+
+    fn cache_stats(&self) -> CacheStats {
+        self.mem.cache_stats()
+    }
+}
+
+impl ReadOnlyDatabase {
+    /// Opens an existing redb database.
+    pub fn open(path: impl AsRef<Path>) -> Result<ReadOnlyDatabase, DatabaseError> {
+        Builder::new().open_read_only(path)
+    }
+
+    fn new(
+        file: Box<dyn StorageBackend>,
+        page_size: usize,
+        region_size: Option<u64>,
+        read_cache_size_bytes: usize,
+    ) -> Result<Self, DatabaseError> {
+        #[cfg(feature = "logging")]
+        let file_path = format!("{:?}", &file);
+        #[cfg(feature = "logging")]
+        info!("Opening database in read-only {:?}", &file_path);
+        let mem = TransactionalMemory::new(
+            Box::new(ReadOnlyBackend::new(file)),
+            false,
+            page_size,
+            region_size,
+            read_cache_size_bytes,
+            0,
+            true,
+        )?;
+        let mem = Arc::new(mem);
+        // If the last transaction used 2-phase commit and updated the allocator state table, then
+        // we can just load the allocator state from there. Otherwise, we need a full repair
+        if let Some(tree) = Database::get_allocator_state_table(&mem)? {
+            mem.load_allocator_state(&tree)?;
+        } else {
+            #[cfg(feature = "logging")]
+            warn!(
+                "Database {:?} not shutdown cleanly. Repair required",
+                &file_path
+            );
+            return Err(DatabaseError::RepairAborted);
+        }
+
+        let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
+        let db = Self {
+            mem,
+            transaction_tracker: Arc::new(TransactionTracker::new(next_transaction_id)),
+        };
+
+        Ok(db)
+    }
+}
+
 /// Opened redb database file
 ///
 /// Use [`Self::begin_read`] to get a [`ReadTransaction`] object that can be used to read from the database
@@ -312,7 +476,10 @@ impl Drop for TransactionGuard {
 /// const TABLE: TableDefinition<u64, u64> = TableDefinition::new("my_data");
 ///
 /// # fn main() -> Result<(), Error> {
-/// # let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
+/// # #[cfg(not(target_os = "wasi"))]
+/// # let tmpfile = NamedTempFile::new().unwrap();
+/// # #[cfg(target_os = "wasi")]
+/// # let tmpfile = NamedTempFile::new_in("/tmp").unwrap();
 /// # let filename = tmpfile.path();
 /// let db = Database::create(filename)?;
 /// let write_txn = db.begin_write()?;
@@ -329,6 +496,19 @@ pub struct Database {
     transaction_tracker: Arc<TransactionTracker>,
 }
 
+impl ReadableDatabase for Database {
+    fn begin_read(&self) -> Result<ReadTransaction, TransactionError> {
+        let guard = self.allocate_read_transaction()?;
+        #[cfg(feature = "logging")]
+        debug!("Beginning read transaction id={:?}", guard.id());
+        ReadTransaction::new(self.get_memory(), guard)
+    }
+
+    fn cache_stats(&self) -> CacheStats {
+        self.mem.cache_stats()
+    }
+}
+
 impl Database {
     /// Opens the specified file as a redb database.
     /// * if the file does not exist, or is an empty file, a new database will be initialized in it
@@ -343,50 +523,28 @@ impl Database {
         Self::builder().open(path)
     }
 
-    /// Information regarding the usage of the in-memory cache
-    ///
-    /// Note: these metrics are only collected when the "`cache_metrics`" feature is enabled
-    pub fn cache_stats(&self) -> CacheStats {
-        self.mem.cache_stats()
-    }
-
     pub(crate) fn get_memory(&self) -> Arc<TransactionalMemory> {
         self.mem.clone()
     }
 
     pub(crate) fn verify_primary_checksums(mem: Arc<TransactionalMemory>) -> Result<bool> {
-        let fake_freed_pages = Arc::new(Mutex::new(vec![]));
-        let table_tree = TableTreeMut::new(
+        let table_tree = TableTree::new(
             mem.get_data_root(),
+            PageHint::None,
             Arc::new(TransactionGuard::fake()),
             mem.clone(),
-            fake_freed_pages.clone(),
-        );
+        )?;
         if !table_tree.verify_checksums()? {
             return Ok(false);
         }
-        let system_table_tree = TableTreeMut::new(
+        let system_table_tree = TableTree::new(
             mem.get_system_root(),
+            PageHint::None,
             Arc::new(TransactionGuard::fake()),
             mem.clone(),
-            fake_freed_pages.clone(),
-        );
+        )?;
         if !system_table_tree.verify_checksums()? {
             return Ok(false);
-        }
-        assert!(fake_freed_pages.lock().unwrap().is_empty());
-
-        if let Some(header) = mem.get_freed_root() {
-            if !RawBtree::new(
-                Some(header),
-                FreedTableKey::fixed_width(),
-                FreedPageList::fixed_width(),
-                mem.clone(),
-            )
-            .verify_checksum()?
-            {
-                return Ok(false);
-            }
         }
 
         Ok(true)
@@ -407,11 +565,7 @@ impl Database {
             .unwrap()
             .clear_cache_and_reload()?;
 
-        let old_roots = [
-            self.mem.get_data_root(),
-            self.mem.get_system_root(),
-            self.mem.get_freed_root(),
-        ];
+        let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
 
         let new_roots = Self::do_repair(&mut self.mem, &|_| {}).map_err(|err| match err {
             DatabaseError::Storage(storage_err) => storage_err,
@@ -424,14 +578,13 @@ impl Database {
 
         if !was_clean {
             let next_transaction_id = self.mem.get_last_committed_transaction_id()?.next();
-            let [data_root, system_root, freed_root] = new_roots;
+            let [data_root, system_root] = new_roots;
             self.mem.commit(
                 data_root,
                 system_root,
-                freed_root,
                 next_transaction_id,
-                false,
                 true,
+                ShrinkPolicy::Never,
             )?;
         }
 
@@ -470,7 +623,9 @@ impl Database {
         txn.commit().map_err(|e| e.into_storage_error())?;
         // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
         // should have been cleared out by the above commit()
-        assert!(self.mem.get_freed_root().is_none());
+        let txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+        assert!(!txn.pending_free_pages()?);
+        txn.abort()?;
 
         let mut compacted = false;
         // Iteratively compact until no progress is made
@@ -488,8 +643,20 @@ impl Database {
             // Double commit to free up the relocated pages for reuse
             let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
             txn.set_two_phase_commit(true);
+            // Also shrink the database file by the maximum amount
+            txn.set_shrink_policy(ShrinkPolicy::Maximum);
             txn.commit().map_err(|e| e.into_storage_error())?;
-            assert!(self.mem.get_freed_root().is_none());
+            // Triple commit to free up the relocated pages for reuse
+            // TODO: this really shouldn't be necessary, but the data freed tree is a system table
+            // and so free'ing up its pages causes more deletes from the system tree
+            let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+            txn.set_two_phase_commit(true);
+            // Also shrink the database file by the maximum amount
+            txn.set_shrink_policy(ShrinkPolicy::Maximum);
+            txn.commit().map_err(|e| e.into_storage_error())?;
+            let txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+            assert!(!txn.pending_free_pages()?);
+            txn.abort()?;
 
             if !progress {
                 break;
@@ -501,48 +668,38 @@ impl Database {
         Ok(compacted)
     }
 
-    fn check_repaired_persistent_savepoints(
+    #[cfg_attr(not(debug_assertions), expect(dead_code))]
+    fn check_repaired_allocated_pages_table(
         system_root: Option<BtreeHeader>,
         mem: Arc<TransactionalMemory>,
     ) -> Result {
-        let freed_list = Arc::new(Mutex::new(vec![]));
-        let table_tree = TableTreeMut::new(
+        let table_tree = TableTree::new(
             system_root,
+            PageHint::None,
             Arc::new(TransactionGuard::fake()),
             mem.clone(),
-            freed_list,
-        );
-        let fake_transaction_tracker = Arc::new(TransactionTracker::new(TransactionId::new(0)));
-        if let Some(savepoint_table_def) = table_tree
-            .get_table::<SavepointId, SerializedSavepoint>(
-                SAVEPOINT_TABLE.name(),
+        )?;
+        if let Some(table_def) = table_tree
+            .get_table::<TransactionIdWithPagination, PageList>(
+                DATA_ALLOCATED_TABLE.name(),
                 TableType::Normal,
             )
-            .map_err(|e| {
-                e.into_storage_error_or_corrupted("Persistent savepoint table corrupted")
-            })?
+            .map_err(|e| e.into_storage_error_or_corrupted("Allocated pages table corrupted"))?
         {
-            let savepoint_table_root =
-                if let InternalTableDefinition::Normal { table_root, .. } = savepoint_table_def {
-                    table_root
-                } else {
-                    unreachable!()
-                };
-            let savepoint_table: ReadOnlyTable<SavepointId, SerializedSavepoint> =
-                ReadOnlyTable::new(
-                    "internal savepoint table".to_string(),
-                    savepoint_table_root,
-                    PageHint::None,
-                    Arc::new(TransactionGuard::fake()),
-                    mem.clone(),
-                )?;
-            for result in savepoint_table.range::<SavepointId>(..)? {
-                let (_, savepoint_data) = result?;
-                let savepoint = savepoint_data
-                    .value()
-                    .to_savepoint(fake_transaction_tracker.clone());
-                if let Some(header) = savepoint.get_user_root() {
-                    Self::check_pages_allocated_recursive(header.root, mem.clone())?;
+            let InternalTableDefinition::Normal { table_root, .. } = table_def else {
+                unreachable!()
+            };
+            let table: ReadOnlyTable<TransactionIdWithPagination, PageList> = ReadOnlyTable::new(
+                DATA_ALLOCATED_TABLE.name().to_string(),
+                table_root,
+                PageHint::None,
+                Arc::new(TransactionGuard::fake()),
+                mem.clone(),
+            )?;
+            for result in table.range::<TransactionIdWithPagination>(..)? {
+                let (_, pages) = result?;
+                for i in 0..pages.value().len() {
+                    assert!(mem.is_allocated(pages.value().get(i)));
                 }
             }
         }
@@ -550,81 +707,89 @@ impl Database {
         Ok(())
     }
 
-    fn mark_freed_tree(freed_root: Option<BtreeHeader>, mem: Arc<TransactionalMemory>) -> Result {
-        if let Some(header) = freed_root {
-            let freed_pages_iter = AllPageNumbersBtreeIter::new(
-                header.root,
-                FreedTableKey::fixed_width(),
-                FreedPageList::fixed_width(),
-                mem.clone(),
-            )?;
-            for page in freed_pages_iter {
-                mem.mark_page_allocated(page?);
+    fn visit_freed_tree<K: Key, V: Value, F>(
+        system_root: Option<BtreeHeader>,
+        table_def: SystemTableDefinition<K, V>,
+        mem: Arc<TransactionalMemory>,
+        mut visitor: F,
+    ) -> Result
+    where
+        F: FnMut(PageNumber) -> Result,
+    {
+        let fake_guard = Arc::new(TransactionGuard::fake());
+        let system_tree = TableTree::new(system_root, PageHint::None, fake_guard, mem.clone())?;
+        let table_name = table_def.name();
+        let result = match system_tree.get_table::<K, V>(table_name, TableType::Normal) {
+            Ok(result) => result,
+            Err(TableError::Storage(err)) => {
+                return Err(err);
             }
-        }
+            Err(TableError::TableDoesNotExist(_)) => {
+                return Ok(());
+            }
+            Err(_) => {
+                return Err(StorageError::Corrupted(format!(
+                    "Unable to open {table_name}"
+                )));
+            }
+        };
 
-        let freed_table: ReadOnlyTable<FreedTableKey, FreedPageList<'static>> = ReadOnlyTable::new(
-            "internal freed table".to_string(),
-            freed_root,
-            PageHint::None,
-            Arc::new(TransactionGuard::fake()),
-            mem.clone(),
-        )?;
-        for result in freed_table.range::<FreedTableKey>(..)? {
-            let (_, freed_page_list) = result?;
-            for i in 0..freed_page_list.value().len() {
-                mem.mark_page_allocated(freed_page_list.value().get(i));
+        if let Some(definition) = result {
+            let table_root = match definition {
+                InternalTableDefinition::Normal { table_root, .. } => table_root,
+                InternalTableDefinition::Multimap { .. } => unreachable!(),
+            };
+            let table: ReadOnlyTable<TransactionIdWithPagination, PageList<'static>> =
+                ReadOnlyTable::new(
+                    table_name.to_string(),
+                    table_root,
+                    PageHint::None,
+                    Arc::new(TransactionGuard::fake()),
+                    mem.clone(),
+                )?;
+            for result in table.range::<TransactionIdWithPagination>(..)? {
+                let (_, page_list) = result?;
+                for i in 0..page_list.value().len() {
+                    visitor(page_list.value().get(i))?;
+                }
             }
         }
 
         Ok(())
     }
 
-    fn check_pages_allocated_recursive(root: PageNumber, mem: Arc<TransactionalMemory>) -> Result {
-        // Repair the allocator state
-        // All pages in the master table
-        let master_pages_iter = AllPageNumbersBtreeIter::new(root, None, None, mem.clone())?;
-        for result in master_pages_iter {
-            let page = result?;
-            assert!(mem.is_allocated(page));
-        }
-
-        // Iterate over all other tables
-        let iter: BtreeRangeIter<&str, InternalTableDefinition> =
-            BtreeRangeIter::new::<RangeFull, &str>(&(..), Some(root), mem.clone())?;
-
-        // Chain all the other tables to the master table iter
-        for entry in iter {
-            let definition = entry?.value();
-            definition.visit_all_pages(mem.clone(), |path| {
-                assert!(mem.is_allocated(path.page_number()));
+    #[cfg(debug_assertions)]
+    fn mark_allocated_page_for_debug(
+        mem: &mut Arc<TransactionalMemory>, // Only &mut to ensure exclusivity
+    ) -> Result {
+        let data_root = mem.get_data_root();
+        {
+            let fake = Arc::new(TransactionGuard::fake());
+            let tables = TableTree::new(data_root, PageHint::None, fake, mem.clone())?;
+            tables.visit_all_pages(|path| {
+                mem.mark_debug_allocated_page(path.page_number());
                 Ok(())
             })?;
         }
 
-        Ok(())
-    }
-
-    fn mark_tables_recursive(root: PageNumber, mem: Arc<TransactionalMemory>) -> Result {
-        // Repair the allocator state
-        // All pages in the master table
-        let master_pages_iter = AllPageNumbersBtreeIter::new(root, None, None, mem.clone())?;
-        for page in master_pages_iter {
-            mem.mark_page_allocated(page?);
-        }
-
-        // Iterate over all other tables
-        let iter: BtreeRangeIter<&str, InternalTableDefinition> =
-            BtreeRangeIter::new::<RangeFull, &str>(&(..), Some(root), mem.clone())?;
-
-        // Chain all the other tables to the master table iter
-        for entry in iter {
-            let definition = entry?.value();
-            definition.visit_all_pages(mem.clone(), |path| {
-                mem.mark_page_allocated(path.page_number());
+        let system_root = mem.get_system_root();
+        {
+            let fake = Arc::new(TransactionGuard::fake());
+            let system_tables = TableTree::new(system_root, PageHint::None, fake, mem.clone())?;
+            system_tables.visit_all_pages(|path| {
+                mem.mark_debug_allocated_page(path.page_number());
                 Ok(())
             })?;
         }
+
+        Self::visit_freed_tree(system_root, DATA_FREED_TABLE, mem.clone(), |page| {
+            mem.mark_debug_allocated_page(page);
+            Ok(())
+        })?;
+        Self::visit_freed_tree(system_root, SYSTEM_FREED_TABLE, mem.clone(), |page| {
+            mem.mark_debug_allocated_page(page);
+            Ok(())
+        })?;
 
         Ok(())
     }
@@ -632,7 +797,7 @@ impl Database {
     fn do_repair(
         mem: &mut Arc<TransactionalMemory>, // Only &mut to ensure exclusivity
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
-    ) -> Result<[Option<BtreeHeader>; 3], DatabaseError> {
+    ) -> Result<[Option<BtreeHeader>; 2], DatabaseError> {
         if !Self::verify_primary_checksums(mem.clone())? {
             if mem.used_two_phase_commit() {
                 return Err(DatabaseError::Storage(StorageError::Corrupted(
@@ -668,21 +833,14 @@ impl Database {
         mem.begin_repair()?;
 
         let data_root = mem.get_data_root();
-        if let Some(header) = data_root {
-            Self::mark_tables_recursive(header.root, mem.clone())?;
+        {
+            let fake = Arc::new(TransactionGuard::fake());
+            let tables = TableTree::new(data_root, PageHint::None, fake, mem.clone())?;
+            tables.visit_all_pages(|path| {
+                mem.mark_page_allocated(path.page_number());
+                Ok(())
+            })?;
         }
-
-        let freed_root = mem.get_freed_root();
-        // Allow processing of all transactions, since this is the main freed tree
-        Self::mark_freed_tree(freed_root, mem.clone())?;
-        let freed_table: ReadOnlyTable<FreedTableKey, FreedPageList<'static>> = ReadOnlyTable::new(
-            "internal freed table".to_string(),
-            freed_root,
-            PageHint::None,
-            Arc::new(TransactionGuard::fake()),
-            mem.clone(),
-        )?;
-        drop(freed_table);
 
         // 0.9 because the repair takes 3 full scans and the third is done now. There is just some system tables left
         let mut handle = RepairSession::new(0.9);
@@ -692,14 +850,26 @@ impl Database {
         }
 
         let system_root = mem.get_system_root();
-        if let Some(header) = system_root {
-            Self::mark_tables_recursive(header.root, mem.clone())?;
+        {
+            let fake = Arc::new(TransactionGuard::fake());
+            let system_tables = TableTree::new(system_root, PageHint::None, fake, mem.clone())?;
+            system_tables.visit_all_pages(|path| {
+                mem.mark_page_allocated(path.page_number());
+                Ok(())
+            })?;
         }
+
+        Self::visit_freed_tree(system_root, DATA_FREED_TABLE, mem.clone(), |page| {
+            mem.mark_page_allocated(page);
+            Ok(())
+        })?;
+        Self::visit_freed_tree(system_root, SYSTEM_FREED_TABLE, mem.clone(), |page| {
+            mem.mark_page_allocated(page);
+            Ok(())
+        })?;
         #[cfg(debug_assertions)]
         {
-            // Savepoints only reference pages from a previous commit, so those are either referenced
-            // in the current root, or are in the freed tree
-            Self::check_repaired_persistent_savepoints(system_root, mem.clone())?;
+            Self::check_repaired_allocated_pages_table(system_root, mem.clone())?;
         }
 
         mem.end_repair()?;
@@ -708,9 +878,10 @@ impl Database {
         // by storing an empty root during the below commit()
         mem.clear_read_cache();
 
-        Ok([data_root, system_root, freed_root])
+        Ok([data_root, system_root])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         file: Box<dyn StorageBackend>,
         allow_initialize: bool,
@@ -731,35 +902,34 @@ impl Database {
             region_size,
             read_cache_size_bytes,
             write_cache_size_bytes,
+            false,
         )?;
         let mut mem = Arc::new(mem);
-        if mem.needs_repair()? {
-            // If the last transaction used 2-phase commit and updated the allocator state table, then
-            // we can just load the allocator state from there. Otherwise, we need a full repair
-            if let Some(tree) = Self::get_allocator_state_table(&mem)? {
-                #[cfg(feature = "logging")]
-                info!("Found valid allocator state, full repair not needed");
-                mem.load_allocator_state(&tree)?;
-            } else {
-                #[cfg(feature = "logging")]
-                warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-                let mut handle = RepairSession::new(0.0);
-                repair_callback(&mut handle);
-                if handle.aborted() {
-                    return Err(DatabaseError::RepairAborted);
-                }
-                let [data_root, system_root, freed_root] =
-                    Self::do_repair(&mut mem, repair_callback)?;
-                let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
-                mem.commit(
-                    data_root,
-                    system_root,
-                    freed_root,
-                    next_transaction_id,
-                    false,
-                    true,
-                )?;
+        // If the last transaction used 2-phase commit and updated the allocator state table, then
+        // we can just load the allocator state from there. Otherwise, we need a full repair
+        if let Some(tree) = Self::get_allocator_state_table(&mem)? {
+            #[cfg(feature = "logging")]
+            info!("Found valid allocator state, full repair not needed");
+            mem.load_allocator_state(&tree)?;
+            #[cfg(debug_assertions)]
+            Self::mark_allocated_page_for_debug(&mut mem)?;
+        } else {
+            #[cfg(feature = "logging")]
+            warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
+            let mut handle = RepairSession::new(0.0);
+            repair_callback(&mut handle);
+            if handle.aborted() {
+                return Err(DatabaseError::RepairAborted);
             }
+            let [data_root, system_root] = Self::do_repair(&mut mem, repair_callback)?;
+            let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
+            mem.commit(
+                data_root,
+                system_root,
+                next_transaction_id,
+                true,
+                ShrinkPolicy::Never,
+            )?;
         }
 
         mem.begin_writable()?;
@@ -803,13 +973,12 @@ impl Database {
         }
 
         // See if it's present in the system table tree
-        let fake_freed_pages = Arc::new(Mutex::new(vec![]));
-        let system_table_tree = TableTreeMut::new(
+        let system_table_tree = TableTree::new(
             mem.get_system_root(),
+            PageHint::None,
             Arc::new(TransactionGuard::fake()),
             mem.clone(),
-            fake_freed_pages.clone(),
-        );
+        )?;
         let Some(allocator_state_table) = system_table_tree
             .get_table::<AllocatorStateKey, &[u8]>(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
             .map_err(|e| e.into_storage_error_or_corrupted("Unexpected TableError"))?
@@ -823,10 +992,10 @@ impl Database {
         };
         let tree = AllocatorStateTree::new(
             table_root,
+            PageHint::None,
             Arc::new(TransactionGuard::fake()),
             mem.clone(),
-            fake_freed_pages,
-        );
+        )?;
 
         // Make sure this isn't stale allocator state left over from a previous transaction
         if !mem.is_valid_allocator_state(&tree)? {
@@ -868,31 +1037,13 @@ impl Database {
             .map_err(|e| e.into())
     }
 
-    /// Begins a read transaction
-    ///
-    /// Captures a snapshot of the database, so that only data committed before calling this method
-    /// is visible in the transaction
-    ///
-    /// Returns a [`ReadTransaction`] which may be used to read from the database. Read transactions
-    /// may exist concurrently with writes
-    pub fn begin_read(&self) -> Result<ReadTransaction, TransactionError> {
-        let guard = self.allocate_read_transaction()?;
-        #[cfg(feature = "logging")]
-        debug!("Beginning read transaction id={:?}", guard.id());
-        ReadTransaction::new(self.get_memory(), guard)
-    }
-
-    fn ensure_allocator_state_table(&self) -> Result<(), Error> {
-        // If the allocator state table is already up to date, we're done
-        if Self::get_allocator_state_table(&self.mem)?.is_some() {
-            return Ok(());
-        }
-
+    fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
         // Make a new quick-repair commit to update the allocator state table
         #[cfg(feature = "logging")]
         debug!("Writing allocator state table");
         let mut tx = self.begin_write()?;
         tx.set_quick_repair(true);
+        tx.set_shrink_policy(ShrinkPolicy::Maximum);
         tx.commit()?;
 
         Ok(())
@@ -901,13 +1052,14 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        if thread::panicking() {
-            return;
+        if !thread::panicking() && self.ensure_allocator_state_table_and_trim().is_err() {
+            #[cfg(feature = "logging")]
+            warn!("Failed to write allocator state table. Repair may be required at restart.");
         }
 
-        if self.ensure_allocator_state_table().is_err() {
+        if self.mem.close().is_err() {
             #[cfg(feature = "logging")]
-            warn!("Failed to write allocator state table. Repair may be required at restart.")
+            warn!("Failed to flush database file. Repair may be required at restart.");
         }
     }
 }
@@ -1056,6 +1208,25 @@ impl Builder {
         )
     }
 
+    /// Opens an existing redb database.
+    ///
+    /// If the file has been opened for writing (i.e. as a [`Database`]) [`DatabaseError::DatabaseAlreadyOpen`]
+    /// will be returned on platforms which support file locks (macOS, Windows, Linux). On other platforms,
+    /// the caller MUST avoid calling this method when the database is open for writing.
+    pub fn open_read_only(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ReadOnlyDatabase, DatabaseError> {
+        let file = OpenOptions::new().read(true).open(path)?;
+
+        ReadOnlyDatabase::new(
+            Box::new(FileBackend::new_internal(file, true)?),
+            self.page_size,
+            None,
+            self.read_cache_size_bytes,
+        )
+    }
+
     /// Open an existing or create a new database in the given `file`.
     ///
     /// The file must be empty or contain a valid database.
@@ -1148,18 +1319,18 @@ mod test {
             self.inner.len()
         }
 
-        fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, std::io::Error> {
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
             self.check_countdown()?;
-            self.inner.read(offset, len)
+            self.inner.read(offset, out)
         }
 
         fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
             self.inner.set_len(len)
         }
 
-        fn sync_data(&self, eventual: bool) -> Result<(), std::io::Error> {
+        fn sync_data(&self) -> Result<(), std::io::Error> {
             self.check_countdown()?;
-            self.inner.sync_data(eventual)
+            self.inner.sync_data()
         }
 
         fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
@@ -1173,7 +1344,7 @@ mod test {
         let tmpfile = crate::create_tempfile();
         let (file, path) = tmpfile.into_parts();
 
-        let backend = FailingBackend::new(FileBackend::new(file).unwrap(), 23);
+        let backend = FailingBackend::new(FileBackend::new(file).unwrap(), 20);
         let db = Database::builder()
             .set_cache_size(12686)
             .set_page_size(8 * 1024)
@@ -1294,7 +1465,7 @@ mod test {
         tx.set_two_phase_commit(true);
         let savepoint1 = tx.ephemeral_savepoint().unwrap();
         tx.restore_savepoint(&savepoint0).unwrap();
-        tx.set_durability(Durability::None);
+        tx.set_durability(Durability::None).unwrap();
         {
             let mut t = tx.open_table(table_def).unwrap();
             t.insert_reserve(&660503, 489).unwrap().as_mut().fill(0xFF);
@@ -1338,7 +1509,7 @@ mod test {
         let savepoint4 = tx.ephemeral_savepoint().unwrap();
         drop(savepoint2);
         tx.restore_savepoint(&savepoint3).unwrap();
-        tx.set_durability(Durability::None);
+        tx.set_durability(Durability::None).unwrap();
         {
             let mut t = tx.open_table(table_def).unwrap();
             assert!(t.remove(&207936).unwrap().is_none());
@@ -1358,7 +1529,7 @@ mod test {
         let mut tx = db.begin_write().unwrap();
         tx.set_two_phase_commit(true);
         tx.restore_savepoint(&savepoint5).unwrap();
-        tx.set_durability(Durability::None);
+        tx.set_durability(Durability::None).unwrap();
         {
             tx.open_table(table_def).unwrap();
         }
@@ -1378,7 +1549,7 @@ mod test {
 
         let mut tx = db.begin_write().unwrap();
         let _savepoint0 = tx.ephemeral_savepoint().unwrap();
-        tx.set_durability(Durability::None);
+        tx.set_durability(Durability::None).unwrap();
         {
             let mut t = tx.open_table(table_def).unwrap();
             let value = vec![0; 306];
@@ -1389,7 +1560,7 @@ mod test {
         let mut tx = db.begin_write().unwrap();
         let savepoint1 = tx.ephemeral_savepoint().unwrap();
         tx.restore_savepoint(&savepoint1).unwrap();
-        tx.set_durability(Durability::None);
+        tx.set_durability(Durability::None).unwrap();
         {
             let mut t = tx.open_table(table_def).unwrap();
             let value = vec![0; 2008];

@@ -1,4 +1,4 @@
-use crate::tree_store::{FILE_FORMAT_VERSION2, MAX_VALUE_LENGTH};
+use crate::tree_store::{FILE_FORMAT_VERSION3, MAX_VALUE_LENGTH};
 use crate::{ReadTransaction, TypeName};
 use std::fmt::{Display, Formatter};
 use std::sync::PoisonError;
@@ -14,6 +14,7 @@ pub enum StorageError {
     ValueTooLarge(usize),
     Io(io::Error),
     PreviousIo,
+    DatabaseClosed,
     LockPoisoned(&'static panic::Location<'static>),
 }
 
@@ -36,6 +37,7 @@ impl From<StorageError> for Error {
             StorageError::ValueTooLarge(x) => Error::ValueTooLarge(x),
             StorageError::Io(x) => Error::Io(x),
             StorageError::PreviousIo => Error::PreviousIo,
+            StorageError::DatabaseClosed => Error::DatabaseClosed,
             StorageError::LockPoisoned(location) => Error::LockPoisoned(location),
         }
     }
@@ -56,6 +58,9 @@ impl Display for StorageError {
             }
             StorageError::Io(err) => {
                 write!(f, "I/O error: {err}")
+            }
+            StorageError::DatabaseClosed => {
+                write!(f, "Database has been closed")
             }
             StorageError::PreviousIo => {
                 write!(
@@ -202,7 +207,7 @@ impl std::error::Error for TableError {}
 pub enum DatabaseError {
     /// The Database is already open. Cannot acquire lock.
     DatabaseAlreadyOpen,
-    /// [`crate::RepairSession::abort`] was called.
+    /// [`crate::RepairSession::abort`] was called or repair was aborted for another reason (such as the database being read-only).
     RepairAborted,
     /// The database file is in an old file format and must be manually upgraded
     UpgradeRequired(u8),
@@ -239,7 +244,7 @@ impl Display for DatabaseError {
             DatabaseError::UpgradeRequired(actual) => {
                 write!(
                     f,
-                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION2}, but file is version {actual}"
+                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION3}, but file is version {actual}"
                 )
             }
             DatabaseError::RepairAborted => {
@@ -358,11 +363,42 @@ impl std::error::Error for CompactionError {}
 /// Errors related to transactions
 #[derive(Debug)]
 #[non_exhaustive]
+pub enum SetDurabilityError {
+    /// A persistent savepoint was modified
+    PersistentSavepointModified,
+}
+
+impl From<SetDurabilityError> for Error {
+    fn from(err: SetDurabilityError) -> Error {
+        match err {
+            SetDurabilityError::PersistentSavepointModified => Error::PersistentSavepointModified,
+        }
+    }
+}
+
+impl Display for SetDurabilityError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetDurabilityError::PersistentSavepointModified => {
+                write!(
+                    f,
+                    "Persistent savepoint modified. Cannot reduce transaction durability"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SetDurabilityError {}
+
+/// Errors related to transactions
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum TransactionError {
     /// Error from underlying storage
     Storage(StorageError),
     /// The transaction is still referenced by a table or other object
-    ReadTransactionStillInUse(ReadTransaction),
+    ReadTransactionStillInUse(Box<ReadTransaction>),
 }
 
 impl TransactionError {
@@ -457,6 +493,8 @@ pub enum Error {
     InvalidSavepoint,
     /// [`crate::RepairSession::abort`] was called.
     RepairAborted,
+    /// A persistent savepoint was modified
+    PersistentSavepointModified,
     /// A persistent savepoint exists
     PersistentSavepointExists,
     /// An Ephemeral savepoint exists
@@ -492,11 +530,12 @@ pub enum Error {
     // mutable references to the same dirty pages, or multiple mutable references via insert_reserve()
     TableAlreadyOpen(String, &'static panic::Location<'static>),
     Io(io::Error),
+    DatabaseClosed,
     /// A previous IO error occurred. The database must be closed and re-opened
     PreviousIo,
     LockPoisoned(&'static panic::Location<'static>),
     /// The transaction is still referenced by a table or other object
-    ReadTransactionStillInUse(ReadTransaction),
+    ReadTransactionStillInUse(Box<ReadTransaction>),
 }
 
 impl<T> From<PoisonError<T>> for Error {
@@ -520,7 +559,7 @@ impl Display for Error {
             Error::UpgradeRequired(actual) => {
                 write!(
                     f,
-                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION2}, but file is version {actual}"
+                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION3}, but file is version {actual}"
                 )
             }
             Error::ValueTooLarge(len) => {
@@ -569,6 +608,9 @@ impl Display for Error {
             Error::Io(err) => {
                 write!(f, "I/O error: {err}")
             }
+            Error::DatabaseClosed => {
+                write!(f, "Database has been closed")
+            }
             Error::PreviousIo => {
                 write!(
                     f,
@@ -583,6 +625,12 @@ impl Display for Error {
             }
             Error::RepairAborted => {
                 write!(f, "Database repair aborted.")
+            }
+            Error::PersistentSavepointModified => {
+                write!(
+                    f,
+                    "Persistent savepoint modified. Cannot reduce transaction durability"
+                )
             }
             Error::PersistentSavepointExists => {
                 write!(

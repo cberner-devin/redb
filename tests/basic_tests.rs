@@ -1,8 +1,11 @@
 use rand::random;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use redb::DatabaseError;
 use redb::backends::InMemoryBackend;
 use redb::{
-    Database, Key, MultimapTableDefinition, MultimapTableHandle, Range, ReadableTable,
-    ReadableTableMetadata, TableDefinition, TableError, TableHandle, TypeName, Value,
+    Database, Key, MultimapTableDefinition, MultimapTableHandle, Range, ReadOnlyDatabase,
+    ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableError,
+    TableHandle, TypeName, Value,
 };
 use std::cmp::Ordering;
 #[cfg(not(target_os = "wasi"))]
@@ -38,6 +41,47 @@ fn len() {
     assert_eq!(table.len().unwrap(), 3);
     let untyped_table = read_txn.open_untyped_table(STR_TABLE).unwrap();
     assert_eq!(untyped_table.len().unwrap(), 3);
+}
+
+#[test]
+fn read_only() {
+    let tmpfile = create_tempfile();
+    {
+        let db = Database::create(tmpfile.path()).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(STR_TABLE).unwrap();
+            table.insert("hello", "world").unwrap();
+            table.insert("hello2", "world2").unwrap();
+            table.insert("hi", "world").unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        assert!(matches!(
+            ReadOnlyDatabase::open(tmpfile.path()),
+            Err(DatabaseError::DatabaseAlreadyOpen)
+        ));
+        drop(db);
+    }
+
+    let db = ReadOnlyDatabase::open(tmpfile.path()).unwrap();
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(STR_TABLE).unwrap();
+    assert_eq!(table.len().unwrap(), 3);
+
+    let db2 = ReadOnlyDatabase::open(tmpfile.path()).unwrap();
+    let read_txn2 = db.begin_read().unwrap();
+    let table2 = read_txn2.open_table(STR_TABLE).unwrap();
+    assert_eq!(table2.len().unwrap(), 3);
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    assert!(matches!(
+        Database::open(tmpfile.path()),
+        Err(DatabaseError::DatabaseAlreadyOpen)
+    ));
+    drop(db);
+    drop(db2);
 }
 
 #[test]
@@ -701,7 +745,20 @@ fn tuple12_type() {
     let db = Database::create(tmpfile.path()).unwrap();
 
     let table_def: TableDefinition<
-        (&str, u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, &str),
+        (
+            &str,
+            u8,
+            u16,
+            u32,
+            u64,
+            u128,
+            &str,
+            i16,
+            i32,
+            i64,
+            i128,
+            &str,
+        ),
         (u16, u32),
     > = TableDefinition::new("table");
 
@@ -710,7 +767,7 @@ fn tuple12_type() {
         let mut table = write_txn.open_table(table_def).unwrap();
         table
             .insert(
-                &("hello", 5, 6, 7, 8, 9, -1, -2, -3, -4, -5, "end"),
+                &("hello", 5, 6, 7, 8, 9, "mid", -2, -3, -4, -5, "end"),
                 &(0, 123),
             )
             .unwrap();
@@ -721,7 +778,7 @@ fn tuple12_type() {
     let table = read_txn.open_table(table_def).unwrap();
     assert_eq!(
         table
-            .get(&("hello", 5, 6, 7, 8, 9, -1, -2, -3, -4, -5, "end"))
+            .get(&("hello", 5, 6, 7, 8, 9, "mid", -2, -3, -4, -5, "end"))
             .unwrap()
             .unwrap()
             .value(),
@@ -870,9 +927,7 @@ fn insert_reserve() {
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(def).unwrap();
-        let mut reserved = table
-            .insert_reserve("hello", value.len().try_into().unwrap())
-            .unwrap();
+        let mut reserved = table.insert_reserve("hello", value.len()).unwrap();
         reserved.as_mut().copy_from_slice(value.as_bytes());
     }
     write_txn.commit().unwrap();
@@ -883,6 +938,51 @@ fn insert_reserve() {
         value.as_bytes(),
         table.get("hello").unwrap().unwrap().value()
     );
+}
+
+#[test]
+fn get_mut() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(STR_TABLE).unwrap();
+        assert!(table.insert("hello", "world").unwrap().is_none());
+    }
+    write_txn.commit().unwrap();
+
+    {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(STR_TABLE).unwrap();
+        assert_eq!("world", table.get("hello").unwrap().unwrap().value());
+    }
+
+    let mut very_long_string = String::from("hello");
+    for _ in 0..10_000 {
+        very_long_string.push('x');
+    }
+
+    let mut last_value = "world";
+
+    for new_value in ["earth", "mars", very_long_string.as_str()].iter() {
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(STR_TABLE).unwrap();
+            let mut value = table.get_mut("hello").unwrap().unwrap();
+            if value.value() == last_value {
+                value.insert(new_value).unwrap();
+            } else {
+                panic!();
+            }
+            assert_eq!(value.value(), *new_value);
+            last_value = new_value;
+        }
+        write_txn.commit().unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(STR_TABLE).unwrap();
+        assert_eq!(*new_value, table.get("hello").unwrap().unwrap().value());
+    }
 }
 
 #[test]
@@ -1419,6 +1519,66 @@ fn range_lifetime() {
     };
     assert_eq!(iter.next().unwrap().unwrap().1.value(), "world");
     assert!(iter.next().is_none());
+}
+
+#[test]
+fn range_empty() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u128, u128> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0..1000 {
+            table.insert(i, i).unwrap();
+        }
+        #[expect(clippy::reversed_empty_ranges)]
+        let mut iter = table.range(500..0).unwrap();
+        assert!(iter.next().is_none());
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_from_if_empty() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u128, u128> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0..1000 {
+            table.insert(i, i).unwrap();
+        }
+        #[expect(clippy::reversed_empty_ranges)]
+        let mut iter = table.extract_from_if(500..0, |_, _| true).unwrap();
+        assert!(iter.next().is_none());
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn retain_in_empty() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u128, u128> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0..1000 {
+            table.insert(i, i).unwrap();
+        }
+        #[expect(clippy::reversed_empty_ranges)]
+        table.retain_in(500..0, |_, _| false).unwrap();
+        assert_eq!(table.len().unwrap(), 1000);
+    }
+    write_txn.commit().unwrap();
 }
 
 #[test]

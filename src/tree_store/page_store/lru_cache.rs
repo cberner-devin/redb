@@ -1,10 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use crate::tree_store::page_store::fast_hash::FastHashMapU64;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Default)]
 pub struct LRUCache<T> {
     // AtomicBool is the second chance flag
-    cache: HashMap<u64, (T, AtomicBool)>,
+    cache: FastHashMapU64<(T, AtomicBool)>,
     lru_queue: VecDeque<u64>,
 }
 
@@ -36,11 +37,11 @@ impl<T> LRUCache<T> {
             if self.lru_queue.len() > 2 * self.cache.len() {
                 // Cycle two elements of the LRU queue to ensure it doesn't grow without bound
                 for _ in 0..2 {
-                    if let Some(removed_key) = self.lru_queue.pop_front() {
-                        if let Some((_, second_chance)) = self.cache.get(&removed_key) {
-                            second_chance.store(false, Ordering::Release);
-                            self.lru_queue.push_back(removed_key);
-                        }
+                    if let Some(removed_key) = self.lru_queue.pop_front()
+                        && let Some((_, second_chance)) = self.cache.get(&removed_key)
+                    {
+                        second_chance.store(false, Ordering::Release);
+                        self.lru_queue.push_back(removed_key);
                     }
                 }
             }
@@ -94,7 +95,9 @@ impl<T> LRUCache<T> {
     }
 
     pub(crate) fn clear(&mut self) {
+        self.cache.shrink_to_fit();
         self.cache.clear();
+        self.lru_queue.shrink_to_fit();
         self.lru_queue.clear();
     }
 }

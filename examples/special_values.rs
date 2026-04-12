@@ -27,7 +27,7 @@ impl SpecialValuesDb {
         }
     }
 
-    fn begin_txn(&mut self) -> SpecialValuesTransaction {
+    fn begin_txn(&mut self) -> SpecialValuesTransaction<'_> {
         SpecialValuesTransaction {
             inner: self.database.begin_write().unwrap(),
             file: &mut self.file,
@@ -44,7 +44,7 @@ impl SpecialValuesTransaction<'_> {
     fn open_table<K: Key + 'static, V: Value + 'static>(
         &mut self,
         table: TableDefinition<K, V>,
-    ) -> SpecialValuesTable<K, V> {
+    ) -> SpecialValuesTable<'_, K, V> {
         let def: TableDefinition<K, (u64, u64)> = TableDefinition::new(table.name());
         SpecialValuesTable {
             inner: self.inner.open_table(def).unwrap(),
@@ -105,6 +105,7 @@ impl<V: Value + 'static> ValueAccessor<V> {
 /// Storing values with alignment requirements is also not supported.
 ///
 /// This example demonstrates one way to handle such values, via a sidecar file.
+#[allow(clippy::result_large_err)]
 fn main() -> Result<(), Error> {
     let mut db = SpecialValuesDb::new();
     let mut txn = db.begin_txn();

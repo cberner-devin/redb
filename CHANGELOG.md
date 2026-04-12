@@ -1,5 +1,157 @@
 # redb - Changelog
 
+## 4.0.0 - 2026-04-02
+* Implement `Drop` on `AccessGuardMut` and `AccessGuardMutInPlace`, which requires that these be dropped
+  before the `Table` they borrow from.
+  This fixes a critical bug where the accessor could outlive the `Table`, and be dropped after the
+  transaction had already committed. This could cause data loss due to the data in the accessor
+  being written out after the transaction had already completed.
+* Remove `Legacy` type. To migrate off the `Legacy` type, use the `Legacy` type in the 3.x release
+  and copy the data to a table with plain tuples, before upgrading to the 4.x release.
+
+## 3.1.3 - 2026-04-02
+* Fix a data loss bug which can occur when the guard returned from `Table::get_mut()` is dropped
+  after the transaction has been committed.
+* Add a warning to `Table::insert_reserve()` indicating that it can cause data loss and recommending
+  to upgrade to the 4.0.0 release.
+
+## 3.1.2 - 2026-04-01
+* Reduce memory usage of open databases
+
+## 3.1.1 - 2026-03-08
+* Fix panic which could occur when inserting into a table with fixed size keys when `debug_assertions` are enabled
+* Add additional information to the stats returned by `cache_stats()`
+
+## 3.1.0 - 2025-09-25
+* Implement `std::error::Error` for `SetDurabilityError`
+* Fix compilation error on various non-tier-1 platforms, such as wasm32-unknown
+
+## 3.0.2 - 2025-09-16
+* Fix performance issue where a transaction with a large number of writes would cause
+  `WriteTransaction::abort()` and committing non-durable transactions to become slow.
+
+## 3.0.1 - 2025-08-23
+* Fix correctness issue with `range()`, `extract_from_if()`, and `retain_in()`. If a RangeBounds
+  with `start` > `end` was passed as an argument and `start` and `end` keys were stored in different
+  internal pages in the database (i.e. a sufficient condition is that more than 4KiB of key-value
+  pairs were between the two keys) then these methods would perform as if the argument had been
+  `start..`
+* Fix performance regression, from redb 2.x, where `Durability::None` commits could become linearly
+  slower during a series of transactions.
+
+## 2.6.3 - 2025-08-23
+* Fix correctness issue with `range()`, `extract_from_if()`, and `retain_in()`. If a RangeBounds
+  with `start` > `end` was passed as an argument and `start` and `end` keys were stored in different
+  internal pages in the database (i.e. a sufficient condition is that more than 4KiB of key-value
+  pairs were between the two keys) then these methods would perform as if the argument had been
+  `start..`
+
+## 1.5.2 - 2025-08-23
+* Fix correctness issue with `range()`, `drain()`, and `drain_filter()`. If a RangeBounds
+  with `start` > `end` was passed as an argument and `start` and `end` keys were stored in different
+  internal pages in the database (i.e. a sufficient condition is that more than 4KiB of key-value
+  pairs were between the two keys) then these methods would perform as if the argument had been
+  `start..`
+
+## 3.0.0 - 2025-08-09
+
+### Removes support for file format v2.
+Use `Database::upgrade()`, in redb 2.6, to migrate to the v3 file format.
+
+### General storage optimizations
+The v3 file format has been further optimized to reduce the size of the database. Databases with only
+a few small keys will see the largest benefit, and the minimum size of a database file has decreased
+from ~2.5MiB to ~50KiB. To achieve the smallest file size call `Database::compact()` before
+dropping the `Database`.
+
+Additionally, performance is ~15% better in bulk load benchmarks. This was achieved by implementing
+a custom hash function for various in-memory `HashSet`s and `HashMap`s, and by optimizing the usage
+of buffers held in `Arc`s to reduce the number of atomic instructions executed.
+
+### Optimize storage of tuple types
+Storage of variable width tuple types with arity greater than 1 is more efficient. The new format
+elides the length of any fixed width fields and uses varint encoding for the lengths of all variable
+width fields.
+
+Note that this encoding is not compatible with the serialization of variable width tuples used in prior versions.
+To load tuple data created prior to version 3.0, wrap them in the `Legacy` type.
+For example, `TableDefinition<u64, (&str, u32)>` becomes `TableDefinition<u64, Legacy<(&str, u32)>>`.
+Fixed width tuples, such as `(u32, u64)` are backwards compatible.
+
+### Derive for Key and Value traits
+`Key` and `Value` can be derived using the `redb-derive` crate. Note that it does not support
+schema migration. The recommended pattern to migrate schema is to create a new table, and then
+perform a migration from the old table to the new table.
+
+### Read-only multi-process support
+Multiple processes may open the same database file for reading by using the new `ReadOnlyDatabase`
+type. On platforms which support file locks, this acquires a shared lock on the database file.
+
+### Enable garbage collection in Durability::None transactions
+Non-durable transactions will now free pages when possible (pages allocated in a preceding
+non-durable transaction which are no longer referenced).
+This resolves an issue where a long sequence of non-durable transactions led to significant growth
+in the size of the database file.
+This change increases the RAM required for a sequence of non-durable transactions, such that RAM
+proportional to the net change in the database is now used. However, it will never use more than
+about 0.2% of the database file size.
+
+### Other changes
+
+* Add `ReadOnlyDatabase`
+* Add `Builder::open_read_only()`
+* Add `StorageBackend::close()`
+* Add `Table::get_mut()`
+* Add `chrono_v0_4` feature flag which enables serialization of the `NaiveDate`, `NaiveTime`,
+  `NaiveDatetime`, `DateTime<FixedOffset>`, and `FixedOffset` types in the `chrono` crate
+* Add `uuid` feature flag which enables serialization of the `Uuid` type in the `uuid` crate
+* Change `StorageBackend::read()` to accept a `&mut [u8]` output argument instead of returning
+  a `Vec<u8>`
+* Change `Table::insert_reserve()` to take `usize` instead of `u32` as the argument type
+* Change `TypeName::name()` to be public
+* Change `ReadTransactionStillInUse` to contain a `Box`
+* Change `set_durability()` to return a `Result`
+* Move `Database::cache_stats()` and `Database::begin_read()` to `ReadableDatabase` trait
+* Rename `AccessGuardMut` to `AccessGuardMutInPlace`. Note that a new `AccessGuardMut` struct has
+  been added; it serves a different purpose
+* Remove `Durability::Paranoid`
+* Fix a rare case where `check_integrity()` returned `Ok(false)` even though no repair was required,
+  when called on a database that was not shutdown cleanly and was automatically repaired when opened
+* Disallow access to the database from read transactions after the `Database` as been
+  dropped. Access will now return `DatabaseClosed`
+
+## 2.6.2 - 2025-08-02
+* Forward compatibility improvement which makes the file format more flexible to support a potential
+  future optimization
+
+## 2.6.1 - 2025-07-24
+* Fix a forward compatibility issue which caused a crash when opening databases created with redb
+  3.x. Note that opening 3.x databases with redb 2.x is not generally supported and only works
+  in certain situations.
+
+## 2.6.0 - 2025-05-22
+
+### Add support for the v3 file format.
+This file format improves savepoints.
+Savepoints in the v3 format have constant, and small, overhead. Creating
+and restoring them is also much faster. The v3 file format also supports
+savepoints on large databases (v2 has a limit around 32TB). This release
+creates v2 databases by default. Use `Builder::create_with_file_format_v3()`
+and `Database::upgrade()`, respectively, to enable and migrate to v3.
+
+**The upcoming 3.0 release will only support the v3 file format.**
+
+* Add `Builder::create_with_file_format_v3()`
+* Add `Database::upgrade()`
+
+## 2.5.0 - 2025-04-21
+* Add `rename_table()` and `rename_multimap_table()`
+* Add `Key` and `Value` implementations for the unary tuple type (i.e. `(T,)`)
+* Fix an issue which could cause a panic when concurrently performing read and write transactions,
+  when `debug_assertions` were enabled
+* Optimize `retain()` and `retain_in()` to use less space in the database file
+* Improve handling of some internal errors to return `LockPoisoned` instead of panicking
+
 ## 2.4.0 - 2024-12-30
 * Add `Database::cache_stats()`
 * Fix `open()` and `create()` to return `InvalidData` when they are called on a database file

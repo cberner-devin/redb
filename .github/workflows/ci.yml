@@ -29,11 +29,16 @@ jobs:
                 ~/.cargo/registry/cache/
                 ~/.cargo/git/db/
                 target/
+                fuzz/target/
             key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml', 'rust-toolchain') }}
 
-      - name: Check for forbidden words
-        if: runner.os != 'Windows'
-        run: "! grep --include='*.rs' -RE 'to_be_bytes|from_be_bytes|dbg!' ."
+      - name: Non ASCII characters
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+            if grep -P -n "[^\x00-\x7F]" -r --include="*.rs" --include="*.toml" .; then
+            echo "Non-ASCII characters detected"
+            exit 1
+            fi
 
       - name: Install Python
         uses: actions/setup-python@v5
@@ -41,7 +46,6 @@ jobs:
           python-version: "3.12"
 
       - name: Install Rust
-        if: steps.rust-cache.outputs.cache-hit != 'true'
         run: |
             rustup component add rustfmt
             rustup component add clippy
@@ -69,21 +73,39 @@ jobs:
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: cargo install --force --version 1.36.0 just --locked
 
-      - name: Compile
-        run: cargo build --all-targets --all-features
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Compile (default features)
+        run: cargo check --all --all-targets
+
+      - name: Compile (all features)
+        run: cargo check --all --all-targets --all-features
+
+      - name: Compile (no features)
+        run: cargo check --all --all-targets --no-default-features
+
+      - name: Compile (`wasm32-unknown-unknown`)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+            rustup target add wasm32-unknown-unknown
+            # Not possible to set default members for specific a target:
+            # https://github.com/rust-lang/cargo/issues/6179
+            command="cargo check -p $(cargo pkgid) -p redb-derive --target wasm32-unknown-unknown"
+            $command
+            $command --all-features
+            $command --no-default-features
+            rustup target remove wasm32-unknown-unknown
+
+      - name: Clippy
+        run: cargo clippy --all --all-targets -- -Dwarnings
 
       - name: Fuzzer
         if: startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')
         run: just fuzz_ci
 
       - name: Run tests
-        run: just build test
-
-      - name: Clippy
-        run: cargo clippy --all --all-targets -- -Dwarnings
-
-      - name: Format
-        run: cargo fmt --all -- --check
+        run: just test_all
 
       - name: Run CPython wrapper tests
         if: runner.os != 'Windows'
@@ -106,6 +128,4 @@ jobs:
       - name: Run WASI tests
         if: runner.os != 'Windows'
         run: |
-          rustup toolchain install nightly-2025-04-06
-          rustup target add wasm32-wasip1-threads --toolchain=nightly-2025-04-06
           RUSTFLAGS="" just test_wasi

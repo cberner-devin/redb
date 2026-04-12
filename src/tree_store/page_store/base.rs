@@ -3,9 +3,11 @@ use crate::tree_store::page_store::page_manager::MAX_MAX_PAGE_ORDER;
 use std::cmp::Ordering;
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
-#[cfg(debug_assertions)]
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
+use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
+use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 #[cfg(debug_assertions)]
@@ -14,19 +16,35 @@ use std::sync::Mutex;
 pub(crate) const MAX_VALUE_LENGTH: usize = 3 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PAIR_LENGTH: usize = 3 * 1024 * 1024 * 1024 + 768 * 1024 * 1024;
 pub(crate) const MAX_PAGE_INDEX: u32 = 0x000F_FFFF;
+pub(crate) const MAX_REGIONS: u32 = 0x0010_0000;
 
 // On-disk format is:
-// lowest 20bits: page index within the region
+// TODO: consider implementing an optimization in which we store the number of order-0 pages that
+// are actually used, in these reserved bits, so that the reads to the PagedCachedFile layer can avoid
+// reading all the zeros at the end of the page.
+// lowest 20bits: page index within the region. Only the lowest `20 - order_exponent` bits may be read.
+// The remaining bits are reserved for future use and must be ignored
 // second 20bits: region number
 // 19bits: reserved
 // highest 5bits: page order exponent
 //
 // Assuming a reasonable page size, like 4kiB, this allows for 4kiB * 2^20 * 2^20 = 4PiB of usable space
-#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub(crate) struct PageNumber {
     pub(crate) region: u32,
     pub(crate) page_index: u32,
     pub(crate) page_order: u8,
+}
+
+impl Hash for PageNumber {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // TODO: maybe we should store these fields as a single u64 in PageNumber. The field access
+        // will be a little more expensive, but I think it's less frequent than these hashes
+        let mut temp = 0x000F_FFFF & u64::from(self.page_index);
+        temp |= (0x000F_FFFF & u64::from(self.region)) << 20;
+        temp |= (0b0001_1111 & u64::from(self.page_order)) << 59;
+        state.write_u64(temp);
+    }
 }
 
 // PageNumbers are ordered as determined by their starting address in the database file
@@ -55,7 +73,6 @@ impl PartialOrd for PageNumber {
 }
 
 impl PageNumber {
-    #[inline(always)]
     pub(crate) const fn serialized_size() -> usize {
         8
     }
@@ -80,29 +97,15 @@ impl PageNumber {
 
     pub(crate) fn from_le_bytes(bytes: [u8; 8]) -> Self {
         let temp = u64::from_le_bytes(bytes);
-        let index = (temp & 0x000F_FFFF) as u32;
-        let region = ((temp >> 20) & 0x000F_FFFF) as u32;
         let order = (temp >> 59) as u8;
+        let index = u32::try_from(temp & (0x000F_FFFF >> order)).unwrap();
+        let region = ((temp >> 20) & 0x000F_FFFF) as u32;
 
         Self {
             region,
             page_index: index,
             page_order: order,
         }
-    }
-
-    // Returns true if this PageNumber is before the other PageNumber in the file layout
-    pub(crate) fn is_before(&self, other: PageNumber) -> bool {
-        if self.region < other.region {
-            return true;
-        }
-        if self.region > other.region {
-            return false;
-        }
-        let self_order0 = self.page_index * 2u32.pow(self.page_order.into());
-        let other_order0 = other.page_index * 2u32.pow(other.page_order.into());
-        assert_ne!(self_order0, other_order0, "{self:?} overlaps {other:?}");
-        self_order0 < other_order0
     }
 
     #[cfg(test)]
@@ -237,20 +240,23 @@ impl Clone for PageImpl {
     }
 }
 
-pub(crate) struct PageMut {
+// The lifetime should be bound to the lifetime of the transaction in which this page was opened.
+// It is used in the Drop impl to ensure that the page is dropped before the transaction is committed.
+pub(crate) struct PageMut<'txn> {
     pub(super) mem: WritablePage,
     pub(super) page_number: PageNumber,
+    pub(super) _lifetime: PhantomData<&'txn ()>,
     #[cfg(debug_assertions)]
     pub(super) open_pages: Arc<Mutex<HashSet<PageNumber>>>,
 }
 
-impl PageMut {
+impl PageMut<'_> {
     pub(crate) fn memory_mut(&mut self) -> &mut [u8] {
         self.mem.mem_mut()
     }
 }
 
-impl Page for PageMut {
+impl Page for PageMut<'_> {
     fn memory(&self) -> &[u8] {
         self.mem.mem()
     }
@@ -260,9 +266,9 @@ impl Page for PageMut {
     }
 }
 
-#[cfg(debug_assertions)]
-impl Drop for PageMut {
+impl Drop for PageMut<'_> {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
         assert!(self.open_pages.lock().unwrap().remove(&self.page_number));
     }
 }
@@ -271,6 +277,60 @@ impl Drop for PageMut {
 pub(crate) enum PageHint {
     None,
     Clean,
+}
+
+pub(crate) enum PageTrackerPolicy {
+    Ignore,
+    Track(HashSet<PageNumber>),
+    Closed,
+}
+
+impl PageTrackerPolicy {
+    pub(crate) fn new_tracking() -> Self {
+        PageTrackerPolicy::Track(HashSet::new())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            PageTrackerPolicy::Ignore | PageTrackerPolicy::Closed => true,
+            PageTrackerPolicy::Track(x) => x.is_empty(),
+        }
+    }
+
+    pub(super) fn remove(&mut self, page: PageNumber) {
+        match self {
+            PageTrackerPolicy::Ignore => {}
+            PageTrackerPolicy::Track(x) => {
+                assert!(x.remove(&page));
+            }
+            PageTrackerPolicy::Closed => {
+                panic!("Page tracker is closed");
+            }
+        }
+    }
+
+    pub(super) fn insert(&mut self, page: PageNumber) {
+        match self {
+            PageTrackerPolicy::Ignore => {}
+            PageTrackerPolicy::Track(x) => {
+                assert!(x.insert(page));
+            }
+            PageTrackerPolicy::Closed => {
+                panic!("Page tracker is closed");
+            }
+        }
+    }
+
+    pub(crate) fn close(&mut self) -> HashSet<PageNumber> {
+        let old = mem::replace(self, PageTrackerPolicy::Closed);
+        match old {
+            PageTrackerPolicy::Ignore => HashSet::new(),
+            PageTrackerPolicy::Track(x) => x,
+            PageTrackerPolicy::Closed => {
+                panic!("Page tracker is closed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,5 +351,14 @@ mod test {
             region_header_size,
             page_size.try_into().unwrap(),
         );
+    }
+
+    #[test]
+    fn reserved_bits() {
+        let page_number = PageNumber::new(0, 0, 12);
+        let mut bytes = page_number.to_le_bytes();
+        bytes[1] = 0xFF;
+        let page_number2 = PageNumber::from_le_bytes(bytes);
+        assert_eq!(page_number, page_number2);
     }
 }
