@@ -1,5 +1,9 @@
 # redb - Changelog
 
+## 4.0.1 - 2026-04-12
+* Fix data loss bug in `restore_savepoint()`: pending table modifications from before the restore
+  were not cleared, causing `flush_table_root_updates()` to re-apply stale changes on commit.
+
 ## 4.0.0 - 2026-04-02
 * Implement `Drop` on `AccessGuardMut` and `AccessGuardMutInPlace`, which requires that these be dropped
   before the `Table` they borrow from.
