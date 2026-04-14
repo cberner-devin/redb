@@ -147,11 +147,7 @@ impl TransactionalMemory {
         );
         assert!(region_size.is_power_of_two());
 
-        let storage = PagedCachedFile::new(
-            file,
-            page_size as u64,
-            cache_size,
-        )?;
+        let storage = PagedCachedFile::new(file, page_size as u64, cache_size)?;
 
         let initial_storage_len = storage.raw_file_len()?;
 

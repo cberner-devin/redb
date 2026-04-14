@@ -1146,13 +1146,6 @@ impl Builder {
     }
 
     /// Set the amount of memory (in bytes) used for caching data
-    ///
-    /// The budget is dynamically shared between a read cache and a write
-    /// buffer.  The write buffer is hard-capped at 50% and may only reclaim
-    /// read-cache space while the read cache holds more than 50%.  This allows
-    /// the write buffer to grow during large transactions without starving
-    /// readers, while the read cache can use up to 100% when no writes are in
-    /// progress.
     pub fn set_cache_size(&mut self, bytes: usize) -> &mut Self {
         self.cache_size = bytes;
         self

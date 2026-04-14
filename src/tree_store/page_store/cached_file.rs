@@ -6,7 +6,7 @@ use std::slice::SliceIndex;
 #[cfg(feature = "cache_metrics")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 pub(super) struct WritablePage {
     buffer: Arc<Mutex<LRUWriteCache>>,
@@ -205,14 +205,6 @@ pub(super) struct PagedCachedFile {
     // writes are in progress, while write-heavy workloads never starve readers
     // below 50%.
     //
-    // Enforcement in write(): first flush any write-buffer excess above 50% to
-    // disk (rule 1), then if the total still exceeds the budget the only
-    // possibility is read > 50%, so evict from the read cache (rules 2 + 3).
-    //
-    // Enforcement in read(): evict from the local read-cache stripe when the
-    // total exceeds the budget (rule 3).  The read cache cannot evict write-
-    // buffer entries due to lock-ordering constraints.
-    //
     // We track usage with two atomic counters and compute the total on the fly.
     // The resulting read is not perfectly atomic (between loading the two
     // counters a concurrent operation could change one), but the budget is a
@@ -322,7 +314,7 @@ impl PagedCachedFile {
     //
     // Caller must hold the write_buffer mutex to maintain the lock ordering
     // invariant (write_buffer lock is always acquired before read_cache locks).
-    fn evict_from_read_cache(&self, bytes_needed: usize) {
+    fn evict_from_read_cache(&self, bytes_needed: usize, _write_lock: &MutexGuard<'_, LRUWriteCache>) {
         let mut freed = 0;
         for cache in &self.read_cache {
             if freed >= bytes_needed {
@@ -569,7 +561,7 @@ impl PagedCachedFile {
             // read cache (fairness: we only take from read when read > 50%).
             let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
             if write_bytes + read_bytes > self.max_cache_size {
-                self.evict_from_read_cache(write_bytes + read_bytes - self.max_cache_size);
+                self.evict_from_read_cache(write_bytes + read_bytes - self.max_cache_size, &lock);
             }
             let result = if let Some(data) = existing {
                 #[cfg(feature = "cache_metrics")]
