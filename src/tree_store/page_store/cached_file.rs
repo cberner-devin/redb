@@ -214,6 +214,9 @@ pub(super) struct PagedCachedFile {
     read_cache_bytes: AtomicUsize,
     write_buffer_bytes: AtomicUsize,
     max_cache_size: usize,
+    // Rotates the starting stripe for read-cache eviction so that
+    // pressure is spread evenly instead of always hitting stripe 0 first.
+    next_eviction_stripe: AtomicUsize,
     #[cfg(feature = "cache_metrics")]
     reads_total: AtomicU64,
     #[cfg(feature = "cache_metrics")]
@@ -245,6 +248,7 @@ impl PagedCachedFile {
             read_cache_bytes: AtomicUsize::new(0),
             write_buffer_bytes: AtomicUsize::new(0),
             max_cache_size,
+            next_eviction_stripe: AtomicUsize::new(0),
             #[cfg(feature = "cache_metrics")]
             reads_total: Default::default(),
             #[cfg(feature = "cache_metrics")]
@@ -315,12 +319,15 @@ impl PagedCachedFile {
     // Caller must hold the write_buffer mutex to maintain the lock ordering
     // invariant (write_buffer lock is always acquired before read_cache locks).
     fn evict_from_read_cache(&self, bytes_needed: usize, _write_lock: &MutexGuard<'_, LRUWriteCache>) {
+        let num_stripes = self.read_cache.len();
+        let start = self.next_eviction_stripe.fetch_add(1, Ordering::Relaxed) % num_stripes;
         let mut freed = 0;
-        for cache in &self.read_cache {
+        for i in 0..num_stripes {
             if freed >= bytes_needed {
                 break;
             }
-            let mut lock = cache.write().unwrap();
+            let stripe = (start + i) % num_stripes;
+            let mut lock = self.read_cache[stripe].write().unwrap();
             while freed < bytes_needed {
                 if let Some((_, v)) = lock.pop_lowest_priority() {
                     #[cfg(feature = "cache_metrics")]
