@@ -12,7 +12,7 @@ use crate::tree_store::{
 use crate::types::{Key, Value};
 use crate::{DatabaseStats, Result};
 use std::cmp::max;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::ops::RangeFull;
 use std::sync::{Arc, Mutex};
@@ -599,13 +599,7 @@ impl TableTreeMut<'_> {
         }
     }
 
-    // Returns the paths to the n pages that are closest to the end of the database
-    // The return value is sorted, according to path.page_number()'s Ord
-    pub(crate) fn highest_index_pages(
-        &self,
-        n: usize,
-        output: &mut BTreeMap<PageNumber, PagePath>,
-    ) -> Result {
+    pub(crate) fn collect_pages(&self, output: &mut Vec<PagePath>) -> Result {
         for entry in self.tree.range::<RangeFull, &str>(&(..))? {
             let entry = entry?;
             let mut definition = entry.value();
@@ -616,19 +610,13 @@ impl TableTreeMut<'_> {
             }
 
             definition.visit_all_pages(self.mem.clone(), |path| {
-                output.insert(path.page_number(), path.clone());
-                while output.len() > n {
-                    output.pop_first();
-                }
+                output.push(path.clone());
                 Ok(())
             })?;
         }
 
         self.tree.visit_all_pages(|path| {
-            output.insert(path.page_number(), path.clone());
-            while output.len() > n {
-                output.pop_first();
-            }
+            output.push(path.clone());
             Ok(())
         })?;
 

@@ -21,7 +21,7 @@ use crate::{
 use log::{debug, warn};
 use std::borrow::Borrow;
 use std::cmp::min;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -55,6 +55,11 @@ pub(crate) const ALLOCATOR_STATE_TABLE_NAME: &str = "allocator_state";
 pub(crate) type AllocatorStateTree = Btree<AllocatorStateKey, &'static [u8]>;
 pub(crate) type AllocatorStateTreeMut<'a> = BtreeMut<'a, AllocatorStateKey, &'static [u8]>;
 pub(crate) type SystemFreedTree<'a> = BtreeMut<'a, TransactionIdWithPagination, PageList<'static>>;
+
+pub(crate) struct CompactionProgress {
+    pub(crate) made_progress: bool,
+    pub(crate) considered_all_live_pages: bool,
+}
 
 // Format:
 // 2 bytes: length
@@ -1690,22 +1695,27 @@ impl WriteTransaction {
     }
 
     // Relocate pages to lower number regions/pages
-    // Returns true if a page(s) was moved
-    pub(crate) fn compact_pages(&mut self) -> Result<bool> {
-        let mut progress = false;
-
+    pub(crate) fn compact_pages(&mut self) -> Result<CompactionProgress> {
         // Find the 1M highest pages
-        let mut highest_pages = BTreeMap::new();
+        let mut highest_pages = Vec::new();
         let mut tables = self.tables.lock().unwrap();
         let table_tree = &mut tables.table_tree;
-        table_tree.highest_index_pages(MAX_PAGES_PER_COMPACTION, &mut highest_pages)?;
+        table_tree.collect_pages(&mut highest_pages)?;
         let mut system_tables = self.system_tables.lock().unwrap();
         let system_table_tree = &mut system_tables.table_tree;
-        system_table_tree.highest_index_pages(MAX_PAGES_PER_COMPACTION, &mut highest_pages)?;
+        system_table_tree.collect_pages(&mut highest_pages)?;
+        let considered_all_live_pages = highest_pages.len() <= MAX_PAGES_PER_COMPACTION;
+        if highest_pages.len() > MAX_PAGES_PER_COMPACTION {
+            let split = highest_pages.len() - MAX_PAGES_PER_COMPACTION;
+            highest_pages
+                .select_nth_unstable_by(split, |a, b| a.page_number().cmp(&b.page_number()));
+            highest_pages.drain(..split);
+        }
+        highest_pages.sort_unstable_by_key(|path| path.page_number());
 
         // Calculate how many of them can be relocated to lower pages, starting from the last page
         let mut relocation_map = HashMap::new();
-        for path in highest_pages.into_values().rev() {
+        for path in highest_pages.into_iter().rev() {
             if relocation_map.contains_key(&path.page_number()) {
                 continue;
             }
@@ -1739,14 +1749,13 @@ impl WriteTransaction {
             }
         }
 
-        if !relocation_map.is_empty() {
-            progress = true;
-        }
-
         table_tree.relocate_tables(&relocation_map)?;
         system_table_tree.relocate_tables(&relocation_map)?;
 
-        Ok(progress)
+        Ok(CompactionProgress {
+            made_progress: !relocation_map.is_empty(),
+            considered_all_live_pages,
+        })
     }
 
     // NOTE: must be called before store_system_freed_pages() during commit, since this can create

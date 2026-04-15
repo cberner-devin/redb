@@ -632,7 +632,9 @@ impl Database {
             let mut progress = false;
 
             let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
-            if txn.compact_pages()? {
+            let compaction = txn.compact_pages()?;
+            let considered_all_live_pages = compaction.considered_all_live_pages;
+            if compaction.made_progress {
                 progress = true;
                 txn.commit().map_err(|e| e.into_storage_error())?;
             } else {
@@ -662,6 +664,12 @@ impl Database {
             }
 
             compacted = true;
+            if considered_all_live_pages {
+                // The compaction pass already examined every live page. Since pages are processed
+                // from highest to lowest, the newly freed source pages are all above the remaining
+                // candidates and can't unlock additional lower relocations in another pass.
+                break;
+            }
         }
 
         Ok(compacted)
