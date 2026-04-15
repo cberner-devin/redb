@@ -1393,7 +1393,17 @@ impl WriteTransaction {
         let (user_root, allocated_pages, data_freed) =
             self.tables.lock().unwrap().table_tree.flush_and_close()?;
 
-        self.store_data_freed_pages(data_freed)?;
+        let free_data_pages_after_commit = matches!(self.durability, InternalDurability::Immediate)
+            && self
+                .transaction_tracker
+                .oldest_live_read_transaction()
+                .is_none();
+        let post_commit_data_frees = if free_data_pages_after_commit {
+            data_freed
+        } else {
+            self.store_data_freed_pages(data_freed)?;
+            vec![]
+        };
         self.store_allocated_pages(allocated_pages.into_iter().collect())?;
 
         #[cfg(feature = "logging")]
@@ -1403,7 +1413,9 @@ impl WriteTransaction {
         );
         match self.durability {
             InternalDurability::None => self.non_durable_commit(user_root)?,
-            InternalDurability::Immediate => self.durable_commit(user_root)?,
+            InternalDurability::Immediate => {
+                self.durable_commit(user_root, post_commit_data_frees)?
+            }
         }
 
         for (savepoint, transaction) in self.deleted_persistent_savepoints.lock().unwrap().iter() {
@@ -1471,7 +1483,35 @@ impl WriteTransaction {
     }
 
     fn store_allocated_pages(&self, mut data_allocated_pages: Vec<PageNumber>) -> Result {
+        let oldest_savepoint = self.transaction_tracker.oldest_savepoint();
         let mut system_tables = self.system_tables.lock().unwrap();
+
+        if oldest_savepoint.is_none() {
+            let allocated_table_exists = system_tables
+                .table_tree
+                .get_table::<TransactionIdWithPagination, PageList>(
+                    DATA_ALLOCATED_TABLE.name(),
+                    TableType::Normal,
+                )
+                .map_err(|e| {
+                    e.into_storage_error_or_corrupted("Internal error. System table is corrupted")
+                })?
+                .is_some();
+
+            if !allocated_table_exists {
+                return Ok(());
+            }
+
+            let mut allocated_table =
+                system_tables.open_system_table(self, DATA_ALLOCATED_TABLE)?;
+            for entry in allocated_table
+                .extract_from_if::<TransactionIdWithPagination, _>(.., |_, _| true)?
+            {
+                entry?;
+            }
+            return Ok(());
+        }
+
         let mut allocated_table = system_tables.open_system_table(self, DATA_ALLOCATED_TABLE)?;
         let mut pagination_counter = 0;
         while !data_allocated_pages.is_empty() {
@@ -1501,10 +1541,7 @@ impl WriteTransaction {
         }
 
         // Purge any transactions that are no longer referenced
-        let oldest = self
-            .transaction_tracker
-            .oldest_savepoint()
-            .map_or(u64::MAX, |(_, x)| x.raw_id());
+        let oldest = oldest_savepoint.unwrap().1.raw_id();
         let key = TransactionIdWithPagination {
             transaction_id: oldest,
             pagination_id: 0,
@@ -1552,7 +1589,11 @@ impl WriteTransaction {
         Ok(())
     }
 
-    pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
+    pub(crate) fn durable_commit(
+        &mut self,
+        user_root: Option<BtreeHeader>,
+        post_commit_data_frees: Vec<PageNumber>,
+    ) -> Result {
         let free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
@@ -1621,6 +1662,10 @@ impl WriteTransaction {
         // Immediately free the pages that were freed from the system-tree. These are only
         // accessed by write transactions, so it's safe to free them as soon as the commit is done.
         for page in system_freed_pages.lock().unwrap().drain(..) {
+            self.mem.free(page, &mut PageTrackerPolicy::Ignore);
+        }
+
+        for page in post_commit_data_frees {
             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
         }
 

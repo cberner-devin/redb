@@ -1251,7 +1251,13 @@ impl std::fmt::Debug for Database {
 
 #[cfg(test)]
 mod test {
+    use super::TransactionGuard;
+    use crate::TableHandle;
     use crate::backends::FileBackend;
+    use crate::transactions::{
+        DATA_ALLOCATED_TABLE, DATA_FREED_TABLE, PageList, TransactionIdWithPagination,
+    };
+    use crate::tree_store::{InternalTableDefinition, PageHint, TableTree, TableType};
     use crate::{
         CommitError, Database, DatabaseError, Durability, ReadableTable, StorageBackend,
         StorageError, TableDefinition, TransactionError,
@@ -1639,6 +1645,63 @@ mod test {
 
         let final_file_size = tmpfile.as_file().metadata().unwrap().len();
         assert!(final_file_size < file_size);
+    }
+
+    #[test]
+    fn no_savepoint_commit_skips_allocated_and_freed_tables() {
+        let tmpfile = crate::create_tempfile();
+        let db = Database::builder()
+            .set_page_size(512)
+            .create(tmpfile.path())
+            .unwrap();
+        let table_definition: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(table_definition).unwrap();
+            let value = [0u8; 64];
+            for i in 0..512u64 {
+                table.insert(&i, value.as_slice()).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(table_definition).unwrap();
+            let value = [1u8; 64];
+            for i in 512..1024u64 {
+                table.insert(&i, value.as_slice()).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let system_tree = TableTree::new(
+            db.mem.get_system_root(),
+            PageHint::None,
+            Arc::new(TransactionGuard::fake()),
+            db.mem.clone(),
+        )
+        .unwrap();
+        let is_empty = |definition: Option<InternalTableDefinition>| {
+            definition.is_none_or(|table| table.get_length() == 0)
+        };
+        assert!(is_empty(
+            system_tree
+                .get_table::<TransactionIdWithPagination, PageList>(
+                    DATA_ALLOCATED_TABLE.name(),
+                    TableType::Normal,
+                )
+                .unwrap()
+        ));
+        assert!(is_empty(
+            system_tree
+                .get_table::<TransactionIdWithPagination, PageList>(
+                    DATA_FREED_TABLE.name(),
+                    TableType::Normal,
+                )
+                .unwrap()
+        ));
     }
 
     #[test]
