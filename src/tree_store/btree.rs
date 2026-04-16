@@ -5,7 +5,7 @@ use crate::tree_store::btree_base::{
 };
 use crate::tree_store::btree_iters::BtreeExtractIf;
 use crate::tree_store::btree_mutator::MutateHelper;
-use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory};
+use crate::tree_store::page_store::{FastHashMapU64, Page, PageImpl, PageMut, TransactionalMemory};
 use crate::tree_store::{
     AccessGuardMutInPlace, AllPageNumbersBtreeIter, BtreeRangeIter, PageHint, PageNumber,
     PageTrackerPolicy,
@@ -17,6 +17,7 @@ use log::trace;
 use std::borrow::Borrow;
 use std::cmp::max;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
@@ -799,6 +800,9 @@ pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
     transaction_guard: Arc<TransactionGuard>,
     // Cache of the root page to avoid repeated lookups
     cached_root: Option<PageImpl>,
+    // Read-only transactions repeatedly traverse the same top branch levels.
+    // Cache those pages locally so lookups avoid striped page-cache contention.
+    cached_top_pages: FastHashMapU64<Arc<[u8]>>,
     root: Option<BtreeHeader>,
     hint: PageHint,
     _key_type: PhantomData<K>,
@@ -806,6 +810,9 @@ pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
 }
 
 impl<K: Key, V: Value> Btree<K, V> {
+    const MAX_CACHED_TOP_PAGES: usize = 512;
+    const MAX_CACHED_TOP_PAGE_BYTES: usize = 2 * 1024 * 1024;
+
     pub(crate) fn new(
         root: Option<BtreeHeader>,
         hint: PageHint,
@@ -817,10 +824,16 @@ impl<K: Key, V: Value> Btree<K, V> {
         } else {
             None
         };
+        let cached_top_pages = if let Some(root_page) = cached_root.as_ref() {
+            Self::build_top_page_cache(root_page, &mem, hint)?
+        } else {
+            Default::default()
+        };
         Ok(Self {
             mem,
             transaction_guard: guard,
             cached_root,
+            cached_top_pages,
             root,
             hint,
             _key_type: Default::default(),
@@ -861,9 +874,132 @@ impl<K: Key, V: Value> Btree<K, V> {
 
     pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
         if let Some(ref root_page) = self.cached_root {
-            self.get_helper(root_page.clone(), K::as_bytes(key).as_ref())
+            let query = K::as_bytes(key);
+            if self.cached_top_pages.is_empty() {
+                self.get_helper(root_page.clone(), query.as_ref())
+            } else {
+                self.get_cached_helper(
+                    root_page.get_page_number(),
+                    root_page.memory(),
+                    query.as_ref(),
+                )
+            }
         } else {
             Ok(None)
+        }
+    }
+
+    fn build_top_page_cache(
+        root: &PageImpl,
+        mem: &TransactionalMemory,
+        hint: PageHint,
+    ) -> Result<FastHashMapU64<Arc<[u8]>>> {
+        if !matches!(hint, PageHint::Clean) {
+            return Ok(Default::default());
+        }
+
+        let mut result = FastHashMapU64::default();
+        let mut cached_bytes = root.memory().len();
+        result.insert(page_number_key(root.get_page_number()), root.to_arc());
+
+        let mut current_level = VecDeque::from([root.get_page_number()]);
+        while !current_level.is_empty() {
+            // Cache whole levels so every lookup shares the same cached prefix.
+            let mut next_level = VecDeque::new();
+            let mut fetched_pages = Vec::new();
+            let mut level_bytes = 0usize;
+            let mut level_fits = true;
+
+            while let Some(page_number) = current_level.pop_front() {
+                let child_pages = {
+                    let page_mem = result.get(&page_number_key(page_number)).unwrap();
+                    if page_mem[0] != BRANCH {
+                        continue;
+                    }
+
+                    let page = CachedPage::new(page_number, page_mem);
+                    let accessor = BranchAccessor::new(&page, K::fixed_width());
+                    let mut child_pages = Vec::with_capacity(accessor.count_children());
+                    for i in 0..accessor.count_children() {
+                        child_pages.push(accessor.child_page(i).unwrap());
+                    }
+                    child_pages
+                };
+
+                for child_page in child_pages {
+                    if result.contains_key(&page_number_key(child_page))
+                        || fetched_pages
+                            .iter()
+                            .any(|(page_number, _)| *page_number == child_page)
+                    {
+                        continue;
+                    }
+
+                    let child = mem.get_page_extended(child_page, hint)?;
+                    let child_mem = child.to_arc();
+                    let child_len = child_mem.len();
+                    if result.len() + fetched_pages.len() + 1 > Self::MAX_CACHED_TOP_PAGES
+                        || cached_bytes + level_bytes + child_len > Self::MAX_CACHED_TOP_PAGE_BYTES
+                    {
+                        level_fits = false;
+                        break;
+                    }
+
+                    level_bytes += child_len;
+                    next_level.push_back(child_page);
+                    fetched_pages.push((child_page, child_mem));
+                }
+
+                if !level_fits {
+                    break;
+                }
+            }
+
+            if !level_fits || fetched_pages.is_empty() {
+                break;
+            }
+
+            cached_bytes += level_bytes;
+            for (page_number, page_mem) in fetched_pages {
+                result.insert(page_number_key(page_number), page_mem);
+            }
+            current_level = next_level;
+        }
+
+        Ok(result)
+    }
+
+    fn get_cached_helper(
+        &self,
+        page_number: PageNumber,
+        page_mem: &[u8],
+        query: &[u8],
+    ) -> Result<Option<AccessGuard<'static, V>>> {
+        match page_mem[0] {
+            LEAF => {
+                let accessor = LeafAccessor::new(page_mem, K::fixed_width(), V::fixed_width());
+                if let Some(entry_index) = accessor.find_key::<K>(query) {
+                    let (start, end) = accessor.value_range(entry_index).unwrap();
+                    if let Some(page) = self.cached_top_pages.get(&page_number_key(page_number)) {
+                        Ok(Some(AccessGuard::with_arc_page(page.clone(), start..end)))
+                    } else {
+                        self.get_helper(self.mem.get_page_extended(page_number, self.hint)?, query)
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            BRANCH => {
+                let page = CachedPage::new(page_number, page_mem);
+                let accessor = BranchAccessor::new(&page, K::fixed_width());
+                let (_, child_page) = accessor.child_for_key::<K>(query);
+                if let Some(child_mem) = self.cached_top_pages.get(&page_number_key(child_page)) {
+                    self.get_cached_helper(child_page, child_mem, query)
+                } else {
+                    self.get_helper(self.mem.get_page_extended(child_page, self.hint)?, query)
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -1019,9 +1155,35 @@ impl<K: Key, V: Value> Btree<K, V> {
 
 impl<K: Key, V: Value> Drop for Btree<K, V> {
     fn drop(&mut self) {
-        // Make sure that we clear our reference to the root page, before the transaction guard goes out of scope
+        // Drop our cached page references before the transaction guard goes out of scope.
+        self.cached_top_pages.clear();
         self.cached_root = None;
     }
+}
+
+struct CachedPage<'a> {
+    page_number: PageNumber,
+    mem: &'a [u8],
+}
+
+impl<'a> CachedPage<'a> {
+    fn new(page_number: PageNumber, mem: &'a [u8]) -> Self {
+        Self { page_number, mem }
+    }
+}
+
+impl Page for CachedPage<'_> {
+    fn memory(&self) -> &[u8] {
+        self.mem
+    }
+
+    fn get_page_number(&self) -> PageNumber {
+        self.page_number
+    }
+}
+
+fn page_number_key(page_number: PageNumber) -> u64 {
+    u64::from_le_bytes(page_number.to_le_bytes())
 }
 
 pub(crate) fn btree_stats(
