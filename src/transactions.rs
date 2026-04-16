@@ -6,8 +6,8 @@ use crate::table::ReadOnlyUntypedTable;
 use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
 use crate::tree_store::{
     Btree, BtreeHeader, BtreeMut, InternalTableDefinition, MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page,
-    PageHint, PageListMut, PageNumber, PageTrackerPolicy, SerializedSavepoint, ShrinkPolicy,
-    TableTree, TableTreeMut, TableType, TransactionalMemory,
+    PageHint, PageListMut, PageNumber, PageTrackerPolicy, ReadTransactionPageCache,
+    SerializedSavepoint, ShrinkPolicy, TableTree, TableTreeMut, TableType, TransactionalMemory,
 };
 use crate::types::{Key, Value};
 use crate::{
@@ -2031,6 +2031,7 @@ impl Drop for WriteTransaction {
 /// Read-only transactions may exist concurrently with writes
 pub struct ReadTransaction {
     mem: Arc<TransactionalMemory>,
+    page_cache: Arc<ReadTransactionPageCache>,
     tree: TableTree,
 }
 
@@ -2041,10 +2042,18 @@ impl ReadTransaction {
     ) -> Result<Self, TransactionError> {
         let root_page = mem.get_data_root();
         let guard = Arc::new(guard);
+        let page_cache = Arc::new(ReadTransactionPageCache::new());
         Ok(Self {
             mem: mem.clone(),
-            tree: TableTree::new(root_page, PageHint::Clean, guard, mem)
-                .map_err(TransactionError::Storage)?,
+            page_cache: page_cache.clone(),
+            tree: TableTree::new_with_page_cache(
+                root_page,
+                PageHint::Clean,
+                guard,
+                mem,
+                Some(page_cache),
+            )
+            .map_err(TransactionError::Storage)?,
         })
     }
 
@@ -2065,6 +2074,7 @@ impl ReadTransaction {
                 PageHint::Clean,
                 self.tree.transaction_guard().clone(),
                 self.mem.clone(),
+                Some(self.page_cache.clone()),
             )?),
             InternalTableDefinition::Multimap { .. } => unreachable!(),
         }
@@ -2118,6 +2128,7 @@ impl ReadTransaction {
                 PageHint::Clean,
                 self.tree.transaction_guard().clone(),
                 self.mem.clone(),
+                Some(self.page_cache.clone()),
             )?),
         }
     }

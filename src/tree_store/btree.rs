@@ -64,6 +64,154 @@ impl PagePath {
     }
 }
 
+pub(crate) struct ReadTransactionPageCache {
+    state: Mutex<ReadTransactionPageCacheState>,
+}
+
+struct ReadTransactionPageCacheState {
+    pages: FastHashMapU64<Arc<[u8]>>,
+    cached_bytes: usize,
+}
+
+impl ReadTransactionPageCache {
+    const MAX_CACHED_TOP_PAGES: usize = 512;
+    const MAX_CACHED_TOP_PAGE_BYTES: usize = 2 * 1024 * 1024;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(ReadTransactionPageCacheState {
+                pages: Default::default(),
+                cached_bytes: 0,
+            }),
+        }
+    }
+
+    pub(crate) fn page_cache_for_btree<K: Key>(
+        &self,
+        root: &PageImpl,
+        mem: &TransactionalMemory,
+        hint: PageHint,
+    ) -> Result<FastHashMapU64<Arc<[u8]>>> {
+        if !matches!(hint, PageHint::Clean) {
+            return Ok(Default::default());
+        }
+
+        let mut state = self.state.lock().unwrap();
+        let mut result = FastHashMapU64::default();
+        if !Self::insert_page(
+            &mut state,
+            &mut result,
+            root.get_page_number(),
+            root.to_arc(),
+        ) {
+            return Ok(Default::default());
+        }
+
+        let mut current_level = VecDeque::from([root.get_page_number()]);
+        while !current_level.is_empty() {
+            // Cache whole levels so every lookup shares the same cached prefix.
+            let mut next_level = VecDeque::new();
+            let mut fetched_pages = Vec::new();
+            let mut level_bytes = 0usize;
+            let mut level_new_pages = 0usize;
+            let mut level_fits = true;
+
+            while let Some(page_number) = current_level.pop_front() {
+                let child_pages = {
+                    let page_mem = result.get(&page_number_key(page_number)).unwrap();
+                    if page_mem[0] != BRANCH {
+                        continue;
+                    }
+
+                    let page = CachedPage::new(page_number, page_mem);
+                    let accessor = BranchAccessor::new(&page, K::fixed_width());
+                    let mut child_pages = Vec::with_capacity(accessor.count_children());
+                    for i in 0..accessor.count_children() {
+                        child_pages.push(accessor.child_page(i).unwrap());
+                    }
+                    child_pages
+                };
+
+                for child_page in child_pages {
+                    let child_key = page_number_key(child_page);
+                    if result.contains_key(&child_key)
+                        || fetched_pages
+                            .iter()
+                            .any(|(page_number, _, _)| *page_number == child_page)
+                    {
+                        continue;
+                    }
+
+                    if let Some(existing) = state.pages.get(&child_key) {
+                        next_level.push_back(child_page);
+                        fetched_pages.push((child_page, existing.clone(), false));
+                        continue;
+                    }
+
+                    let child = mem.get_page_extended(child_page, hint)?;
+                    let child_mem = child.to_arc();
+                    let child_len = child_mem.len();
+                    if state.pages.len() + level_new_pages + 1 > Self::MAX_CACHED_TOP_PAGES
+                        || state.cached_bytes + level_bytes + child_len
+                            > Self::MAX_CACHED_TOP_PAGE_BYTES
+                    {
+                        level_fits = false;
+                        break;
+                    }
+
+                    level_new_pages += 1;
+                    level_bytes += child_len;
+                    next_level.push_back(child_page);
+                    fetched_pages.push((child_page, child_mem, true));
+                }
+
+                if !level_fits {
+                    break;
+                }
+            }
+
+            if !level_fits || fetched_pages.is_empty() {
+                break;
+            }
+
+            for (page_number, page_mem, is_new) in fetched_pages {
+                if is_new {
+                    state.cached_bytes += page_mem.len();
+                    state
+                        .pages
+                        .insert(page_number_key(page_number), page_mem.clone());
+                }
+                result.insert(page_number_key(page_number), page_mem);
+            }
+            current_level = next_level;
+        }
+
+        Ok(result)
+    }
+
+    fn insert_page(
+        state: &mut ReadTransactionPageCacheState,
+        result: &mut FastHashMapU64<Arc<[u8]>>,
+        page_number: PageNumber,
+        page_mem: Arc<[u8]>,
+    ) -> bool {
+        let key = page_number_key(page_number);
+        if let Some(existing) = state.pages.get(&key) {
+            result.insert(key, existing.clone());
+            true
+        } else if state.pages.len() + 1 > Self::MAX_CACHED_TOP_PAGES
+            || state.cached_bytes + page_mem.len() > Self::MAX_CACHED_TOP_PAGE_BYTES
+        {
+            false
+        } else {
+            state.cached_bytes += page_mem.len();
+            state.pages.insert(key, page_mem.clone());
+            result.insert(key, page_mem);
+            true
+        }
+    }
+}
+
 pub(crate) struct UntypedBtree {
     mem: Arc<TransactionalMemory>,
     root: Option<BtreeHeader>,
@@ -800,8 +948,7 @@ pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
     transaction_guard: Arc<TransactionGuard>,
     // Cache of the root page to avoid repeated lookups
     cached_root: Option<PageImpl>,
-    // Read-only transactions repeatedly traverse the same top branch levels.
-    // Cache those pages locally so lookups avoid striped page-cache contention.
+    // Local view of the read transaction's shared top-page cache.
     cached_top_pages: FastHashMapU64<Arc<[u8]>>,
     root: Option<BtreeHeader>,
     hint: PageHint,
@@ -810,22 +957,31 @@ pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
 }
 
 impl<K: Key, V: Value> Btree<K, V> {
-    const MAX_CACHED_TOP_PAGES: usize = 512;
-    const MAX_CACHED_TOP_PAGE_BYTES: usize = 2 * 1024 * 1024;
-
     pub(crate) fn new(
         root: Option<BtreeHeader>,
         hint: PageHint,
         guard: Arc<TransactionGuard>,
         mem: Arc<TransactionalMemory>,
     ) -> Result<Self> {
+        Self::new_with_page_cache(root, hint, guard, mem, None)
+    }
+
+    pub(crate) fn new_with_page_cache(
+        root: Option<BtreeHeader>,
+        hint: PageHint,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+        page_cache: Option<Arc<ReadTransactionPageCache>>,
+    ) -> Result<Self> {
         let cached_root = if let Some(header) = root {
             Some(mem.get_page_extended(header.root, hint)?)
         } else {
             None
         };
-        let cached_top_pages = if let Some(root_page) = cached_root.as_ref() {
-            Self::build_top_page_cache(root_page, &mem, hint)?
+        let cached_top_pages = if let (Some(root_page), Some(page_cache)) =
+            (cached_root.as_ref(), page_cache.as_ref())
+        {
+            page_cache.page_cache_for_btree::<K>(root_page, &mem, hint)?
         } else {
             Default::default()
         };
@@ -887,86 +1043,6 @@ impl<K: Key, V: Value> Btree<K, V> {
         } else {
             Ok(None)
         }
-    }
-
-    fn build_top_page_cache(
-        root: &PageImpl,
-        mem: &TransactionalMemory,
-        hint: PageHint,
-    ) -> Result<FastHashMapU64<Arc<[u8]>>> {
-        if !matches!(hint, PageHint::Clean) {
-            return Ok(Default::default());
-        }
-
-        let mut result = FastHashMapU64::default();
-        let mut cached_bytes = root.memory().len();
-        result.insert(page_number_key(root.get_page_number()), root.to_arc());
-
-        let mut current_level = VecDeque::from([root.get_page_number()]);
-        while !current_level.is_empty() {
-            // Cache whole levels so every lookup shares the same cached prefix.
-            let mut next_level = VecDeque::new();
-            let mut fetched_pages = Vec::new();
-            let mut level_bytes = 0usize;
-            let mut level_fits = true;
-
-            while let Some(page_number) = current_level.pop_front() {
-                let child_pages = {
-                    let page_mem = result.get(&page_number_key(page_number)).unwrap();
-                    if page_mem[0] != BRANCH {
-                        continue;
-                    }
-
-                    let page = CachedPage::new(page_number, page_mem);
-                    let accessor = BranchAccessor::new(&page, K::fixed_width());
-                    let mut child_pages = Vec::with_capacity(accessor.count_children());
-                    for i in 0..accessor.count_children() {
-                        child_pages.push(accessor.child_page(i).unwrap());
-                    }
-                    child_pages
-                };
-
-                for child_page in child_pages {
-                    if result.contains_key(&page_number_key(child_page))
-                        || fetched_pages
-                            .iter()
-                            .any(|(page_number, _)| *page_number == child_page)
-                    {
-                        continue;
-                    }
-
-                    let child = mem.get_page_extended(child_page, hint)?;
-                    let child_mem = child.to_arc();
-                    let child_len = child_mem.len();
-                    if result.len() + fetched_pages.len() + 1 > Self::MAX_CACHED_TOP_PAGES
-                        || cached_bytes + level_bytes + child_len > Self::MAX_CACHED_TOP_PAGE_BYTES
-                    {
-                        level_fits = false;
-                        break;
-                    }
-
-                    level_bytes += child_len;
-                    next_level.push_back(child_page);
-                    fetched_pages.push((child_page, child_mem));
-                }
-
-                if !level_fits {
-                    break;
-                }
-            }
-
-            if !level_fits || fetched_pages.is_empty() {
-                break;
-            }
-
-            cached_bytes += level_bytes;
-            for (page_number, page_mem) in fetched_pages {
-                result.insert(page_number_key(page_number), page_mem);
-            }
-            current_level = next_level;
-        }
-
-        Ok(result)
     }
 
     fn get_cached_helper(

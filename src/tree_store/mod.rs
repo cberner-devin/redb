@@ -7,7 +7,8 @@ mod table_tree;
 mod table_tree_base;
 
 pub(crate) use btree::{
-    Btree, BtreeMut, BtreeStats, PagePath, RawBtree, UntypedBtree, UntypedBtreeMut, btree_stats,
+    Btree, BtreeMut, BtreeStats, PagePath, RawBtree, ReadTransactionPageCache, UntypedBtree,
+    UntypedBtreeMut, btree_stats,
 };
 pub use btree_base::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace};
 pub(crate) use btree_base::{

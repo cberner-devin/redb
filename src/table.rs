@@ -3,7 +3,7 @@ use crate::sealed::Sealed;
 use crate::tree_store::{
     AccessGuardMutInPlace, Btree, BtreeExtractIf, BtreeHeader, BtreeMut, BtreeRangeIter,
     MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, PageHint, PageNumber, PageTrackerPolicy, RawBtree,
-    TransactionalMemory,
+    ReadTransactionPageCache, TransactionalMemory,
 };
 use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{AccessGuard, AccessGuardMut, StorageError, WriteTransaction};
@@ -485,10 +485,11 @@ impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
         hint: PageHint,
         guard: Arc<TransactionGuard>,
         mem: Arc<TransactionalMemory>,
+        page_cache: Option<Arc<ReadTransactionPageCache>>,
     ) -> Result<ReadOnlyTable<K, V>> {
         Ok(ReadOnlyTable {
             name,
-            tree: Btree::new(root_page, hint, guard.clone(), mem)?,
+            tree: Btree::new_with_page_cache(root_page, hint, guard.clone(), mem, page_cache)?,
             transaction_guard: guard,
         })
     }

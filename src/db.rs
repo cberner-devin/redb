@@ -694,6 +694,7 @@ impl Database {
                 PageHint::None,
                 Arc::new(TransactionGuard::fake()),
                 mem.clone(),
+                None,
             )?;
             for result in table.range::<TransactionIdWithPagination>(..)? {
                 let (_, pages) = result?;
@@ -745,6 +746,7 @@ impl Database {
                     PageHint::None,
                     Arc::new(TransactionGuard::fake()),
                     mem.clone(),
+                    None,
                 )?;
             for result in table.range::<TransactionIdWithPagination>(..)? {
                 let (_, page_list) = result?;

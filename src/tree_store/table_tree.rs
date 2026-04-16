@@ -7,7 +7,7 @@ use crate::tree_store::btree::{UntypedBtreeMut, btree_stats};
 use crate::tree_store::btree_base::BtreeHeader;
 use crate::tree_store::{
     Btree, BtreeMut, BtreeRangeIter, InternalTableDefinition, PageHint, PageNumber, PagePath,
-    PageTrackerPolicy, RawBtree, TableType, TransactionalMemory,
+    PageTrackerPolicy, RawBtree, ReadTransactionPageCache, TableType, TransactionalMemory,
 };
 use crate::types::{Key, Value};
 use crate::{DatabaseStats, Result};
@@ -76,8 +76,24 @@ impl TableTree {
         guard: Arc<TransactionGuard>,
         mem: Arc<TransactionalMemory>,
     ) -> Result<Self> {
+        Self::new_with_page_cache(master_root, page_hint, guard, mem, None)
+    }
+
+    pub(crate) fn new_with_page_cache(
+        master_root: Option<BtreeHeader>,
+        page_hint: PageHint,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+        page_cache: Option<Arc<ReadTransactionPageCache>>,
+    ) -> Result<Self> {
         Ok(Self {
-            tree: Btree::new(master_root, page_hint, guard, mem.clone())?,
+            tree: Btree::new_with_page_cache(
+                master_root,
+                page_hint,
+                guard,
+                mem.clone(),
+                page_cache,
+            )?,
             mem,
         })
     }

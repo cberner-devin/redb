@@ -6,7 +6,8 @@ use crate::tree_store::{
     AllPageNumbersBtreeIter, BRANCH, BranchAccessor, BranchMutator, Btree, BtreeHeader, BtreeMut,
     BtreeRangeIter, BtreeStats, Checksum, DEFERRED, LEAF, LeafAccessor, LeafMutator,
     MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page, PageHint, PageNumber, PagePath, PageTrackerPolicy,
-    RawBtree, RawLeafBuilder, TransactionalMemory, UntypedBtree, UntypedBtreeMut, btree_stats,
+    RawBtree, RawLeafBuilder, ReadTransactionPageCache, TransactionalMemory, UntypedBtree,
+    UntypedBtreeMut, btree_stats,
 };
 use crate::types::{Key, TypeName, Value};
 use crate::{AccessGuard, MultimapTableHandle, Result, StorageError, WriteTransaction};
@@ -1518,9 +1519,10 @@ impl<K: Key + 'static, V: Key + 'static> ReadOnlyMultimapTable<K, V> {
         hint: PageHint,
         guard: Arc<TransactionGuard>,
         mem: Arc<TransactionalMemory>,
+        page_cache: Option<Arc<ReadTransactionPageCache>>,
     ) -> Result<ReadOnlyMultimapTable<K, V>> {
         Ok(ReadOnlyMultimapTable {
-            tree: Btree::new(root, hint, guard.clone(), mem.clone())?,
+            tree: Btree::new_with_page_cache(root, hint, guard.clone(), mem.clone(), page_cache)?,
             num_values,
             mem,
             transaction_guard: guard,
