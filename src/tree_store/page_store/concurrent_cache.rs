@@ -2,6 +2,28 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+/// A borrowed reference to a cached page.  Holds the cache slot's
+/// read-lock, preventing eviction while alive.  No `Arc` refcount
+/// operations are performed.
+pub(crate) struct CacheGuard<'a> {
+    rwlock: &'a RwSpinLock,
+    data: &'a [u8],
+}
+
+impl<'a> CacheGuard<'a> {
+    #[inline(always)]
+    pub(crate) fn data(&self) -> &[u8] {
+        self.data
+    }
+}
+
+impl Drop for CacheGuard<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.rwlock.read_unlock();
+    }
+}
+
 /// Sentinel: slot is unoccupied and terminates probe chains.
 const EMPTY: u64 = u64::MAX;
 /// Sentinel: slot was deleted; probing continues past it.
@@ -167,10 +189,7 @@ impl ConcurrentPageCache {
 
     // ── read path (hot) ──────────────────────────────────────────────────
 
-    /// Look up a cached page.  The probe loop is lock-free; a per-slot
-    /// *shared* (reader) lock is acquired on the matching entry for the
-    /// `Arc::clone`, so many threads can read the same hot page (e.g. the
-    /// B-tree root) simultaneously.
+    /// Look up a cached page and clone the `Arc`.
     #[inline]
     pub(super) fn get(&self, key: u64) -> Option<Arc<[u8]>> {
         debug_assert!(key != EMPTY && key != TOMBSTONE);
@@ -182,10 +201,9 @@ impl ConcurrentPageCache {
             let k = slot.key.load(Ordering::Acquire);
 
             if k == EMPTY {
-                return None; // end of probe chain
+                return None;
             }
             if k == key {
-                // Candidate hit – shared lock, re-validate, clone.
                 slot.rwlock.read_lock();
                 if slot.key.load(Ordering::Relaxed) == key {
                     slot.recently_used.store(1, Ordering::Relaxed);
@@ -195,10 +213,53 @@ impl ConcurrentPageCache {
                     return result;
                 }
                 slot.rwlock.read_unlock();
-                // Key was changed (evicted) between the optimistic load and
-                // the lock.  Keep probing in case it moved further down.
             }
-            // TOMBSTONE or different key → continue probing
+        }
+        None
+    }
+
+    /// Look up a cached page and return a borrowed guard instead of cloning
+    /// the `Arc`.  The guard holds the slot's read-lock, so the data cannot
+    /// be evicted while the guard is alive.  Multiple guards on the same
+    /// slot can coexist (shared read-lock).
+    ///
+    /// This is faster than `get()` because it avoids the `Arc::clone` +
+    /// `Arc::drop` pair (2 atomic RMW operations on a potentially contended
+    /// refcount cache line).
+    #[inline]
+    pub(super) fn get_borrowed(&self, key: u64) -> Option<CacheGuard<'_>> {
+        debug_assert!(key != EMPTY && key != TOMBSTONE);
+        let start = self.slot_index(key);
+
+        for i in 0..MAX_PROBE {
+            let idx = (start + i) & self.mask;
+            let slot = &self.slots[idx];
+            let k = slot.key.load(Ordering::Acquire);
+
+            if k == EMPTY {
+                return None;
+            }
+            if k == key {
+                slot.rwlock.read_lock();
+                if slot.key.load(Ordering::Relaxed) == key {
+                    slot.recently_used.store(1, Ordering::Relaxed);
+                    // SAFETY: read lock is held; no concurrent mutation.
+                    let data = unsafe {
+                        match &*slot.value.get() {
+                            Some(arc) => arc.as_ref() as *const [u8],
+                            None => {
+                                slot.rwlock.read_unlock();
+                                return None;
+                            }
+                        }
+                    };
+                    return Some(CacheGuard {
+                        rwlock: &slot.rwlock,
+                        data: unsafe { &*data },
+                    });
+                }
+                slot.rwlock.read_unlock();
+            }
         }
         None
     }
