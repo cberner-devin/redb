@@ -1,5 +1,5 @@
 use crate::tree_store::page_store::base::PageHint;
-use crate::tree_store::page_store::concurrent_cache::ConcurrentPageCache;
+use crate::tree_store::page_store::concurrent_cache::{CacheGuard, ConcurrentPageCache};
 use crate::tree_store::page_store::lru_cache::LRUCache;
 use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
 use std::ops::{Index, IndexMut};
@@ -14,6 +14,23 @@ use std::sync::{Arc, Mutex, MutexGuard};
 fn zero_filled_arc(len: usize) -> Arc<[u8]> {
     // This is documented to do a single allocation: https://doc.rust-lang.org/std/sync/struct.Arc.html#iterators-of-known-length
     std::iter::repeat_n(0u8, len).collect()
+}
+
+/// A page that is either borrowed from the cache (zero-copy, no Arc
+/// refcount) or owned as a fallback.
+pub(crate) enum BorrowedPage<'a> {
+    Guard(CacheGuard<'a>),
+    Owned(Arc<[u8]>),
+}
+
+impl BorrowedPage<'_> {
+    #[inline]
+    pub(crate) fn data(&self) -> &[u8] {
+        match self {
+            BorrowedPage::Guard(g) => g.data(),
+            BorrowedPage::Owned(a) => a.as_ref(),
+        }
+    }
 }
 
 pub(super) struct WritablePage {
@@ -461,6 +478,41 @@ impl PagedCachedFile {
         }
 
         Ok(buffer)
+    }
+
+    /// Borrow a cached page without cloning the `Arc`.  Returns a guard that
+    /// holds the cache slot's read-lock.  Falls back to `read()` (which
+    /// clones) on cache miss or when the page might be in the write buffer.
+    ///
+    /// Only useful for short-lived borrows (e.g. reading a B-tree branch
+    /// node to find a child pointer).
+    #[inline]
+    pub(super) fn read_borrowed(
+        &self,
+        offset: u64,
+        len: usize,
+        hint: PageHint,
+    ) -> Result<BorrowedPage<'_>> {
+        debug_assert_eq!(0, offset % self.page_size);
+
+        // If the page might be in the write buffer, fall back to the
+        // owning path – the write buffer stores data behind a Mutex and
+        // we cannot borrow out of it.
+        if !matches!(hint, PageHint::Clean) {
+            let lock = self.write_buffer.lock().unwrap();
+            if let Some(cached) = lock.get(offset) {
+                debug_assert_eq!(cached.len(), len);
+                return Ok(BorrowedPage::Owned(cached.clone()));
+            }
+        }
+
+        if let Some(guard) = self.read_cache.get_borrowed(offset) {
+            debug_assert_eq!(guard.data().len(), len);
+            return Ok(BorrowedPage::Guard(guard));
+        }
+
+        // Cache miss – do a full read (inserts into cache and returns Arc).
+        Ok(BorrowedPage::Owned(self.read(offset, len, hint)?))
     }
 
     // Discard pending writes to the given range
