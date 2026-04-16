@@ -1,5 +1,5 @@
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Sentinel: slot is unoccupied and terminates probe chains.
@@ -9,13 +9,97 @@ const TOMBSTONE: u64 = u64::MAX - 1;
 /// Maximum linear-probe distance before giving up or force-evicting.
 const MAX_PROBE: usize = 16;
 
+/// Bit flag in `RwSpinLock::state` indicating a writer is active or waiting.
+const WRITE_BIT: u32 = 1 << 31;
+
+/// A tiny reader-writer spin-lock.
+///
+/// State encoding (AtomicU32):
+///   - bits 0..30 : active reader count (up to ~2 billion)
+///   - bit  31    : WRITE_BIT – set when a writer holds or is acquiring the lock
+///
+/// Multiple readers can hold the lock simultaneously.  A writer sets
+/// WRITE_BIT, which prevents new readers from entering, then spins until
+/// existing readers drain.
+struct RwSpinLock {
+    state: AtomicU32,
+}
+
+impl RwSpinLock {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(0),
+        }
+    }
+
+    /// Acquire a shared (reader) lock.
+    #[inline(always)]
+    fn read_lock(&self) {
+        loop {
+            let s = self.state.load(Ordering::Relaxed);
+            if s & WRITE_BIT == 0 {
+                // No writer – try to increment reader count.
+                if self
+                    .state
+                    .compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Release a shared (reader) lock.
+    #[inline(always)]
+    fn read_unlock(&self) {
+        self.state.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Acquire an exclusive (writer) lock.
+    #[inline(always)]
+    fn write_lock(&self) {
+        // Phase 1: set the WRITE_BIT to block new readers.
+        loop {
+            let s = self.state.load(Ordering::Relaxed);
+            if s & WRITE_BIT == 0 {
+                if self
+                    .state
+                    .compare_exchange_weak(
+                        s,
+                        s | WRITE_BIT,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            std::hint::spin_loop();
+        }
+        // Phase 2: wait for existing readers to drain.
+        while self.state.load(Ordering::Acquire) != WRITE_BIT {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Release an exclusive (writer) lock.
+    #[inline(always)]
+    fn write_unlock(&self) {
+        self.state.store(0, Ordering::Release);
+    }
+}
+
 /// A concurrent hash table optimised for the read-cache workload:
 ///
 /// * **Reads are nearly lock-free**: the probe loop loads only atomic keys;
-///   a tiny per-slot spin-lock is acquired *only* on the matching slot for
-///   the duration of a single `Arc::clone`.
-/// * **Writes (insert / remove / evict)** lock individual slots, so they
-///   never block readers on unrelated pages.
+///   a shared (reader) spin-lock is acquired on the matching slot for the
+///   duration of a single `Arc::clone`, allowing many threads to read the
+///   same hot page simultaneously.
+/// * **Writes (insert / remove / evict)** take an exclusive lock on individual
+///   slots, so they never block readers on unrelated pages.
 /// * Open-addressing with linear probing, power-of-2 table size.
 /// * Clock (second-chance) eviction via a per-slot `recently_used` bit.
 pub(super) struct ConcurrentPageCache {
@@ -27,19 +111,20 @@ pub(super) struct ConcurrentPageCache {
 }
 
 // SAFETY: All mutable access to `CacheSlot::value` (an `UnsafeCell`) is
-// serialised by the per-slot spin-lock.  Concurrent readers acquire the
-// same lock before cloning the `Arc`, so no data race is possible.
+// serialised by the per-slot write lock.  Concurrent readers acquire a
+// shared read lock before cloning the `Arc`, so no data race is possible.
 unsafe impl Sync for ConcurrentPageCache {}
 unsafe impl Send for ConcurrentPageCache {}
 
 struct CacheSlot {
     /// The page's file offset, or `EMPTY` / `TOMBSTONE`.
     key: AtomicU64,
-    /// Per-slot exclusive spin-lock (test-and-test-and-set).
-    lock: AtomicBool,
-    /// Second-chance bit for clock eviction.
-    recently_used: AtomicBool,
-    /// The cached page data.  Access is protected by `lock`.
+    /// Per-slot reader-writer spin-lock.
+    rwlock: RwSpinLock,
+    /// Second-chance bit for clock eviction.  Accessed with `Relaxed`
+    /// ordering; it is only a heuristic for eviction priority.
+    recently_used: AtomicU32,
+    /// The cached page data.  Protected by `rwlock`.
     value: UnsafeCell<Option<Arc<[u8]>>>,
 }
 
@@ -47,46 +132,10 @@ impl CacheSlot {
     fn new() -> Self {
         Self {
             key: AtomicU64::new(EMPTY),
-            lock: AtomicBool::new(false),
-            recently_used: AtomicBool::new(false),
+            rwlock: RwSpinLock::new(),
+            recently_used: AtomicU32::new(0),
             value: UnsafeCell::new(None),
         }
-    }
-
-    #[inline(always)]
-    fn lock(&self) {
-        // Fast path: uncontended CAS.
-        if self
-            .lock
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
-        // Slow path: spin with back-off.
-        self.lock_slow();
-    }
-
-    #[cold]
-    fn lock_slow(&self) {
-        loop {
-            // Wait until the lock *looks* free (no cache-line bouncing).
-            while self.lock.load(Ordering::Relaxed) {
-                std::hint::spin_loop();
-            }
-            if self
-                .lock
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return;
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn unlock(&self) {
-        self.lock.store(false, Ordering::Release);
     }
 }
 
@@ -124,7 +173,9 @@ impl ConcurrentPageCache {
     // ── read path (hot) ──────────────────────────────────────────────────
 
     /// Look up a cached page.  The probe loop is lock-free; a per-slot
-    /// spin-lock is acquired only on the matching entry for the `Arc::clone`.
+    /// *shared* (reader) lock is acquired on the matching entry for the
+    /// `Arc::clone`, so many threads can read the same hot page (e.g. the
+    /// B-tree root) simultaneously.
     #[inline]
     pub(super) fn get(&self, key: u64) -> Option<Arc<[u8]>> {
         debug_assert!(key != EMPTY && key != TOMBSTONE);
@@ -139,19 +190,18 @@ impl ConcurrentPageCache {
                 return None; // end of probe chain
             }
             if k == key {
-                // Candidate hit – lock, re-validate, clone.
-                slot.lock();
+                // Candidate hit – shared lock, re-validate, clone.
+                slot.rwlock.read_lock();
                 if slot.key.load(Ordering::Relaxed) == key {
-                    slot.recently_used.store(true, Ordering::Relaxed);
-                    // SAFETY: lock is held, so no concurrent mutation.
+                    slot.recently_used.store(1, Ordering::Relaxed);
+                    // SAFETY: read lock is held; no concurrent mutation.
                     let result = unsafe { (*slot.value.get()).clone() };
-                    slot.unlock();
+                    slot.rwlock.read_unlock();
                     return result;
                 }
-                slot.unlock();
-                // Key was changed (evicted) between the optimistic load and the
-                // lock.  The entry may have moved further down the chain, so
-                // keep probing.
+                slot.rwlock.read_unlock();
+                // Key was changed (evicted) between the optimistic load and
+                // the lock.  Keep probing in case it moved further down.
             }
             // TOMBSTONE or different key → continue probing
         }
@@ -173,34 +223,34 @@ impl ConcurrentPageCache {
             let idx = (start + i) & self.mask;
             let slot = &self.slots[idx];
 
-            slot.lock();
+            slot.rwlock.write_lock();
             let k = slot.key.load(Ordering::Relaxed);
 
             if k == key || k == EMPTY || k == TOMBSTONE {
                 // Usable slot: replace / fresh insert.
-                // SAFETY: lock is held.
+                // SAFETY: write lock is held.
                 let old = unsafe { (*slot.value.get()).replace(value) };
                 if k != key {
                     self.len.fetch_add(1, Ordering::Relaxed);
                 }
                 slot.key.store(key, Ordering::Release);
-                slot.recently_used.store(true, Ordering::Relaxed);
-                slot.unlock();
+                slot.recently_used.store(1, Ordering::Relaxed);
+                slot.rwlock.write_unlock();
                 return old;
             }
 
-            slot.unlock();
+            slot.rwlock.write_unlock();
         }
 
         // Probe chain exhausted – force-evict the home slot.
         let slot = &self.slots[start & self.mask];
-        slot.lock();
+        slot.rwlock.write_lock();
         let old_key = slot.key.load(Ordering::Relaxed);
-        // SAFETY: lock is held.
+        // SAFETY: write lock is held.
         let old = unsafe { (*slot.value.get()).replace(value) };
         slot.key.store(key, Ordering::Release);
-        slot.recently_used.store(true, Ordering::Relaxed);
-        slot.unlock();
+        slot.recently_used.store(1, Ordering::Relaxed);
+        slot.rwlock.write_unlock();
 
         if old_key == EMPTY || old_key == TOMBSTONE {
             self.len.fetch_add(1, Ordering::Relaxed);
@@ -222,18 +272,18 @@ impl ConcurrentPageCache {
                 return None;
             }
             if k == key {
-                slot.lock();
+                slot.rwlock.write_lock();
                 if slot.key.load(Ordering::Relaxed) == key {
                     slot.key.store(TOMBSTONE, Ordering::Release);
-                    // SAFETY: lock is held.
+                    // SAFETY: write lock is held.
                     let old = unsafe { (*slot.value.get()).take() };
-                    slot.unlock();
+                    slot.rwlock.write_unlock();
                     if old.is_some() {
                         self.len.fetch_sub(1, Ordering::Relaxed);
                     }
                     return old;
                 }
-                slot.unlock();
+                slot.rwlock.write_unlock();
             }
         }
         None
@@ -254,24 +304,24 @@ impl ConcurrentPageCache {
                 continue;
             }
 
-            slot.lock();
+            slot.rwlock.write_lock();
             let k = slot.key.load(Ordering::Relaxed);
             if k == EMPTY || k == TOMBSTONE {
-                slot.unlock();
+                slot.rwlock.write_unlock();
                 continue;
             }
 
             // Second-chance: skip if recently used, but clear the bit.
-            if slot.recently_used.load(Ordering::Relaxed) {
-                slot.recently_used.store(false, Ordering::Relaxed);
-                slot.unlock();
+            if slot.recently_used.load(Ordering::Relaxed) != 0 {
+                slot.recently_used.store(0, Ordering::Relaxed);
+                slot.rwlock.write_unlock();
                 continue;
             }
 
             slot.key.store(TOMBSTONE, Ordering::Release);
-            // SAFETY: lock is held.
+            // SAFETY: write lock is held.
             let value = unsafe { (*slot.value.get()).take() };
-            slot.unlock();
+            slot.rwlock.write_unlock();
 
             if let Some(v) = value {
                 self.len.fetch_sub(1, Ordering::Relaxed);
@@ -284,14 +334,14 @@ impl ConcurrentPageCache {
     /// Drop every entry and reset the table.
     pub(super) fn clear(&self) {
         for slot in self.slots.iter() {
-            slot.lock();
+            slot.rwlock.write_lock();
             slot.key.store(EMPTY, Ordering::Relaxed);
-            // SAFETY: lock is held.
+            // SAFETY: write lock is held.
             unsafe {
                 *slot.value.get() = None;
             }
-            slot.recently_used.store(false, Ordering::Relaxed);
-            slot.unlock();
+            slot.recently_used.store(0, Ordering::Relaxed);
+            slot.rwlock.write_unlock();
         }
         self.len.store(0, Ordering::Relaxed);
     }
@@ -338,9 +388,7 @@ mod tests {
         let cache = ConcurrentPageCache::new(4096 * 4, 4096);
         let n = cache.slots.len();
 
-        // Insert pages that all hash to the same home slot
-        // We can't easily control the hash, so insert many pages and verify
-        // they're all retrievable.
+        // Insert many pages and verify they're all retrievable.
         for i in 0..(n / 2) {
             let offset = (i as u64) * 4096;
             let data: Arc<[u8]> = vec![i as u8; 4096].into();
@@ -403,7 +451,7 @@ mod tests {
             cache.insert(offset, data);
         }
 
-        // Read from 8 threads
+        // Read from 8 threads concurrently
         let mut handles = vec![];
         for _ in 0..8 {
             let c = cache.clone();
@@ -415,6 +463,29 @@ mod tests {
                             assert_eq!(v[0], i);
                         }
                     }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_reads_same_key() {
+        // Specifically test that many threads can read the same hot key
+        // simultaneously without degradation (the root-page scenario).
+        let cache = Arc::new(ConcurrentPageCache::new(4096 * 16, 4096));
+        let data: Arc<[u8]> = vec![99u8; 4096].into();
+        cache.insert(0, data);
+
+        let mut handles = vec![];
+        for _ in 0..16 {
+            let c = cache.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100_000 {
+                    let got = c.get(0).unwrap();
+                    assert_eq!(got[0], 99);
                 }
             }));
         }
