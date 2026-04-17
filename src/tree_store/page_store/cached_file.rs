@@ -56,7 +56,7 @@ struct LRUWriteCache {
 impl LRUWriteCache {
     fn new() -> Self {
         Self {
-            cache: Default::default(),
+            cache: LRUCache::new(),
         }
     }
 
