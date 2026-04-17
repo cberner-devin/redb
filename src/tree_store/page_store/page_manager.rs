@@ -763,7 +763,6 @@ impl TransactionalMemory {
         );
         let len: usize = (range.end - range.start).try_into().unwrap();
         let mem = self.storage.read(range.start, len, hint)?;
-
         // We must not retrieve an immutable reference to a page which already has a mutable ref to it
         #[cfg(debug_assertions)]
         {

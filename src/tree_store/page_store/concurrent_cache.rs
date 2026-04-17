@@ -121,7 +121,6 @@ pub(super) struct ConcurrentPageCache {
     slots: Box<[CacheSlot]>,
     mask: usize,
     page_shift: u32,
-    len: AtomicUsize,
     eviction_clock: AtomicUsize,
 }
 
@@ -171,7 +170,6 @@ impl ConcurrentPageCache {
             slots: slots.into_boxed_slice(),
             mask: num_slots - 1,
             page_shift: page_size.trailing_zeros(),
-            len: AtomicUsize::new(0),
             eviction_clock: AtomicUsize::new(0),
         }
     }
@@ -272,45 +270,102 @@ impl ConcurrentPageCache {
     pub(super) fn insert(&self, key: u64, value: Arc<[u8]>) -> Option<Arc<[u8]>> {
         debug_assert!(key != EMPTY && key != TOMBSTONE);
         let start = self.slot_index(key);
+        loop {
+            let mut first_tombstone = None;
 
-        // Probe for the key, or the first usable (empty/tombstone) slot.
-        for i in 0..MAX_PROBE {
-            let idx = (start + i) & self.mask;
-            let slot = &self.slots[idx];
+            // Probe for an existing key, remembering the first tombstone so
+            // that we can reuse it if the search reaches an empty slot.
+            for i in 0..MAX_PROBE {
+                let idx = (start + i) & self.mask;
+                let slot = &self.slots[idx];
+                let k = slot.key.load(Ordering::Acquire);
 
-            slot.rwlock.write_lock();
-            let k = slot.key.load(Ordering::Relaxed);
-
-            if k == key || k == EMPTY || k == TOMBSTONE {
-                // Usable slot: replace / fresh insert.
-                // SAFETY: write lock is held.
-                let old = unsafe { (*slot.value.get()).replace(value) };
-                if k != key {
-                    self.len.fetch_add(1, Ordering::Relaxed);
+                if k == key {
+                    slot.rwlock.write_lock();
+                    if slot.key.load(Ordering::Relaxed) == key {
+                        // SAFETY: write lock is held.
+                        let old = unsafe { (*slot.value.get()).replace(value) };
+                        slot.recently_used.store(1, Ordering::Relaxed);
+                        slot.rwlock.write_unlock();
+                        return old;
+                    }
+                    slot.rwlock.write_unlock();
+                    continue;
                 }
-                slot.key.store(key, Ordering::Release);
-                slot.recently_used.store(1, Ordering::Relaxed);
-                slot.rwlock.write_unlock();
-                return old;
+
+                if k == TOMBSTONE {
+                    first_tombstone.get_or_insert(idx);
+                    continue;
+                }
+
+                if k == EMPTY {
+                    let target_idx = first_tombstone.unwrap_or(idx);
+                    let target = &self.slots[target_idx];
+                    target.rwlock.write_lock();
+                    match target.key.load(Ordering::Relaxed) {
+                        EMPTY | TOMBSTONE => {
+                            // SAFETY: write lock is held.
+                            let old = unsafe { (*target.value.get()).replace(value) };
+                            debug_assert!(old.is_none());
+                            target.key.store(key, Ordering::Release);
+                            target.recently_used.store(1, Ordering::Relaxed);
+                            target.rwlock.write_unlock();
+                            return old;
+                        }
+                        current if current == key => {
+                            // SAFETY: write lock is held.
+                            let old = unsafe { (*target.value.get()).replace(value) };
+                            target.recently_used.store(1, Ordering::Relaxed);
+                            target.rwlock.write_unlock();
+                            return old;
+                        }
+                        _ => {
+                            target.rwlock.write_unlock();
+                        }
+                    }
+                }
             }
 
+            if let Some(target_idx) = first_tombstone {
+                let target = &self.slots[target_idx];
+                target.rwlock.write_lock();
+                match target.key.load(Ordering::Relaxed) {
+                    EMPTY | TOMBSTONE => {
+                        // SAFETY: write lock is held.
+                        let old = unsafe { (*target.value.get()).replace(value) };
+                        debug_assert!(old.is_none());
+                        target.key.store(key, Ordering::Release);
+                        target.recently_used.store(1, Ordering::Relaxed);
+                        target.rwlock.write_unlock();
+                        return old;
+                    }
+                    current if current == key => {
+                        // SAFETY: write lock is held.
+                        let old = unsafe { (*target.value.get()).replace(value) };
+                        target.recently_used.store(1, Ordering::Relaxed);
+                        target.rwlock.write_unlock();
+                        return old;
+                    }
+                    _ => {
+                        target.rwlock.write_unlock();
+                        continue;
+                    }
+                }
+            }
+
+            // Probe chain exhausted – force-evict the home slot.
+            let slot = &self.slots[start];
+            slot.rwlock.write_lock();
+            let old_key = slot.key.load(Ordering::Relaxed);
+            // SAFETY: write lock is held.
+            let old = unsafe { (*slot.value.get()).replace(value) };
+            slot.key.store(key, Ordering::Release);
+            slot.recently_used.store(1, Ordering::Relaxed);
             slot.rwlock.write_unlock();
-        }
 
-        // Probe chain exhausted – force-evict the home slot.
-        let slot = &self.slots[start & self.mask];
-        slot.rwlock.write_lock();
-        let old_key = slot.key.load(Ordering::Relaxed);
-        // SAFETY: write lock is held.
-        let old = unsafe { (*slot.value.get()).replace(value) };
-        slot.key.store(key, Ordering::Release);
-        slot.recently_used.store(1, Ordering::Relaxed);
-        slot.rwlock.write_unlock();
-
-        if old_key == EMPTY || old_key == TOMBSTONE {
-            self.len.fetch_add(1, Ordering::Relaxed);
+            debug_assert!((old_key != EMPTY && old_key != TOMBSTONE) || old.is_none());
+            return old;
         }
-        old
     }
 
     /// Remove a specific key from the cache.
@@ -333,9 +388,6 @@ impl ConcurrentPageCache {
                     // SAFETY: write lock is held.
                     let old = unsafe { (*slot.value.get()).take() };
                     slot.rwlock.write_unlock();
-                    if old.is_some() {
-                        self.len.fetch_sub(1, Ordering::Relaxed);
-                    }
                     return old;
                 }
                 slot.rwlock.write_unlock();
@@ -367,8 +419,7 @@ impl ConcurrentPageCache {
             }
 
             // Second-chance: skip if recently used, but clear the bit.
-            if slot.recently_used.load(Ordering::Relaxed) != 0 {
-                slot.recently_used.store(0, Ordering::Relaxed);
+            if slot.recently_used.swap(0, Ordering::Relaxed) != 0 {
                 slot.rwlock.write_unlock();
                 continue;
             }
@@ -379,7 +430,6 @@ impl ConcurrentPageCache {
             slot.rwlock.write_unlock();
 
             if let Some(v) = value {
-                self.len.fetch_sub(1, Ordering::Relaxed);
                 return Some((k, v));
             }
         }
@@ -398,7 +448,6 @@ impl ConcurrentPageCache {
             slot.recently_used.store(0, Ordering::Relaxed);
             slot.rwlock.write_unlock();
         }
-        self.len.store(0, Ordering::Relaxed);
     }
 }
 
@@ -492,7 +541,30 @@ mod tests {
         cache.clear();
         assert!(cache.get(0).is_none());
         assert!(cache.get(4096).is_none());
-        assert_eq!(cache.len.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn insert_reuses_tombstone_without_duplicating_key() {
+        let cache = ConcurrentPageCache::new(4096 * 16, 4096);
+        let first_slot = cache.slot_index(0);
+        let mut colliding = Vec::with_capacity(3);
+        let mut offset = 0u64;
+        while colliding.len() < 3 {
+            if cache.slot_index(offset) == first_slot {
+                colliding.push(offset);
+            }
+            offset += 4096;
+        }
+
+        cache.insert(colliding[0], vec![1u8; 4096].into());
+        cache.insert(colliding[1], vec![2u8; 4096].into());
+        cache.insert(colliding[2], vec![3u8; 4096].into());
+        assert_eq!(cache.remove(colliding[1]).unwrap()[0], 2);
+
+        cache.insert(colliding[2], vec![4u8; 4096].into());
+        assert_eq!(cache.get(colliding[2]).unwrap()[0], 4);
+        assert_eq!(cache.remove(colliding[2]).unwrap()[0], 4);
+        assert!(cache.get(colliding[2]).is_none());
     }
 
     #[test]
