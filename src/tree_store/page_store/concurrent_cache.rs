@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Sentinel: slot is unoccupied and terminates probe chains.
 const EMPTY: u64 = u64::MAX;
@@ -16,10 +16,10 @@ const WRITE_BIT: u32 = 1 << 31;
 ///
 /// State encoding (AtomicU32):
 ///   - bits 0..30 : active reader count (up to ~2 billion)
-///   - bit  31    : WRITE_BIT – set when a writer holds or is acquiring the lock
+///   - bit  31    : `WRITE_BIT` - set when a writer holds or is acquiring the lock
 ///
-/// Multiple readers can hold the lock simultaneously.  A writer sets
-/// WRITE_BIT, which prevents new readers from entering, then spins until
+/// Multiple readers can hold the lock simultaneously. A writer sets
+/// `WRITE_BIT`, which prevents new readers from entering, then spins until
 /// existing readers drain.
 struct RwSpinLock {
     state: AtomicU32,
@@ -33,49 +33,42 @@ impl RwSpinLock {
     }
 
     /// Acquire a shared (reader) lock.
-    #[inline(always)]
+    #[inline]
     fn read_lock(&self) {
         loop {
             let s = self.state.load(Ordering::Relaxed);
-            if s & WRITE_BIT == 0 {
-                // No writer – try to increment reader count.
-                if self
+            // No writer - try to increment reader count.
+            if s & WRITE_BIT == 0
+                && self
                     .state
                     .compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
-                {
-                    return;
-                }
+            {
+                return;
             }
             std::hint::spin_loop();
         }
     }
 
     /// Release a shared (reader) lock.
-    #[inline(always)]
+    #[inline]
     fn read_unlock(&self) {
         self.state.fetch_sub(1, Ordering::Release);
     }
 
     /// Acquire an exclusive (writer) lock.
-    #[inline(always)]
+    #[inline]
     fn write_lock(&self) {
-        // Phase 1: set the WRITE_BIT to block new readers.
+        // Phase 1: set `WRITE_BIT` to block new readers.
         loop {
             let s = self.state.load(Ordering::Relaxed);
-            if s & WRITE_BIT == 0 {
-                if self
+            if s & WRITE_BIT == 0
+                && self
                     .state
-                    .compare_exchange_weak(
-                        s,
-                        s | WRITE_BIT,
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    )
+                    .compare_exchange_weak(s, s | WRITE_BIT, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
-                {
-                    break;
-                }
+            {
+                break;
             }
             std::hint::spin_loop();
         }
@@ -86,7 +79,7 @@ impl RwSpinLock {
     }
 
     /// Release an exclusive (writer) lock.
-    #[inline(always)]
+    #[inline]
     fn write_unlock(&self) {
         self.state.store(0, Ordering::Release);
     }
@@ -143,7 +136,8 @@ impl ConcurrentPageCache {
     /// Create a new cache sized to hold all pages that fit in `max_cache_bytes`
     /// at ≤ 50 % load factor.
     pub(super) fn new(max_cache_bytes: usize, page_size: u64) -> Self {
-        let max_pages = (max_cache_bytes / page_size as usize).max(1);
+        let page_size: usize = page_size.try_into().unwrap();
+        let max_pages = (max_cache_bytes / page_size).max(1);
         let num_slots = (max_pages * 2).max(16).next_power_of_two();
 
         let mut slots = Vec::with_capacity(num_slots);
@@ -161,13 +155,14 @@ impl ConcurrentPageCache {
     }
 
     /// Map a page-aligned file offset to a slot index.
-    #[inline(always)]
+    #[inline]
     fn slot_index(&self, key: u64) -> usize {
         let page_num = key >> self.page_shift;
         // Fibonacci / multiplicative hash – distributes page-aligned offsets
         // uniformly across the power-of-2 table.
         let h = page_num.wrapping_mul(0x517c_c1b7_2722_0a95);
-        (h as usize) & self.mask
+        let mask = u64::try_from(self.mask).unwrap();
+        usize::try_from(h & mask).unwrap()
     }
 
     // ── read path (hot) ──────────────────────────────────────────────────
@@ -333,7 +328,7 @@ impl ConcurrentPageCache {
 
     /// Drop every entry and reset the table.
     pub(super) fn clear(&self) {
-        for slot in self.slots.iter() {
+        for slot in &*self.slots {
             slot.rwlock.write_lock();
             slot.key.store(EMPTY, Ordering::Relaxed);
             // SAFETY: write lock is held.
@@ -390,18 +385,18 @@ mod tests {
 
         // Insert many pages and verify they're all retrievable.
         for i in 0..(n / 2) {
-            let offset = (i as u64) * 4096;
-            let data: Arc<[u8]> = vec![i as u8; 4096].into();
+            let offset = u64::try_from(i).unwrap() * 4096;
+            let data: Arc<[u8]> = vec![u8::try_from(i).unwrap(); 4096].into();
             cache.insert(offset, data);
         }
 
         for i in 0..(n / 2) {
-            let offset = (i as u64) * 4096;
+            let offset = u64::try_from(i).unwrap() * 4096;
             let got = cache.get(offset);
             // Some entries may have been evicted due to probe-chain overflow,
             // but those that remain must have correct data.
             if let Some(v) = got {
-                assert_eq!(v[0], i as u8);
+                assert_eq!(v[0], u8::try_from(i).unwrap());
             }
         }
     }
@@ -445,9 +440,9 @@ mod tests {
         let cache = Arc::new(ConcurrentPageCache::new(4096 * 1024, 4096));
 
         // Pre-populate
-        for i in 0..100 {
-            let offset = (i as u64) * 4096;
-            let data: Arc<[u8]> = vec![i as u8; 4096].into();
+        for i in 0u8..100 {
+            let offset = u64::from(i) * 4096;
+            let data: Arc<[u8]> = vec![i; 4096].into();
             cache.insert(offset, data);
         }
 
@@ -458,7 +453,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for _ in 0..1000 {
                     for i in 0..100u8 {
-                        let got = c.get((i as u64) * 4096);
+                        let got = c.get(u64::from(i) * 4096);
                         if let Some(v) = got {
                             assert_eq!(v[0], i);
                         }
