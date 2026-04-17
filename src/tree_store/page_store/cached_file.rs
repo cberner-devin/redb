@@ -6,12 +6,51 @@ use std::slice::SliceIndex;
 #[cfg(feature = "cache_metrics")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 pub(super) struct WritablePage {
     buffer: Arc<Mutex<LRUWriteCache>>,
     offset: u64,
     data: Arc<[u8]>,
+}
+
+pub(super) struct BorrowedCachePage<'a> {
+    _lock: RwLockReadGuard<'a, LRUCache<Arc<[u8]>>>,
+    mem: *const [u8],
+    arc: *const Arc<[u8]>,
+}
+
+impl<'a> BorrowedCachePage<'a> {
+    #[inline]
+    fn new(
+        lock: RwLockReadGuard<'a, LRUCache<Arc<[u8]>>>,
+        mem: *const [u8],
+        arc: *const Arc<[u8]>,
+    ) -> Self {
+        Self {
+            _lock: lock,
+            mem,
+            arc,
+        }
+    }
+
+    #[inline]
+    pub(super) fn mem(&self) -> &[u8] {
+        // SAFETY: `self.lock` keeps the cache entry alive and immutable for the lifetime
+        // of this borrow, so these pointers remain valid until `self` is dropped.
+        unsafe { &*self.mem }
+    }
+
+    #[inline]
+    pub(super) fn to_arc(&self) -> Arc<[u8]> {
+        // SAFETY: see `mem()`
+        unsafe { (&*self.arc).clone() }
+    }
+}
+
+pub(super) enum CachedPage<'a> {
+    Borrowed(BorrowedCachePage<'a>),
+    Owned(Arc<[u8]>),
 }
 
 impl WritablePage {
@@ -412,6 +451,18 @@ impl PagedCachedFile {
     // Read with caching. Caller must not read overlapping ranges without first calling invalidate_cache().
     // Doing so will not cause UB, but is a logic error.
     pub(super) fn read(&self, offset: u64, len: usize, hint: PageHint) -> Result<Arc<[u8]>> {
+        match self.read_ref(offset, len, hint)? {
+            CachedPage::Borrowed(page) => Ok(page.to_arc()),
+            CachedPage::Owned(page) => Ok(page),
+        }
+    }
+
+    pub(super) fn read_ref(
+        &self,
+        offset: u64,
+        len: usize,
+        hint: PageHint,
+    ) -> Result<CachedPage<'_>> {
         debug_assert_eq!(0, offset % self.page_size);
         #[cfg(feature = "cache_metrics")]
         self.reads_total.fetch_add(1, Ordering::AcqRel);
@@ -422,18 +473,22 @@ impl PagedCachedFile {
                 #[cfg(feature = "cache_metrics")]
                 self.reads_hits.fetch_add(1, Ordering::Release);
                 debug_assert_eq!(cached.len(), len);
-                return Ok(cached.clone());
+                return Ok(CachedPage::Owned(cached.clone()));
             }
         }
 
         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
         {
             let read_lock = self.read_cache[cache_slot].read().unwrap();
-            if let Some(cached) = read_lock.get(offset) {
+            if let Some((mem, arc)) = read_lock.get_map(offset, |cached| {
+                (Arc::as_ptr(cached), std::ptr::from_ref::<Arc<[u8]>>(cached))
+            }) {
                 #[cfg(feature = "cache_metrics")]
                 self.reads_hits.fetch_add(1, Ordering::Release);
-                debug_assert_eq!(cached.len(), len);
-                return Ok(cached.clone());
+                debug_assert_eq!(unsafe { (&*arc).len() }, len);
+                return Ok(CachedPage::Borrowed(BorrowedCachePage::new(
+                    read_lock, mem, arc,
+                )));
             }
         }
 
@@ -471,7 +526,7 @@ impl PagedCachedFile {
             self.read_cache_bytes.fetch_sub(removed, Ordering::AcqRel);
         }
 
-        Ok(buffer)
+        Ok(CachedPage::Owned(buffer))
     }
 
     // Discard pending writes to the given range

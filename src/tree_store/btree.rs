@@ -5,7 +5,7 @@ use crate::tree_store::btree_base::{
 };
 use crate::tree_store::btree_iters::BtreeExtractIf;
 use crate::tree_store::btree_mutator::MutateHelper;
-use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory};
+use crate::tree_store::page_store::{Page, PageImpl, PageMut, PageRef, TransactionalMemory};
 use crate::tree_store::{
     AccessGuardMutInPlace, AllPageNumbersBtreeIter, BtreeRangeIter, PageHint, PageNumber,
     PageTrackerPolicy,
@@ -884,10 +884,50 @@ impl<K: Key, V: Value> Btree<K, V> {
             BRANCH => {
                 let accessor = BranchAccessor::new(page, K::fixed_width());
                 let (_, child_page) = accessor.child_for_key::<K>(query);
-                let child_page = self.mem.get_page_extended(child_page, self.hint)?;
-                self.get_helper(&child_page, query)
+                self.get_helper_from_page_number(child_page, query)
             }
             _ => unreachable!(),
+        }
+    }
+
+    fn get_helper_from_page_number(
+        &self,
+        page_number: PageNumber,
+        query: &[u8],
+    ) -> Result<Option<AccessGuard<'static, V>>> {
+        let mut page = self.mem.get_page_extended_ref(page_number, self.hint)?;
+        loop {
+            let (page_number, page_mem) = match &page {
+                PageRef::Borrowed(page) => (page.get_page_number(), page.memory()),
+                PageRef::Owned(page) => (page.get_page_number(), page.memory()),
+            };
+            let node_type = page_mem[0];
+            match node_type {
+                LEAF => {
+                    let accessor = LeafAccessor::new(page_mem, K::fixed_width(), V::fixed_width());
+                    if let Some(entry_index) = accessor.find_key::<K>(query) {
+                        let (start, end) = accessor.value_range(entry_index).unwrap();
+                        let value = match page {
+                            PageRef::Borrowed(page) => {
+                                AccessGuard::with_arc_page(page.to_arc(), start..end)
+                            }
+                            PageRef::Owned(page) => AccessGuard::with_page(page, start..end),
+                        };
+                        return Ok(Some(value));
+                    }
+                    return Ok(None);
+                }
+                BRANCH => {
+                    let child_page = {
+                        let page = CachedPage::new(page_number, page_mem);
+                        let accessor = BranchAccessor::new(&page, K::fixed_width());
+                        let (_, child_page) = accessor.child_for_key::<K>(query);
+                        child_page
+                    };
+                    page = self.mem.get_page_extended_ref(child_page, self.hint)?;
+                }
+                _ => unreachable!(),
+            }
         }
     }
 
@@ -1022,6 +1062,27 @@ impl<K: Key, V: Value> Drop for Btree<K, V> {
     fn drop(&mut self) {
         // Make sure that we clear our reference to the root page, before the transaction guard goes out of scope
         self.cached_root = None;
+    }
+}
+
+struct CachedPage<'a> {
+    page_number: PageNumber,
+    mem: &'a [u8],
+}
+
+impl<'a> CachedPage<'a> {
+    fn new(page_number: PageNumber, mem: &'a [u8]) -> Self {
+        Self { page_number, mem }
+    }
+}
+
+impl Page for CachedPage<'_> {
+    fn memory(&self) -> &[u8] {
+        self.mem
+    }
+
+    fn get_page_number(&self) -> PageNumber {
+        self.page_number
     }
 }
 

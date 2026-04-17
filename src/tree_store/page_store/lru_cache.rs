@@ -60,6 +60,16 @@ impl<T> LRUCache<T> {
         }
     }
 
+    #[inline]
+    pub(crate) fn get_map<R>(&self, key: u64, map: impl FnOnce(&T) -> R) -> Option<R> {
+        if let Some((value, second_chance)) = self.cache.get(&key) {
+            second_chance.store(true, Ordering::Release);
+            Some(map(value))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
         if let Some((value, second_chance)) = self.cache.get_mut(&key) {
             second_chance.store(true, Ordering::Release);

@@ -8,7 +8,7 @@ use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
 use crate::tree_store::page_store::header::{DB_HEADER_SIZE, DatabaseHeader, MAGICNUMBER};
 use crate::tree_store::page_store::layout::DatabaseLayout;
 use crate::tree_store::page_store::region::{Allocators, RegionTracker};
-use crate::tree_store::page_store::{PageImpl, PageMut, hash128_with_seed};
+use crate::tree_store::page_store::{PageImpl, PageMut, PageRef, hash128_with_seed};
 use crate::tree_store::{Page, PageNumber, PageTrackerPolicy};
 use crate::{CacheStats, StorageBackend};
 use crate::{DatabaseError, Result, StorageError};
@@ -782,6 +782,53 @@ impl TransactionalMemory {
             page_number,
             #[cfg(debug_assertions)]
             open_pages: self.read_page_ref_counts.clone(),
+        })
+    }
+
+    pub(crate) fn get_page_extended_ref(
+        &self,
+        page_number: PageNumber,
+        hint: PageHint,
+    ) -> Result<PageRef<'_>> {
+        let range = page_number.address_range(
+            self.page_size.into(),
+            self.region_size,
+            self.region_header_with_padding_size,
+            self.page_size,
+        );
+        let len: usize = (range.end - range.start).try_into().unwrap();
+        let mem = self.storage.read_ref(range.start, len, hint)?;
+
+        #[cfg(debug_assertions)]
+        {
+            let dirty_pages = self.open_dirty_pages.lock().unwrap();
+            debug_assert!(!dirty_pages.contains(&page_number), "{page_number:?}");
+            *(self
+                .read_page_ref_counts
+                .lock()
+                .unwrap()
+                .entry(page_number)
+                .or_default()) += 1;
+            drop(dirty_pages);
+        }
+
+        Ok(match mem {
+            crate::tree_store::page_store::cached_file::CachedPage::Borrowed(mem) => {
+                PageRef::Borrowed(crate::tree_store::page_store::base::BorrowedPage {
+                    mem,
+                    page_number,
+                    #[cfg(debug_assertions)]
+                    open_pages: self.read_page_ref_counts.clone(),
+                })
+            }
+            crate::tree_store::page_store::cached_file::CachedPage::Owned(mem) => {
+                PageRef::Owned(PageImpl {
+                    mem,
+                    page_number,
+                    #[cfg(debug_assertions)]
+                    open_pages: self.read_page_ref_counts.clone(),
+                })
+            }
         })
     }
 

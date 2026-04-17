@@ -1,4 +1,4 @@
-use crate::tree_store::page_store::cached_file::WritablePage;
+use crate::tree_store::page_store::cached_file::{BorrowedCachePage, WritablePage};
 use crate::tree_store::page_store::page_manager::MAX_MAX_PAGE_ORDER;
 use std::cmp::Ordering;
 #[cfg(debug_assertions)]
@@ -236,6 +236,72 @@ impl Clone for PageImpl {
             page_number: self.page_number,
             #[cfg(debug_assertions)]
             open_pages: self.open_pages.clone(),
+        }
+    }
+}
+
+pub(crate) struct BorrowedPage<'a> {
+    pub(super) mem: BorrowedCachePage<'a>,
+    pub(super) page_number: PageNumber,
+    #[cfg(debug_assertions)]
+    pub(super) open_pages: Arc<Mutex<HashMap<PageNumber, u64>>>,
+}
+
+impl BorrowedPage<'_> {
+    pub(crate) fn to_arc(&self) -> Arc<[u8]> {
+        self.mem.to_arc()
+    }
+}
+
+impl Debug for BorrowedPage<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "BorrowedPage: page_number={:?}",
+            self.page_number
+        ))
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for BorrowedPage<'_> {
+    fn drop(&mut self) {
+        let mut open_pages = self.open_pages.lock().unwrap();
+        let value = open_pages.get_mut(&self.page_number).unwrap();
+        assert!(*value > 0);
+        *value -= 1;
+        if *value == 0 {
+            open_pages.remove(&self.page_number);
+        }
+    }
+}
+
+impl Page for BorrowedPage<'_> {
+    fn memory(&self) -> &[u8] {
+        self.mem.mem()
+    }
+
+    fn get_page_number(&self) -> PageNumber {
+        self.page_number
+    }
+}
+
+pub(crate) enum PageRef<'a> {
+    Borrowed(BorrowedPage<'a>),
+    Owned(PageImpl),
+}
+
+impl Page for PageRef<'_> {
+    fn memory(&self) -> &[u8] {
+        match self {
+            PageRef::Borrowed(page) => page.memory(),
+            PageRef::Owned(page) => page.memory(),
+        }
+    }
+
+    fn get_page_number(&self) -> PageNumber {
+        match self {
+            PageRef::Borrowed(page) => page.get_page_number(),
+            PageRef::Owned(page) => page.get_page_number(),
         }
     }
 }
