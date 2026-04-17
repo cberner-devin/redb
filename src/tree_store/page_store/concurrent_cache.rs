@@ -10,15 +10,15 @@ pub(crate) struct CacheGuard<'a> {
     data: &'a [u8],
 }
 
-impl<'a> CacheGuard<'a> {
-    #[inline(always)]
+impl CacheGuard<'_> {
+    #[inline]
     pub(crate) fn data(&self) -> &[u8] {
         self.data
     }
 }
 
 impl Drop for CacheGuard<'_> {
-    #[inline(always)]
+    #[inline]
     fn drop(&mut self) {
         self.rwlock.read_unlock();
     }
@@ -245,12 +245,11 @@ impl ConcurrentPageCache {
                     slot.recently_used.store(1, Ordering::Relaxed);
                     // SAFETY: read lock is held; no concurrent mutation.
                     let data = unsafe {
-                        match &*slot.value.get() {
-                            Some(arc) => arc.as_ref() as *const [u8],
-                            None => {
-                                slot.rwlock.read_unlock();
-                                return None;
-                            }
+                        if let Some(arc) = &*slot.value.get() {
+                            arc.as_ref() as *const [u8]
+                        } else {
+                            slot.rwlock.read_unlock();
+                            return None;
                         }
                     };
                     return Some(CacheGuard {

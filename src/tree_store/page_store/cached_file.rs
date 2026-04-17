@@ -17,7 +17,7 @@ pub(crate) enum BorrowedPage<'a> {
 }
 
 impl BorrowedPage<'_> {
-    #[inline(always)]
+    #[inline]
     pub(crate) fn data(&self) -> &[u8] {
         match self {
             BorrowedPage::Guard(g) => g.data(),
@@ -471,7 +471,12 @@ impl PagedCachedFile {
     /// Only useful for short-lived borrows (e.g. reading a B-tree branch
     /// node to find a child pointer).
     #[inline]
-    pub(super) fn read_borrowed(&self, offset: u64, len: usize, hint: PageHint) -> Result<BorrowedPage<'_>> {
+    pub(super) fn read_borrowed(
+        &self,
+        offset: u64,
+        len: usize,
+        hint: PageHint,
+    ) -> Result<BorrowedPage<'_>> {
         debug_assert_eq!(0, offset % self.page_size);
 
         // If the page might be in the write buffer, fall back to the
