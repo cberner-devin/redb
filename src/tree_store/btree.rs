@@ -860,9 +860,8 @@ impl<K: Key, V: Value> Btree<K, V> {
     }
 
     pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
-        let root_page = match self.cached_root {
-            Some(ref p) => p,
-            None => return Ok(None),
+        let Some(ref root_page) = self.cached_root else {
+            return Ok(None);
         };
         let query = K::as_bytes(key);
         let query = query.as_ref();
@@ -872,7 +871,7 @@ impl<K: Key, V: Value> Btree<K, V> {
         // Only the final leaf page needs an owned PageImpl for AccessGuard.
         let mut child_page_number = match root_page.memory()[0] {
             LEAF => {
-                return self.get_from_leaf(root_page.clone(), query);
+                return Self::get_from_leaf(root_page.clone(), query);
             }
             BRANCH => {
                 let accessor = BranchAccessor::new(root_page, K::fixed_width());
@@ -893,7 +892,7 @@ impl<K: Key, V: Value> Btree<K, V> {
                     // borrow first, then fetch via the owning path.
                     drop(borrowed);
                     let page = self.mem.get_page_extended(child_page_number, self.hint)?;
-                    return self.get_from_leaf(page, query);
+                    return Self::get_from_leaf(page, query);
                 }
                 BRANCH => {
                     let slice_page = SlicePage(data);
@@ -908,11 +907,7 @@ impl<K: Key, V: Value> Btree<K, V> {
     }
 
     #[inline]
-    fn get_from_leaf(
-        &self,
-        page: PageImpl,
-        query: &[u8],
-    ) -> Result<Option<AccessGuard<'static, V>>> {
+    fn get_from_leaf(page: PageImpl, query: &[u8]) -> Result<Option<AccessGuard<'static, V>>> {
         let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
         if let Some(entry_index) = accessor.find_key::<K>(query) {
             let (start, end) = accessor.value_range(entry_index).unwrap();
