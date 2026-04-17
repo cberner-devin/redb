@@ -632,7 +632,7 @@ mod test {
     use crate::StorageBackend;
     use crate::backends::InMemoryBackend;
     use crate::tree_store::PageHint;
-    use crate::tree_store::page_store::cached_file::PagedCachedFile;
+    use crate::tree_store::page_store::cached_file::{BorrowedPage, PagedCachedFile};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
@@ -666,5 +666,40 @@ mod test {
         t2.join().unwrap();
         cached_file.invalidate_cache(0, 128);
         assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn read_borrowed_clean_miss_then_hit() {
+        let backend = InMemoryBackend::new();
+        backend.set_len(128).unwrap();
+        backend.write(0, &[7u8; 128]).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();
+
+        match cached_file.read_borrowed(0, 128, PageHint::Clean).unwrap() {
+            BorrowedPage::Owned(page) => assert_eq!(page[0], 7),
+            BorrowedPage::Guard(_) => panic!("expected cache miss to fall back to owned page"),
+        }
+
+        match cached_file.read_borrowed(0, 128, PageHint::Clean).unwrap() {
+            BorrowedPage::Guard(page) => assert_eq!(page.data()[0], 7),
+            BorrowedPage::Owned(_) => panic!("expected clean cache hit to return borrowed page"),
+        }
+    }
+
+    #[test]
+    fn read_borrowed_dirty_page_stays_owned() {
+        let backend = InMemoryBackend::new();
+        backend.set_len(128).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();
+
+        {
+            let mut page = cached_file.write(0, 128, true).unwrap();
+            page.mem_mut()[0] = 9;
+        }
+
+        match cached_file.read_borrowed(0, 128, PageHint::None).unwrap() {
+            BorrowedPage::Owned(page) => assert_eq!(page[0], 9),
+            BorrowedPage::Guard(_) => panic!("expected write-buffer hit to return owned page"),
+        }
     }
 }
