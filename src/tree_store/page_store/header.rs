@@ -85,14 +85,43 @@ fn get_u64(data: &[u8]) -> u64 {
     u64::from_le_bytes(data[..size_of::<u64>()].try_into().unwrap())
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default, Debug)]
 pub(super) struct HeaderRepairInfo {
     pub(super) invalid_magic_number: bool,
     pub(super) primary_corrupted: bool,
     pub(super) secondary_corrupted: bool,
 }
 
-#[derive(Clone)]
+/// Error returned by [`DatabaseHeader::from_bytes`].
+///
+/// `Ok(header)` from `from_bytes` guarantees the bytes parsed into a fully valid header with a
+/// correct magic number and uncorrupted commit slots -- the caller does not need to consider
+/// repair. Anything that might need repair ends up in the [`DatabaseHeaderError::RepairInfo`]
+/// variant so the repair info cannot be silently ignored.
+#[derive(Debug)]
+pub(super) enum DatabaseHeaderError {
+    /// The header could not be used at all (e.g. unsupported file format version). Callers
+    /// should propagate this error to the user.
+    Other(DatabaseError),
+    /// The header was parsed but either the magic number is missing or one or both commit slots
+    /// have an invalid checksum. Contains the (partially-trusted) parsed header together with
+    /// the repair info so the caller can decide how to recover.
+    RepairInfo(Box<DatabaseHeader>, HeaderRepairInfo),
+}
+
+impl From<DatabaseError> for DatabaseHeaderError {
+    fn from(e: DatabaseError) -> Self {
+        Self::Other(e)
+    }
+}
+
+impl From<StorageError> for DatabaseHeaderError {
+    fn from(e: StorageError) -> Self {
+        Self::Other(e.into())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct DatabaseHeader {
     primary_slot: usize,
     pub(super) recovery_required: bool,
@@ -226,8 +255,12 @@ impl DatabaseHeader {
         Ok(true)
     }
 
-    // TODO: consider returning an Err with the repair info
-    pub(super) fn from_bytes(data: &[u8]) -> Result<(Self, HeaderRepairInfo), DatabaseError> {
+    /// Parse a raw header. Returns `Ok(header)` only if the bytes are a valid redb header whose
+    /// magic number matches and whose commit slots both have valid checksums. If the magic
+    /// number is missing or any slot is corrupted the parsed header and the repair info are
+    /// returned inside [`DatabaseHeaderError::RepairInfo`], forcing the caller to acknowledge
+    /// the repair info rather than consume a silently-partial header.
+    pub(super) fn from_bytes(data: &[u8]) -> Result<Self, DatabaseHeaderError> {
         let invalid_magic_number = data[..MAGICNUMBER.len()] != MAGICNUMBER;
 
         let primary_slot = usize::from(data[GOD_BYTE_OFFSET] & PRIMARY_BIT != 0);
@@ -261,12 +294,17 @@ impl DatabaseHeader {
             trailing_partial_region_pages: trailing_data_pages,
             transaction_slots: [slot0, slot1],
         };
-        let repair = HeaderRepairInfo {
-            invalid_magic_number,
-            primary_corrupted,
-            secondary_corrupted,
-        };
-        Ok((result, repair))
+
+        if invalid_magic_number || primary_corrupted || secondary_corrupted {
+            let repair = HeaderRepairInfo {
+                invalid_magic_number,
+                primary_corrupted,
+                secondary_corrupted,
+            };
+            Err(DatabaseHeaderError::RepairInfo(Box::new(result), repair))
+        } else {
+            Ok(result)
+        }
     }
 
     pub(super) fn to_bytes(&self, include_magic_number: bool) -> [u8; DB_HEADER_SIZE] {
@@ -301,7 +339,7 @@ impl DatabaseHeader {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct TransactionHeader {
     pub(super) version: u8,
     pub(super) user_root: Option<BtreeHeader>,
@@ -683,6 +721,68 @@ mod test {
         file.write_all(&buffer).unwrap();
 
         Database::open(tmpfile.path()).unwrap();
+    }
+
+    #[test]
+    fn from_bytes_returns_repair_info_on_bad_magic_number() {
+        use crate::tree_store::page_store::header::{
+            DatabaseHeader, DatabaseHeaderError, MAGICNUMBER,
+        };
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        // Create a real on-disk database so we start from well-formed header bytes, then zero
+        // out just the magic number. from_bytes should surface this via the RepairInfo variant
+        // instead of silently returning Ok with a DatabaseHeader that could not be trusted.
+        let tmpfile = crate::create_tempfile();
+        let db = Database::builder().create(tmpfile.path()).unwrap();
+        drop(db);
+
+        let mut file = tmpfile.as_file();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut header_bytes = vec![0u8; crate::tree_store::page_store::header::DB_HEADER_SIZE];
+        file.read_exact(&mut header_bytes).unwrap();
+
+        // Confirm the roundtrip parses cleanly before we corrupt anything.
+        assert!(DatabaseHeader::from_bytes(&header_bytes).is_ok());
+
+        // Zero out the magic number and reparse.
+        for byte in &mut header_bytes[..MAGICNUMBER.len()] {
+            *byte = 0;
+        }
+        match DatabaseHeader::from_bytes(&header_bytes) {
+            Ok(_) => panic!("expected Err for bytes with invalid magic number"),
+            Err(DatabaseHeaderError::RepairInfo(_, repair_info)) => {
+                assert!(repair_info.invalid_magic_number);
+                assert!(!repair_info.primary_corrupted);
+                assert!(!repair_info.secondary_corrupted);
+            }
+            Err(other) => panic!("expected RepairInfo error, got {other:?}"),
+        }
+
+        // Restore the magic number and corrupt the primary slot's checksum instead. from_bytes
+        // should still surface this as RepairInfo, with primary_corrupted set and the magic flag
+        // clear.
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut header_bytes).unwrap();
+        // Flip the last byte of the primary slot (the checksum) to force a checksum mismatch.
+        let primary_slot_offset = if header_bytes[GOD_BYTE_OFFSET] & PRIMARY_BIT == 0 {
+            TRANSACTION_0_OFFSET
+        } else {
+            TRANSACTION_1_OFFSET
+        };
+        let checksum_end = primary_slot_offset + 128 - 1;
+        header_bytes[checksum_end] ^= 0xFF;
+        match DatabaseHeader::from_bytes(&header_bytes) {
+            Ok(_) => panic!("expected Err for bytes with corrupted primary slot checksum"),
+            Err(DatabaseHeaderError::RepairInfo(_, repair_info)) => {
+                assert!(!repair_info.invalid_magic_number);
+                assert!(repair_info.primary_corrupted);
+            }
+            Err(other) => panic!("expected RepairInfo error, got {other:?}"),
+        }
+
+        // Restore the file so the tmpfile drop cleanup is well-behaved (not strictly required).
+        let _ = file.write_all(&[]);
     }
 
     #[test]

@@ -5,7 +5,9 @@ use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
 use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
 use crate::tree_store::page_store::cached_file::PagedCachedFile;
 use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
-use crate::tree_store::page_store::header::{DB_HEADER_SIZE, DatabaseHeader, MAGICNUMBER};
+use crate::tree_store::page_store::header::{
+    DB_HEADER_SIZE, DatabaseHeader, DatabaseHeaderError, HeaderRepairInfo, MAGICNUMBER,
+};
 use crate::tree_store::page_store::layout::DatabaseLayout;
 use crate::tree_store::page_store::region::{Allocators, RegionTracker};
 use crate::tree_store::page_store::{PageImpl, PageMut, hash128_with_seed};
@@ -225,7 +227,17 @@ impl TransactionalMemory {
             storage.flush()?;
         }
         let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
-        let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
+        let (mut header, repair_info) = match DatabaseHeader::from_bytes(&header_bytes) {
+            Ok(h) => (h, HeaderRepairInfo::default()),
+            Err(DatabaseHeaderError::Other(e)) => return Err(e),
+            Err(DatabaseHeaderError::RepairInfo(h, r)) => {
+                // The magic number is validated separately above before we even reach this point,
+                // so if from_bytes reports invalid_magic_number here something has gone badly wrong
+                // between the two reads.
+                assert!(!r.invalid_magic_number);
+                (*h, r)
+            }
+        };
 
         assert_eq!(header.page_size() as usize, page_size);
         assert!(storage.raw_file_len()? >= header.layout().len());
@@ -245,7 +257,6 @@ impl TransactionalMemory {
                 page_size.try_into().unwrap(),
             ));
             header.pick_primary_for_repair(repair_info)?;
-            assert!(!repair_info.invalid_magic_number);
             storage
                 .write(0, DB_HEADER_SIZE, true)?
                 .mem_mut()
@@ -326,16 +337,22 @@ impl TransactionalMemory {
         self.storage.invalidate_cache_all();
 
         let header_bytes = self.storage.read_direct(0, DB_HEADER_SIZE)?;
-        let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
+        let (mut header, repair_info) = match DatabaseHeader::from_bytes(&header_bytes) {
+            Ok(h) => (h, HeaderRepairInfo::default()),
+            Err(DatabaseHeaderError::Other(e)) => return Err(e),
+            Err(DatabaseHeaderError::RepairInfo(h, r)) => {
+                if r.invalid_magic_number {
+                    return Err(StorageError::Corrupted("Invalid magic number".to_string()).into());
+                }
+                (*h, r)
+            }
+        };
         // TODO: This ends up always being true because this is called from check_integrity() once the db is already open
         // TODO: Also we should recheck the layout
         let mut was_clean = true;
         if header.recovery_required {
             if !header.pick_primary_for_repair(repair_info)? {
                 was_clean = false;
-            }
-            if repair_info.invalid_magic_number {
-                return Err(StorageError::Corrupted("Invalid magic number".to_string()).into());
             }
             self.storage
                 .write(0, DB_HEADER_SIZE, true)?
