@@ -3,9 +3,9 @@ use rand::random;
 use redb::DatabaseError;
 use redb::backends::InMemoryBackend;
 use redb::{
-    Database, Key, MultimapTableDefinition, MultimapTableHandle, Range, ReadOnlyDatabase,
-    ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableError,
-    TableHandle, TypeName, Value,
+    CommitError, Database, Key, MultimapTableDefinition, MultimapTableHandle, Range,
+    ReadOnlyDatabase, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableError, TableHandle, TypeName, Value,
 };
 use std::cmp::Ordering;
 #[cfg(not(target_os = "wasi"))]
@@ -1895,6 +1895,211 @@ fn retain_in_empty() {
         assert_eq!(table.len().unwrap(), 1000);
     }
     write_txn.commit().unwrap();
+}
+
+#[test]
+fn retain_collapses_to_single_entry() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..10_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+
+        table.retain(|key, _| key == 7777).unwrap();
+        assert_eq!(table.len().unwrap(), 1);
+        assert!(table.get(&7776).unwrap().is_none());
+        assert!(table.get(&7777).unwrap().is_some());
+        assert!(table.get(&7778).unwrap().is_none());
+
+        let mut iter = table.iter().unwrap();
+        let (key, _) = iter.next().unwrap().unwrap();
+        assert_eq!(key.value(), 7777);
+        assert!(iter.next().is_none());
+    }
+    write_txn.commit().unwrap();
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        assert_eq!(table.len().unwrap(), 1);
+        for i in 0u64..1000 {
+            table.insert(i, &[1u8; 200]).unwrap();
+        }
+        assert_eq!(table.len().unwrap(), 1001);
+        for i in 0u64..1000 {
+            assert!(table.remove(i).unwrap().is_some());
+        }
+        assert_eq!(table.len().unwrap(), 1);
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn retain_collapses_to_sparse_entries() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..20_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+
+        table.retain(|key, _| key == 1234 || key == 17_777).unwrap();
+        assert_eq!(table.len().unwrap(), 2);
+        assert!(table.get(&1233).unwrap().is_none());
+        assert!(table.get(&1234).unwrap().is_some());
+        assert!(table.get(&17_777).unwrap().is_some());
+        assert!(table.get(&17_778).unwrap().is_none());
+
+        let keys: Vec<_> = table
+            .iter()
+            .unwrap()
+            .map(|entry| entry.unwrap().0.value())
+            .collect();
+        assert_eq!(keys, [1234, 17_777]);
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn retain_rebuilds_changed_separators() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..30_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+
+        table
+            .retain(|key, _| key < 10_000 || key == 15_000 || key >= 20_000)
+            .unwrap();
+        assert_eq!(table.len().unwrap(), 20_001);
+        assert!(table.get(&9999).unwrap().is_some());
+        assert!(table.get(&10_000).unwrap().is_none());
+        assert!(table.get(&14_999).unwrap().is_none());
+        assert!(table.get(&15_000).unwrap().is_some());
+        assert!(table.get(&15_001).unwrap().is_none());
+        assert!(table.get(&20_000).unwrap().is_some());
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn retain_in_rebuilds_range_boundaries() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..30_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+
+        table
+            .retain_in(10_000..20_000, |key, _| key == 15_000)
+            .unwrap();
+        assert_eq!(table.len().unwrap(), 20_001);
+        assert!(table.get(&9999).unwrap().is_some());
+        assert!(table.get(&10_000).unwrap().is_none());
+        assert!(table.get(&14_999).unwrap().is_none());
+        assert!(table.get(&15_000).unwrap().is_some());
+        assert!(table.get(&15_001).unwrap().is_none());
+        assert!(table.get(&19_999).unwrap().is_none());
+        assert!(table.get(&20_000).unwrap().is_some());
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn retain_coalesces_sparse_survivors() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..20_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+
+        table.retain(|key, _| key % 100 == 0).unwrap();
+        assert_eq!(table.len().unwrap(), 200);
+        assert!(table.stats().unwrap().leaf_pages() < 50);
+        for i in 0u64..20_000 {
+            let value = table.get(&i).unwrap();
+            assert_eq!(value.is_some(), i % 100 == 0);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn retain_predicate_panic_poisons_transaction() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..20_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 20_000u64..22_000 {
+            table.insert(i, &[1u8; 200]).unwrap();
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table
+                .retain(|key, _| {
+                    assert_ne!(key, 21_000, "retain predicate panic");
+                    key % 2 == 0
+                })
+                .unwrap();
+        }));
+        assert!(result.is_err());
+    }
+
+    assert!(matches!(
+        write_txn.commit(),
+        Err(CommitError::TransactionPoisoned)
+    ));
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(definition).unwrap();
+    assert_eq!(table.len().unwrap(), 20_000);
+    assert!(table.get(&20_000).unwrap().is_none());
+    assert!(table.get(&21_000).unwrap().is_none());
+    assert_eq!(table.get(&0).unwrap().unwrap().value(), [0u8; 200]);
+    assert_eq!(table.get(&12_345).unwrap().unwrap().value(), [0u8; 200]);
+    assert_eq!(table.get(&19_999).unwrap().unwrap().value(), [0u8; 200]);
 }
 
 #[test]
