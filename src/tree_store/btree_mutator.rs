@@ -54,15 +54,6 @@ enum DeletionResult {
     DeletedBranch(PageNumber, Checksum),
 }
 
-// Result of merging an orphaned subtree into an adjacent sibling branch via
-// `MutateHelper::merge_branch_with_orphan`. If the merged branch overflowed,
-// `split_off` carries the separator key (owned, since it borrowed from a builder
-// that's gone by the time the function returns) and the right-half page.
-struct OrphanMergeOutcome {
-    primary: PageNumber,
-    split_off: Option<(Vec<u8>, PageNumber)>,
-}
-
 struct RetainNode {
     page: PageNumber,
     checksum: Checksum,
@@ -325,7 +316,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         let bounds = KeyRange::<K>::new(start_bound, end_bound);
 
         let root_page = self.page_allocator.get_page(header.root, PageHint::None)?;
-        let root_max_key = self.subtree_max_key(&root_page)?;
+        let (root_height, root_max_key) = self.subtree_height_and_max(&root_page)?;
         if bounds.less_than_start(&root_max_key) {
             return Ok(());
         }
@@ -335,6 +326,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             root_page,
             header.checksum,
             root_max_key,
+            root_height,
             bounds,
             &mut predicate,
             &mut removed,
@@ -356,45 +348,24 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         Ok(())
     }
 
-    fn subtree_max_key(&self, page: &PageImpl) -> Result<Vec<u8>> {
+    fn subtree_height_and_max(&self, page: &PageImpl) -> Result<(u32, Vec<u8>)> {
         match page.memory()[0] {
             LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
-                Ok(accessor.last_entry().key().to_vec())
+                Ok((0, accessor.last_entry().key().to_vec()))
             }
             BRANCH => {
+                // Existing mutation paths, including delete(), assume every child of a
+                // branch page is at the same tree level. The right edge is therefore enough
+                // to determine height, and also carries the subtree's maximum key.
                 let accessor = BranchAccessor::new(page, K::fixed_width());
                 let child_page = accessor.child_page(accessor.count_children() - 1).unwrap();
                 let child_page = self.page_allocator.get_page(child_page, PageHint::None)?;
-                self.subtree_max_key(&child_page)
+                let (height, max_key) = self.subtree_height_and_max(&child_page)?;
+                Ok((height + 1, max_key))
             }
             _ => unreachable!(),
         }
-    }
-
-    fn subtree_height(&self, page_number: PageNumber) -> Result<u32> {
-        let page = self.page_allocator.get_page(page_number, PageHint::None)?;
-        self.subtree_height_from_page(&page)
-    }
-
-    fn subtree_height_from_page(&self, page: &PageImpl) -> Result<u32> {
-        match page.memory()[0] {
-            LEAF => Ok(0),
-            BRANCH => {
-                let accessor = BranchAccessor::new(page, K::fixed_width());
-                self.branch_height(&accessor)
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn branch_height(&self, accessor: &BranchAccessor<'_, '_, PageImpl>) -> Result<u32> {
-        let mut max_child_height = 0;
-        for i in 0..accessor.count_children() {
-            let child_height = self.subtree_height(accessor.child_page(i).unwrap())?;
-            max_child_height = max(max_child_height, child_height);
-        }
-        Ok(max_child_height + 1)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -403,6 +374,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         page: PageImpl,
         checksum: Checksum,
         max_key: Vec<u8>,
+        height: u32,
         bounds: KeyRange<'_, K>,
         predicate: &mut F,
         removed: &mut u64,
@@ -412,7 +384,9 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     {
         match page.memory()[0] {
             LEAF => self.retain_walk_leaf(page, checksum, max_key, bounds, predicate, removed),
-            BRANCH => self.retain_walk_branch(page, checksum, max_key, bounds, predicate, removed),
+            BRANCH => {
+                self.retain_walk_branch(page, checksum, max_key, height, bounds, predicate, removed)
+            }
             _ => unreachable!(),
         }
     }
@@ -526,6 +500,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         page: PageImpl,
         checksum: Checksum,
         max_key: Vec<u8>,
+        height: u32,
         bounds: KeyRange<'_, K>,
         predicate: &mut F,
         removed: &mut u64,
@@ -533,8 +508,10 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     where
         F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
     {
+        debug_assert!(height > 0);
         let page_number = page.get_page_number();
         let accessor = BranchAccessor::new(&page, K::fixed_width());
+        let child_height = height - 1;
         let child_count = accessor.count_children();
         let mut children = Vec::with_capacity(child_count);
         let mut changed = false;
@@ -550,7 +527,12 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             let above_end =
                 i > 0 && bounds.child_lower_bound_is_past_end(accessor.key(i - 1).unwrap());
             if below_start || above_end {
-                children.push(self.branch_child_tree(&accessor, &max_key, i)?);
+                children.push(Self::branch_child_tree(
+                    &accessor,
+                    &max_key,
+                    child_height,
+                    i,
+                ));
                 continue;
             }
 
@@ -561,6 +543,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                 child_page,
                 child_checksum,
                 child_max_key,
+                child_height,
                 bounds,
                 predicate,
                 removed,
@@ -570,7 +553,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         }
 
         if !changed {
-            let height = self.branch_height(&accessor)?;
             return Ok(RetainForest {
                 nodes: vec![RetainTree {
                     node: RetainNode {
@@ -729,26 +711,25 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     }
 
     fn branch_child_tree(
-        &self,
         accessor: &BranchAccessor<'_, '_, PageImpl>,
         parent_max_key: &[u8],
+        child_height: u32,
         index: usize,
-    ) -> Result<RetainTree> {
-        let page = accessor.child_page(index).unwrap();
+    ) -> RetainTree {
         let max_key = if index + 1 < accessor.count_children() {
             accessor.key(index).unwrap().to_vec()
         } else {
             parent_max_key.to_vec()
         };
-        Ok(RetainTree {
+        RetainTree {
             node: RetainNode {
-                page,
+                page: accessor.child_page(index).unwrap(),
                 checksum: accessor.child_checksum(index).unwrap(),
                 max_key,
             },
-            height: self.subtree_height(page)?,
+            height: child_height,
             partial: None,
-        })
+        }
     }
 
     fn normalize_retain_trees(&mut self, mut trees: Vec<RetainTree>) -> Result<Vec<RetainTree>> {
@@ -823,22 +804,34 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             .get_page(higher.node.page, PageHint::None)?;
         debug_assert_eq!(page.memory()[0], BRANCH);
         let accessor = BranchAccessor::new(&page, K::fixed_width());
+        let child_height = higher.height - 1;
         let edge_index = if lower_before_higher {
             0
         } else {
             accessor.count_children() - 1
         };
-        let edge = self.branch_child_tree(&accessor, &higher.node.max_key, edge_index)?;
+        let edge =
+            Self::branch_child_tree(&accessor, &higher.node.max_key, child_height, edge_index);
         let mut children = Vec::with_capacity(accessor.count_children() + 1);
 
         if lower_before_higher {
             children.extend(self.merge_ordered_retain_trees(lower, edge)?);
             for i in 1..accessor.count_children() {
-                children.push(self.branch_child_tree(&accessor, &higher.node.max_key, i)?);
+                children.push(Self::branch_child_tree(
+                    &accessor,
+                    &higher.node.max_key,
+                    child_height,
+                    i,
+                ));
             }
         } else {
             for i in 0..edge_index {
-                children.push(self.branch_child_tree(&accessor, &higher.node.max_key, i)?);
+                children.push(Self::branch_child_tree(
+                    &accessor,
+                    &higher.node.max_key,
+                    child_height,
+                    i,
+                ));
             }
             children.extend(self.merge_ordered_retain_trees(edge, lower)?);
         }
@@ -897,13 +890,24 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         debug_assert_eq!(right_page.memory()[0], BRANCH);
         let left_accessor = BranchAccessor::new(&left_page, K::fixed_width());
         let right_accessor = BranchAccessor::new(&right_page, K::fixed_width());
+        let child_height = left.height - 1;
         let mut children =
             Vec::with_capacity(left_accessor.count_children() + right_accessor.count_children());
         for i in 0..left_accessor.count_children() {
-            children.push(self.branch_child_tree(&left_accessor, &left.node.max_key, i)?);
+            children.push(Self::branch_child_tree(
+                &left_accessor,
+                &left.node.max_key,
+                child_height,
+                i,
+            ));
         }
         for i in 0..right_accessor.count_children() {
-            children.push(self.branch_child_tree(&right_accessor, &right.node.max_key, i)?);
+            children.push(Self::branch_child_tree(
+                &right_accessor,
+                &right.node.max_key,
+                child_height,
+                i,
+            ));
         }
         drop(left_page);
         drop(right_page);
