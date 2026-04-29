@@ -749,6 +749,177 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         Ok(())
     }
 
+    fn append_branch_output_page(
+        &self,
+        page_number: PageNumber,
+        checksum: Checksum,
+        max_key: Option<Vec<u8>>,
+        accumulated_children: &mut Vec<(PageNumber, Checksum)>,
+        accumulated_keys: &mut Vec<Vec<u8>>,
+        accumulated_max_key: &mut Option<Vec<u8>>,
+    ) -> Result<bool> {
+        let page = self.page_allocator.get_page(page_number, PageHint::None)?;
+        match page.memory()[0] {
+            BRANCH => {
+                drop(page);
+                self.append_branch_page(
+                    page_number,
+                    max_key,
+                    accumulated_children,
+                    accumulated_keys,
+                    accumulated_max_key,
+                )?;
+                Ok(true)
+            }
+            LEAF => {
+                drop(page);
+                Self::append_branch_parts(
+                    vec![(page_number, checksum)],
+                    Vec::new(),
+                    max_key,
+                    accumulated_children,
+                    accumulated_keys,
+                    accumulated_max_key,
+                );
+                Ok(false)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn accumulated_children_are_leaves(
+        &self,
+        accumulated_children: &[(PageNumber, Checksum)],
+    ) -> Result<bool> {
+        if accumulated_children.is_empty() {
+            return Ok(false);
+        }
+        for &(child, _) in accumulated_children {
+            let page = self.page_allocator.get_page(child, PageHint::None)?;
+            match page.memory()[0] {
+                LEAF => {}
+                BRANCH => return Ok(false),
+                _ => unreachable!(),
+            }
+        }
+        Ok(true)
+    }
+
+    fn compact_accumulated_leaf_children(
+        &mut self,
+        accumulated_children: &mut Vec<(PageNumber, Checksum)>,
+        accumulated_keys: &mut Vec<Vec<u8>>,
+        accumulated_max_key: &mut Option<Vec<u8>>,
+    ) -> Result {
+        let children = std::mem::take(accumulated_children);
+        accumulated_keys.clear();
+        *accumulated_max_key = None;
+
+        let mut leaf_output = Vec::new();
+        let mut accumulated_entries = Vec::new();
+        let mut accumulated_bytes = 0;
+        for (page_number, checksum) in children {
+            let page = self.page_allocator.get_page(page_number, PageHint::None)?;
+            let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+            let single_large_value = accessor.num_pairs() == 1
+                && accessor.total_length() >= self.page_allocator.get_page_size();
+            if single_large_value {
+                let max_key = accessor.last_entry().key().to_vec();
+                drop(page);
+                self.flush_accumulated_leaf_entries(
+                    &mut accumulated_entries,
+                    &mut accumulated_bytes,
+                    &mut leaf_output,
+                )?;
+                leaf_output.push(RetainLeafOutput {
+                    page: page_number,
+                    checksum,
+                    max_key: Some(max_key),
+                });
+            } else {
+                for i in 0..accessor.num_pairs() {
+                    let entry = accessor.entry(i).unwrap();
+                    accumulated_entries.push((entry.key().to_vec(), entry.value().to_vec()));
+                    accumulated_bytes += entry.key().len() + entry.value().len();
+                }
+                drop(page);
+                self.conditional_free(page_number);
+                let required_bytes = RawLeafBuilder::required_bytes(
+                    accumulated_entries.len(),
+                    accumulated_bytes,
+                    K::fixed_width(),
+                    V::fixed_width(),
+                );
+                if required_bytes > self.page_allocator.get_page_size() / 2 {
+                    self.flush_accumulated_leaf_entries(
+                        &mut accumulated_entries,
+                        &mut accumulated_bytes,
+                        &mut leaf_output,
+                    )?;
+                }
+            }
+        }
+        self.flush_accumulated_leaf_entries(
+            &mut accumulated_entries,
+            &mut accumulated_bytes,
+            &mut leaf_output,
+        )?;
+
+        assert!(!leaf_output.is_empty());
+        let last = leaf_output.len() - 1;
+        for (i, output) in leaf_output.into_iter().enumerate() {
+            accumulated_children.push((output.page, output.checksum));
+            if i == last {
+                *accumulated_max_key = output.max_key;
+            } else {
+                accumulated_keys.push(
+                    output
+                        .max_key
+                        .expect("non-final leaf output must have a separator key"),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn prepend_previous_branch_output(
+        &mut self,
+        output: &mut Vec<RetainBranchOutput>,
+        accumulated_children: &mut Vec<(PageNumber, Checksum)>,
+        accumulated_keys: &mut Vec<Vec<u8>>,
+        accumulated_max_key: &mut Option<Vec<u8>>,
+    ) -> Result<bool> {
+        let Some(previous) = output.pop() else {
+            return Ok(false);
+        };
+
+        let children = std::mem::take(accumulated_children);
+        let keys = std::mem::take(accumulated_keys);
+        let max_key = accumulated_max_key.take();
+        let previous_was_expanded = self.append_branch_output_page(
+            previous.page,
+            previous.checksum,
+            previous.max_key,
+            accumulated_children,
+            accumulated_keys,
+            accumulated_max_key,
+        )?;
+        if previous_was_expanded {
+            self.conditional_free(previous.page);
+        }
+        Self::append_branch_parts(
+            children,
+            keys,
+            max_key,
+            accumulated_children,
+            accumulated_keys,
+            accumulated_max_key,
+        );
+
+        Ok(true)
+    }
+
     fn flush_accumulated_branch_children(
         &mut self,
         accumulated_children: &mut Vec<(PageNumber, Checksum)>,
@@ -760,37 +931,61 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             return Ok(());
         }
 
-        if accumulated_children.len() == 1 {
-            if output.is_empty() {
-                let (page, checksum) = accumulated_children.pop().unwrap();
-                output.push(RetainBranchOutput {
-                    page,
-                    checksum,
-                    max_key: accumulated_max_key.take(),
-                });
-                return Ok(());
+        loop {
+            while accumulated_children.len() == 1 {
+                if !self.prepend_previous_branch_output(
+                    output,
+                    accumulated_children,
+                    accumulated_keys,
+                    accumulated_max_key,
+                )? {
+                    let (page, checksum) = accumulated_children.pop().unwrap();
+                    output.push(RetainBranchOutput {
+                        page,
+                        checksum,
+                        max_key: accumulated_max_key.take(),
+                    });
+                    return Ok(());
+                }
             }
 
-            let previous = output.pop().unwrap();
-            let children = std::mem::take(accumulated_children);
-            let keys = std::mem::take(accumulated_keys);
-            let max_key = accumulated_max_key.take();
-            self.append_branch_page(
-                previous.page,
-                previous.max_key,
+            if !self.accumulated_children_are_leaves(accumulated_children)? {
+                break;
+            }
+            // Collapsed child branches can expose leaf children here. Compact those leaves before
+            // rebuilding this level so sparse retain does not strand one-entry leaves across old
+            // branch boundaries.
+            self.compact_accumulated_leaf_children(
                 accumulated_children,
                 accumulated_keys,
                 accumulated_max_key,
             )?;
-            self.conditional_free(previous.page);
-            Self::append_branch_parts(
-                children,
-                keys,
-                max_key,
-                accumulated_children,
-                accumulated_keys,
-                accumulated_max_key,
-            );
+            if accumulated_children.len() > 1 {
+                break;
+            }
+        }
+
+        let mut max_key = accumulated_max_key.take();
+        if Self::branch_required_bytes(accumulated_keys.len(), accumulated_keys, K::fixed_width())
+            < self.page_allocator.get_page_size() / 3
+        {
+            // Leave the underfilled branch unbuilt so an ancestor can merge it with a sibling.
+            let children = std::mem::take(accumulated_children);
+            let keys = std::mem::take(accumulated_keys);
+            let last = children.len() - 1;
+            for (i, (page, checksum)) in children.into_iter().enumerate() {
+                let child_max_key = if i == last {
+                    max_key.take()
+                } else {
+                    Some(keys[i].clone())
+                };
+                output.push(RetainBranchOutput {
+                    page,
+                    checksum,
+                    max_key: child_max_key,
+                });
+            }
+            return Ok(());
         }
 
         let mut builder = BranchBuilder::new(
@@ -806,7 +1001,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             builder.push_key(key);
         }
 
-        let max_key = accumulated_max_key.take();
         if builder.should_split() {
             let (left, separator, right) = builder.build_split()?;
             output.push(RetainBranchOutput {
@@ -817,14 +1011,14 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             output.push(RetainBranchOutput {
                 page: right.get_page_number(),
                 checksum: DEFERRED,
-                max_key,
+                max_key: max_key.take(),
             });
         } else {
             let page = builder.build()?;
             output.push(RetainBranchOutput {
                 page: page.get_page_number(),
                 checksum: DEFERRED,
-                max_key,
+                max_key: max_key.take(),
             });
         }
 
@@ -1021,6 +1215,10 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         }
         for key in &final_keys {
             builder.push_key(key);
+        }
+        if builder.required_bytes() < self.page_allocator.get_page_size() / 3 {
+            let (children, keys) = builder.into_parts();
+            return Ok(RetainResult::PartialBranch { children, keys });
         }
         let new_page = builder.build()?;
         drop(page);
@@ -2040,5 +2238,41 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             BRANCH => self.delete_branch_helper(page, target, found_key),
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+
+    #[test]
+    fn retain_merges_leaf_children_after_branch_collapse() {
+        let tmpfile = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::builder()
+            .set_page_size(512)
+            .create(tmpfile.path())
+            .unwrap();
+        let definition: TableDefinition<u64, [u8; 40]> = TableDefinition::new("x");
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(definition).unwrap();
+            for i in 0u64..8_000 {
+                table.insert(i, &[0; 40]).unwrap();
+            }
+            let height_before = table.stats().unwrap().tree_height();
+
+            table.retain(|key, _| key % 97 == 0).unwrap();
+
+            let stats = table.stats().unwrap();
+            assert_eq!(table.len().unwrap(), 83);
+            assert!(stats.tree_height() <= height_before);
+            assert!(stats.leaf_pages() < 20);
+            assert!(stats.branch_pages() < 8);
+            for i in 0u64..8_000 {
+                assert_eq!(table.get(&i).unwrap().is_some(), i % 97 == 0);
+            }
+        }
+        write_txn.commit().unwrap();
     }
 }
