@@ -1,6 +1,6 @@
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchBuilder, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor,
-    LeafBuilder, LeafMutator, RawLeafBuilder,
+    LeafBuilder, LeafMutator, RawBranchBuilder, RawLeafBuilder,
 };
 use crate::tree_store::btree_mutator::DeletionResult::{
     DeletedBranch, DeletedLeaf, PartialBranch, PartialLeaf, Subtree,
@@ -11,8 +11,11 @@ use crate::tree_store::{
 };
 use crate::types::{Key, Value};
 use crate::{AccessGuard, Result};
-use std::cmp::{max, min};
+use std::borrow::Borrow;
+use std::cmp::{Ordering, max, min};
+use std::collections::Bound;
 use std::marker::PhantomData;
+use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 
 // Describes which entry to delete. `Key` navigates via key comparison; `First`
@@ -49,6 +52,93 @@ enum DeletionResult {
     // Indicates that the branch node was deleted, and includes the only remaining child.
     // Checksum is retained for the same reason as `PartialBranch`.
     DeletedBranch(PageNumber, Checksum),
+}
+
+#[derive(Debug)]
+enum RetainResult {
+    // A proper subtree
+    Subtree {
+        page: PageNumber,
+        changed: bool,
+    },
+    // A leaf with fewer entries than desired
+    PartialLeaf {
+        page: PageImpl,
+        // The entries to keep in the page
+        keep: Vec<usize>,
+    },
+    // A branch page subtree with fewer children than desired.
+    PartialBranch {
+        children: Vec<(PageNumber, Checksum)>,
+        keys: Vec<Vec<u8>>,
+    },
+    // A leaf or branch with zero children
+    Deleted,
+}
+
+struct RetainLeafOutput {
+    page: PageNumber,
+    checksum: Checksum,
+    max_key: Option<Vec<u8>>,
+}
+
+struct RetainBranchOutput {
+    page: PageNumber,
+    checksum: Checksum,
+    max_key: Option<Vec<u8>>,
+}
+
+struct KeyRange<'a, K: Key + ?Sized> {
+    start: Bound<&'a [u8]>,
+    end: Bound<&'a [u8]>,
+    _key: PhantomData<K>,
+}
+
+impl<K: Key + ?Sized> Copy for KeyRange<'_, K> {}
+
+impl<K: Key + ?Sized> Clone for KeyRange<'_, K> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, K: Key + ?Sized> KeyRange<'a, K> {
+    fn new(start: Bound<&'a [u8]>, end: Bound<&'a [u8]>) -> Self {
+        Self {
+            start,
+            end,
+            _key: PhantomData,
+        }
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        !self.less_than_start(key) && !self.greater_than_end(key)
+    }
+
+    fn less_than_start(&self, key: &[u8]) -> bool {
+        match self.start {
+            Bound::Included(start) => K::compare(key, start) == Ordering::Less,
+            Bound::Excluded(start) => K::compare(key, start) != Ordering::Greater,
+            Bound::Unbounded => false,
+        }
+    }
+
+    fn greater_than_end(&self, key: &[u8]) -> bool {
+        match self.end {
+            Bound::Included(end) => K::compare(key, end) == Ordering::Greater,
+            Bound::Excluded(end) => K::compare(key, end) != Ordering::Less,
+            Bound::Unbounded => false,
+        }
+    }
+
+    fn child_lower_bound_is_past_end(&self, lower_bound: &[u8]) -> bool {
+        match self.end {
+            Bound::Included(end) | Bound::Excluded(end) => {
+                K::compare(lower_bound, end) != Ordering::Less
+            }
+            Bound::Unbounded => false,
+        }
+    }
 }
 
 struct InsertionResult<'a, V: Value + 'static> {
@@ -145,6 +235,800 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         let mut found_key = None;
         let value = self.delete_target(DeleteTarget::Last, &mut found_key)?;
         Ok(value.map(|v| (found_key.take().unwrap(), v)))
+    }
+
+    pub(crate) fn retain_in_range<'r, KR, F>(
+        &mut self,
+        range: &'_ impl RangeBounds<KR>,
+        mut predicate: F,
+    ) -> Result
+    where
+        KR: Borrow<K::SelfType<'r>> + 'r,
+        F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+    {
+        assert!(self.modify_uncommitted);
+        let Some(header) = *self.root else {
+            return Ok(());
+        };
+
+        let start_tmp = match range.start_bound() {
+            Bound::Included(key) | Bound::Excluded(key) => Some(K::as_bytes(key.borrow())),
+            Bound::Unbounded => None,
+        };
+        let end_tmp = match range.end_bound() {
+            Bound::Included(key) | Bound::Excluded(key) => Some(K::as_bytes(key.borrow())),
+            Bound::Unbounded => None,
+        };
+        let start_bound = match (range.start_bound(), start_tmp.as_ref()) {
+            (Bound::Included(_), Some(bytes)) => Bound::Included(bytes.as_ref()),
+            (Bound::Excluded(_), Some(bytes)) => Bound::Excluded(bytes.as_ref()),
+            _ => Bound::Unbounded,
+        };
+        let end_bound = match (range.end_bound(), end_tmp.as_ref()) {
+            (Bound::Included(_), Some(bytes)) => Bound::Included(bytes.as_ref()),
+            (Bound::Excluded(_), Some(bytes)) => Bound::Excluded(bytes.as_ref()),
+            _ => Bound::Unbounded,
+        };
+        let bounds = KeyRange::<K>::new(start_bound, end_bound);
+
+        let root_page = self.page_allocator.get_page(header.root, PageHint::None)?;
+
+        let mut removed = 0;
+        let result = self.retain_walk(root_page, bounds, &mut predicate, &mut removed)?;
+
+        let new_length = header.length - removed;
+
+        *self.root = match result {
+            RetainResult::Subtree { page, changed } => {
+                let checksum = if changed { DEFERRED } else { header.checksum };
+                Some(BtreeHeader::new(page, checksum, new_length))
+            }
+            RetainResult::PartialLeaf { page, keep } => {
+                let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+                let mut builder = LeafBuilder::new(
+                    &self.page_allocator,
+                    &self.allocated,
+                    keep.len(),
+                    K::fixed_width(),
+                    V::fixed_width(),
+                );
+                for i in &keep {
+                    let entry = accessor.entry(*i).unwrap();
+                    builder.push(entry.key(), entry.value());
+                }
+                assert_eq!(keep.len() as u64, new_length);
+                let new_page = builder.build()?;
+                let page_number = page.get_page_number();
+                drop(page);
+                self.conditional_free(page_number);
+                Some(BtreeHeader::new(
+                    new_page.get_page_number(),
+                    DEFERRED,
+                    new_length,
+                ))
+            }
+            RetainResult::PartialBranch { children, keys } => {
+                if children.len() == 1 {
+                    let (child_page, child_checksum) = children[0];
+                    Some(BtreeHeader::new(child_page, child_checksum, new_length))
+                } else {
+                    let mut builder = BranchBuilder::new(
+                        &self.page_allocator,
+                        &self.allocated,
+                        children.len(),
+                        K::fixed_width(),
+                    );
+                    for (child_page, child_checksum) in &children {
+                        builder.push_child(*child_page, *child_checksum);
+                    }
+                    for key in &keys {
+                        builder.push_key(key);
+                    }
+                    Some(BtreeHeader::new(
+                        builder.build()?.get_page_number(),
+                        DEFERRED,
+                        new_length,
+                    ))
+                }
+            }
+            RetainResult::Deleted => None,
+        };
+
+        Ok(())
+    }
+
+    fn retain_walk<F>(
+        &mut self,
+        page: PageImpl,
+        bounds: KeyRange<'_, K>,
+        predicate: &mut F,
+        removed: &mut u64,
+    ) -> Result<RetainResult>
+    where
+        F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+    {
+        match page.memory()[0] {
+            LEAF => self.retain_walk_leaf(page, bounds, predicate, removed),
+            BRANCH => self.retain_walk_branch(page, bounds, predicate, removed),
+            _ => unreachable!(),
+        }
+    }
+
+    fn retain_walk_leaf<F>(
+        &mut self,
+        page: PageImpl,
+        bounds: KeyRange<'_, K>,
+        predicate: &mut F,
+        removed: &mut u64,
+    ) -> Result<RetainResult>
+    where
+        F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+    {
+        let page_number = page.get_page_number();
+        let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+        let num_pairs = accessor.num_pairs();
+        let mut keep = Vec::with_capacity(num_pairs);
+        let mut kept_count = 0;
+        let mut kept_bytes = 0;
+        for i in 0..num_pairs {
+            let entry = accessor.entry(i).unwrap();
+            let keep_entry = if bounds.contains(entry.key()) {
+                predicate(K::from_bytes(entry.key()), V::from_bytes(entry.value()))
+            } else {
+                true
+            };
+            if keep_entry {
+                keep.push(i);
+                kept_bytes += entry.key().len() + entry.value().len();
+                kept_count += 1;
+            } else {
+                *removed += 1;
+            }
+        }
+
+        if kept_count == num_pairs {
+            return Ok(RetainResult::Subtree {
+                page: page_number,
+                changed: false,
+            });
+        }
+
+        if kept_count == 0 {
+            drop(page);
+            self.conditional_free(page_number);
+            return Ok(RetainResult::Deleted);
+        }
+
+        let required_bytes = RawLeafBuilder::required_bytes(
+            kept_count,
+            kept_bytes,
+            K::fixed_width(),
+            V::fixed_width(),
+        );
+        if required_bytes < self.page_allocator.get_page_size() / 3 {
+            return Ok(RetainResult::PartialLeaf { page, keep });
+        }
+
+        let mut builder = LeafBuilder::new(
+            &self.page_allocator,
+            &self.allocated,
+            kept_count,
+            K::fixed_width(),
+            V::fixed_width(),
+        );
+        for i in keep {
+            let entry = accessor.entry(i).unwrap();
+            builder.push(entry.key(), entry.value());
+        }
+        let new_page = builder.build()?;
+        let new_page_number = new_page.get_page_number();
+        drop(new_page);
+        drop(page);
+        self.conditional_free(page_number);
+        Ok(RetainResult::Subtree {
+            page: new_page_number,
+            changed: true,
+        })
+    }
+
+    fn retain_walk_branch<F>(
+        &mut self,
+        page: PageImpl,
+        bounds: KeyRange<'_, K>,
+        predicate: &mut F,
+        removed: &mut u64,
+    ) -> Result<RetainResult>
+    where
+        F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+    {
+        let page_number = page.get_page_number();
+        let accessor = BranchAccessor::new(&page, K::fixed_width());
+        let child_count = accessor.count_children();
+        let mut children = Vec::with_capacity(child_count);
+        let mut any_child_changed = false;
+
+        for i in 0..child_count {
+            let child_page_number = accessor.child_page(i).unwrap();
+            if let Some(separator) = accessor.key(i) {
+                if bounds.less_than_start(separator) {
+                    // Skip, since the child subtree is strictly less than the bound
+                    children.push(RetainResult::Subtree {
+                        page: child_page_number,
+                        changed: false,
+                    });
+                    continue;
+                }
+                if i > 0
+                    && let Some(lower_bound_key) = accessor.key(i - 1)
+                    && bounds.child_lower_bound_is_past_end(lower_bound_key)
+                {
+                    // Skip, since the child subtree is strictly greater than the bound
+                    children.push(RetainResult::Subtree {
+                        page: child_page_number,
+                        changed: false,
+                    });
+                    continue;
+                }
+            }
+
+            let child_page_number = accessor.child_page(i).unwrap();
+            let child_page = self
+                .page_allocator
+                .get_page(child_page_number, PageHint::None)?;
+            let result = self.retain_walk(child_page, bounds, predicate, removed)?;
+            any_child_changed |= match result {
+                RetainResult::Subtree { changed, .. } => changed,
+                _ => true,
+            };
+            children.push(result);
+        }
+
+        if !any_child_changed {
+            return Ok(RetainResult::Subtree {
+                page: page_number,
+                changed: false,
+            });
+        }
+
+        if children
+            .iter()
+            .all(|result| matches!(result, RetainResult::Deleted))
+        {
+            drop(page);
+            self.conditional_free(page_number);
+            return Ok(RetainResult::Deleted);
+        }
+
+        let new_result = self.build_branch(page, children)?;
+
+        self.conditional_free(page_number);
+
+        Ok(new_result)
+    }
+
+    fn flush_accumulated_leaf_entries(
+        &mut self,
+        accumulated_entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        accumulated_bytes: &mut usize,
+        output: &mut Vec<RetainLeafOutput>,
+    ) -> Result {
+        if accumulated_entries.is_empty() {
+            return Ok(());
+        }
+
+        assert!(!accumulated_entries.is_empty());
+
+        let mut builder = LeafBuilder::new(
+            &self.page_allocator,
+            &self.allocated,
+            accumulated_entries.len(),
+            K::fixed_width(),
+            V::fixed_width(),
+        );
+        for (key, value) in accumulated_entries.iter() {
+            builder.push(key, value);
+        }
+
+        let max_key = accumulated_entries.last().unwrap().0.clone();
+        if builder.should_split() {
+            let (left, split_key, right) = builder.build_split()?;
+            output.push(RetainLeafOutput {
+                page: left.get_page_number(),
+                checksum: DEFERRED,
+                max_key: Some(split_key.to_vec()),
+            });
+            output.push(RetainLeafOutput {
+                page: right.get_page_number(),
+                checksum: DEFERRED,
+                max_key: Some(max_key),
+            });
+        } else {
+            let page = builder.build()?;
+            output.push(RetainLeafOutput {
+                page: page.get_page_number(),
+                checksum: DEFERRED,
+                max_key: Some(max_key),
+            });
+        }
+        accumulated_entries.clear();
+        *accumulated_bytes = 0;
+
+        Ok(())
+    }
+
+    fn leaf_outputs_to_partial_branch(output: Vec<RetainLeafOutput>) -> RetainResult {
+        assert!(!output.is_empty());
+
+        let mut children = Vec::with_capacity(output.len());
+        let mut keys = Vec::with_capacity(output.len().saturating_sub(1));
+        let last = output.len() - 1;
+        for (i, child) in output.into_iter().enumerate() {
+            children.push((child.page, child.checksum));
+            if i != last {
+                keys.push(
+                    child
+                        .max_key
+                        .expect("non-final leaf output must have a separator key"),
+                );
+            }
+        }
+
+        RetainResult::PartialBranch { children, keys }
+    }
+
+    // Returns a PartialBranch result
+    fn merge_partial_leaves(
+        &mut self,
+        self_page: &PageImpl,
+        mut child_results: Vec<RetainResult>,
+    ) -> Result<RetainResult> {
+        let accessor = BranchAccessor::new(self_page, K::fixed_width());
+        let mut output = Vec::new();
+        // Accumulates consecutive partial leaves into leaf pages.
+        let mut accumulated_entries: Vec<(Vec<u8>, Vec<u8>)> = vec![];
+        let mut accumulated_bytes = 0;
+
+        for (i, result) in child_results.drain(..).enumerate() {
+            match result {
+                RetainResult::Subtree { page, changed } => {
+                    let checksum = if changed {
+                        DEFERRED
+                    } else {
+                        accessor.child_checksum(i).unwrap()
+                    };
+                    let max_key = accessor.key(i).map(<[u8]>::to_vec);
+                    if accumulated_entries.is_empty() {
+                        output.push(RetainLeafOutput {
+                            page,
+                            checksum,
+                            max_key,
+                        });
+                    } else {
+                        let child_page = self.page_allocator.get_page(page, PageHint::None)?;
+                        let child_accessor = LeafAccessor::new(
+                            child_page.memory(),
+                            K::fixed_width(),
+                            V::fixed_width(),
+                        );
+                        let single_large_value = child_accessor.num_pairs() == 1
+                            && child_accessor.total_length() >= self.page_allocator.get_page_size();
+                        if single_large_value {
+                            drop(child_page);
+                            self.flush_accumulated_leaf_entries(
+                                &mut accumulated_entries,
+                                &mut accumulated_bytes,
+                                &mut output,
+                            )?;
+                            output.push(RetainLeafOutput {
+                                page,
+                                checksum,
+                                max_key,
+                            });
+                        } else {
+                            for j in 0..child_accessor.num_pairs() {
+                                let entry = child_accessor.entry(j).unwrap();
+                                accumulated_bytes += entry.key().len() + entry.value().len();
+                                accumulated_entries
+                                    .push((entry.key().to_vec(), entry.value().to_vec()));
+                            }
+                            drop(child_page);
+                            self.conditional_free(page);
+                            self.flush_accumulated_leaf_entries(
+                                &mut accumulated_entries,
+                                &mut accumulated_bytes,
+                                &mut output,
+                            )?;
+                        }
+                    }
+                }
+                RetainResult::PartialLeaf { page, keep } => {
+                    {
+                        let child_accessor =
+                            LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+                        for j in keep {
+                            let entry = child_accessor.entry(j).unwrap();
+                            accumulated_entries
+                                .push((entry.key().to_vec(), entry.value().to_vec()));
+                            accumulated_bytes += entry.key().len() + entry.value().len();
+                        }
+                    }
+                    let child_page_number = page.get_page_number();
+                    drop(page);
+                    self.conditional_free(child_page_number);
+                    let required_bytes = RawLeafBuilder::required_bytes(
+                        accumulated_entries.len(),
+                        accumulated_bytes,
+                        K::fixed_width(),
+                        V::fixed_width(),
+                    );
+                    if required_bytes > self.page_allocator.get_page_size() / 2 {
+                        self.flush_accumulated_leaf_entries(
+                            &mut accumulated_entries,
+                            &mut accumulated_bytes,
+                            &mut output,
+                        )?;
+                    }
+                }
+                RetainResult::PartialBranch { .. } => unreachable!(),
+                RetainResult::Deleted => {
+                    // no-op
+                }
+            }
+        }
+
+        self.flush_accumulated_leaf_entries(
+            &mut accumulated_entries,
+            &mut accumulated_bytes,
+            &mut output,
+        )?;
+
+        Ok(Self::leaf_outputs_to_partial_branch(output))
+    }
+
+    fn branch_required_bytes(
+        num_keys: usize,
+        keys: &[Vec<u8>],
+        fixed_key_size: Option<usize>,
+    ) -> usize {
+        let key_bytes = keys.iter().map(Vec::len).sum();
+        RawBranchBuilder::required_bytes(num_keys, key_bytes, fixed_key_size)
+    }
+
+    fn append_branch_parts(
+        children: Vec<(PageNumber, Checksum)>,
+        keys: Vec<Vec<u8>>,
+        max_key: Option<Vec<u8>>,
+        accumulated_children: &mut Vec<(PageNumber, Checksum)>,
+        accumulated_keys: &mut Vec<Vec<u8>>,
+        accumulated_max_key: &mut Option<Vec<u8>>,
+    ) {
+        assert!(!children.is_empty());
+        assert_eq!(children.len(), keys.len() + 1);
+        if !accumulated_children.is_empty() {
+            accumulated_keys.push(
+                accumulated_max_key
+                    .take()
+                    .expect("non-final accumulated branch must have a separator key"),
+            );
+        }
+        accumulated_children.extend(children);
+        accumulated_keys.extend(keys);
+        *accumulated_max_key = max_key;
+    }
+
+    fn append_branch_page(
+        &self,
+        page: PageNumber,
+        max_key: Option<Vec<u8>>,
+        accumulated_children: &mut Vec<(PageNumber, Checksum)>,
+        accumulated_keys: &mut Vec<Vec<u8>>,
+        accumulated_max_key: &mut Option<Vec<u8>>,
+    ) -> Result {
+        let page = self.page_allocator.get_page(page, PageHint::None)?;
+        let accessor = BranchAccessor::new(&page, K::fixed_width());
+        let mut children = Vec::with_capacity(accessor.count_children());
+        let mut keys = Vec::with_capacity(accessor.count_children() - 1);
+        for i in 0..accessor.count_children() {
+            children.push((
+                accessor.child_page(i).unwrap(),
+                accessor.child_checksum(i).unwrap(),
+            ));
+        }
+        for i in 0..(accessor.count_children() - 1) {
+            keys.push(accessor.key(i).unwrap().to_vec());
+        }
+
+        Self::append_branch_parts(
+            children,
+            keys,
+            max_key,
+            accumulated_children,
+            accumulated_keys,
+            accumulated_max_key,
+        );
+        Ok(())
+    }
+
+    fn flush_accumulated_branch_children(
+        &mut self,
+        accumulated_children: &mut Vec<(PageNumber, Checksum)>,
+        accumulated_keys: &mut Vec<Vec<u8>>,
+        accumulated_max_key: &mut Option<Vec<u8>>,
+        output: &mut Vec<RetainBranchOutput>,
+    ) -> Result {
+        if accumulated_children.is_empty() {
+            return Ok(());
+        }
+
+        if accumulated_children.len() == 1 {
+            if output.is_empty() {
+                let (page, checksum) = accumulated_children.pop().unwrap();
+                output.push(RetainBranchOutput {
+                    page,
+                    checksum,
+                    max_key: accumulated_max_key.take(),
+                });
+                return Ok(());
+            }
+
+            let previous = output.pop().unwrap();
+            let children = std::mem::take(accumulated_children);
+            let keys = std::mem::take(accumulated_keys);
+            let max_key = accumulated_max_key.take();
+            self.append_branch_page(
+                previous.page,
+                previous.max_key,
+                accumulated_children,
+                accumulated_keys,
+                accumulated_max_key,
+            )?;
+            self.conditional_free(previous.page);
+            Self::append_branch_parts(
+                children,
+                keys,
+                max_key,
+                accumulated_children,
+                accumulated_keys,
+                accumulated_max_key,
+            );
+        }
+
+        let mut builder = BranchBuilder::new(
+            &self.page_allocator,
+            &self.allocated,
+            accumulated_children.len(),
+            K::fixed_width(),
+        );
+        for (child, checksum) in accumulated_children.iter() {
+            builder.push_child(*child, *checksum);
+        }
+        for key in accumulated_keys.iter() {
+            builder.push_key(key);
+        }
+
+        let max_key = accumulated_max_key.take();
+        if builder.should_split() {
+            let (left, separator, right) = builder.build_split()?;
+            output.push(RetainBranchOutput {
+                page: left.get_page_number(),
+                checksum: DEFERRED,
+                max_key: Some(separator.to_vec()),
+            });
+            output.push(RetainBranchOutput {
+                page: right.get_page_number(),
+                checksum: DEFERRED,
+                max_key,
+            });
+        } else {
+            let page = builder.build()?;
+            output.push(RetainBranchOutput {
+                page: page.get_page_number(),
+                checksum: DEFERRED,
+                max_key,
+            });
+        }
+
+        accumulated_children.clear();
+        accumulated_keys.clear();
+        Ok(())
+    }
+
+    fn branch_outputs_to_partial_branch(output: Vec<RetainBranchOutput>) -> RetainResult {
+        assert!(!output.is_empty());
+
+        let mut children = Vec::with_capacity(output.len());
+        let mut keys = Vec::with_capacity(output.len().saturating_sub(1));
+        let last = output.len() - 1;
+        for (i, child) in output.into_iter().enumerate() {
+            children.push((child.page, child.checksum));
+            if i != last {
+                keys.push(
+                    child
+                        .max_key
+                        .expect("non-final branch output must have a separator key"),
+                );
+            }
+        }
+
+        RetainResult::PartialBranch { children, keys }
+    }
+
+    // Returns a PartialBranch result
+    fn merge_partial_branches(
+        &mut self,
+        self_page: &PageImpl,
+        mut child_results: Vec<RetainResult>,
+    ) -> Result<RetainResult> {
+        let accessor = BranchAccessor::new(self_page, K::fixed_width());
+        let mut output = Vec::new();
+        let mut accumulated_children = Vec::new();
+        let mut accumulated_keys = Vec::new();
+        let mut accumulated_max_key = None;
+
+        for (i, result) in child_results.drain(..).enumerate() {
+            let max_key = accessor.key(i).map(<[u8]>::to_vec);
+            match result {
+                RetainResult::Subtree { page, changed } => {
+                    let checksum = if changed {
+                        DEFERRED
+                    } else {
+                        accessor.child_checksum(i).unwrap()
+                    };
+                    if accumulated_children.is_empty() {
+                        output.push(RetainBranchOutput {
+                            page,
+                            checksum,
+                            max_key,
+                        });
+                    } else {
+                        self.append_branch_page(
+                            page,
+                            max_key,
+                            &mut accumulated_children,
+                            &mut accumulated_keys,
+                            &mut accumulated_max_key,
+                        )?;
+                        self.conditional_free(page);
+                        self.flush_accumulated_branch_children(
+                            &mut accumulated_children,
+                            &mut accumulated_keys,
+                            &mut accumulated_max_key,
+                            &mut output,
+                        )?;
+                    }
+                }
+                RetainResult::PartialBranch { children, keys } => {
+                    Self::append_branch_parts(
+                        children,
+                        keys,
+                        max_key,
+                        &mut accumulated_children,
+                        &mut accumulated_keys,
+                        &mut accumulated_max_key,
+                    );
+                    if Self::branch_required_bytes(
+                        accumulated_keys.len(),
+                        &accumulated_keys,
+                        K::fixed_width(),
+                    ) > self.page_allocator.get_page_size() / 2
+                    {
+                        self.flush_accumulated_branch_children(
+                            &mut accumulated_children,
+                            &mut accumulated_keys,
+                            &mut accumulated_max_key,
+                            &mut output,
+                        )?;
+                    }
+                }
+                RetainResult::PartialLeaf { .. } => unreachable!(),
+                RetainResult::Deleted => {
+                    // no-op
+                }
+            }
+        }
+
+        self.flush_accumulated_branch_children(
+            &mut accumulated_children,
+            &mut accumulated_keys,
+            &mut accumulated_max_key,
+            &mut output,
+        )?;
+
+        Ok(Self::branch_outputs_to_partial_branch(output))
+    }
+
+    fn build_branch(
+        &mut self,
+        page: PageImpl,
+        child_results: Vec<RetainResult>,
+    ) -> Result<RetainResult> {
+        let mut final_children = Vec::with_capacity(child_results.len());
+        let mut final_keys = Vec::with_capacity(child_results.len() - 1);
+        let accessor = BranchAccessor::new(&page, K::fixed_width());
+
+        let has_partial_leaves = child_results
+            .iter()
+            .any(|x| matches!(x, RetainResult::PartialLeaf { .. }));
+        let has_partial_branches = child_results
+            .iter()
+            .any(|x| matches!(x, RetainResult::PartialBranch { .. }));
+        assert!(
+            !(has_partial_leaves && has_partial_branches),
+            "Cannot have both partial leaves and branches in a branch node"
+        );
+
+        if has_partial_leaves {
+            match self.merge_partial_leaves(&page, child_results)? {
+                RetainResult::PartialBranch { children, keys } => {
+                    final_children = children;
+                    final_keys = keys;
+                }
+                _ => unreachable!(),
+            }
+        } else if has_partial_branches {
+            match self.merge_partial_branches(&page, child_results)? {
+                RetainResult::PartialBranch { children, keys } => {
+                    final_children = children;
+                    final_keys = keys;
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            let mut previous_max_key = None;
+            for (i, child_result) in child_results.iter().enumerate() {
+                match child_result {
+                    RetainResult::Subtree { page, changed } => {
+                        let checksum = if *changed {
+                            DEFERRED
+                        } else {
+                            accessor.child_checksum(i).unwrap()
+                        };
+                        if !final_children.is_empty() {
+                            final_keys.push(
+                                previous_max_key
+                                    .take()
+                                    .expect("non-final retained child must have a separator key"),
+                            );
+                        }
+                        final_children.push((*page, checksum));
+                        previous_max_key = accessor.key(i).map(<[u8]>::to_vec);
+                    }
+                    RetainResult::PartialLeaf { .. } | RetainResult::PartialBranch { .. } => {
+                        unreachable!()
+                    }
+                    RetainResult::Deleted => {}
+                }
+            }
+        }
+
+        assert!(!final_children.is_empty());
+
+        if final_children.len() == 1 {
+            return Ok(RetainResult::PartialBranch {
+                children: final_children,
+                keys: final_keys,
+            });
+        }
+
+        let mut builder = BranchBuilder::new(
+            &self.page_allocator,
+            &self.allocated,
+            final_children.len(),
+            K::fixed_width(),
+        );
+        for (page, checksum) in final_children {
+            builder.push_child(page, checksum);
+        }
+        for key in &final_keys {
+            builder.push_key(key);
+        }
+        let new_page = builder.build()?;
+        drop(page);
+
+        Ok(RetainResult::Subtree {
+            page: new_page.get_page_number(),
+            changed: true,
+        })
     }
 
     fn delete_target(
