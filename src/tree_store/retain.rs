@@ -32,7 +32,6 @@ pub(super) struct RetainBuilderContext<'a, K: Key, V: Value> {
     page_allocator: &'a PageAllocator,
     allocated: &'a Mutex<PageTrackerPolicy>,
     freed: &'a mut Vec<PageNumber>,
-    modify_uncommitted: bool,
     _types: PhantomData<(K, V)>,
 }
 
@@ -41,13 +40,11 @@ impl<'a, K: Key, V: Value> RetainBuilderContext<'a, K, V> {
         page_allocator: &'a PageAllocator,
         allocated: &'a Mutex<PageTrackerPolicy>,
         freed: &'a mut Vec<PageNumber>,
-        modify_uncommitted: bool,
     ) -> Self {
         Self {
             page_allocator,
             allocated,
             freed,
-            modify_uncommitted,
             _types: PhantomData,
         }
     }
@@ -57,15 +54,11 @@ impl<'a, K: Key, V: Value> RetainBuilderContext<'a, K, V> {
     }
 
     pub(super) fn conditional_free(&mut self, page_number: PageNumber) {
-        if self.modify_uncommitted {
-            let mut allocated = self.allocated.lock().unwrap();
-            if !self
-                .page_allocator
-                .free_if_uncommitted(page_number, &mut allocated)
-            {
-                self.freed.push(page_number);
-            }
-        } else {
+        let mut allocated = self.allocated.lock().unwrap();
+        if !self
+            .page_allocator
+            .free_if_uncommitted(page_number, &mut allocated)
+        {
             self.freed.push(page_number);
         }
     }

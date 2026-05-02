@@ -1880,6 +1880,126 @@ fn extract_from_if_empty() {
 }
 
 #[test]
+fn extract_if_large_table() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..30_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+
+        let mut count = 0u64;
+        let mut iter = table.extract_if(|key, _| key % 2 == 0).unwrap();
+        while iter.next().is_some() {
+            count += 1;
+        }
+        drop(iter);
+        assert_eq!(count, 15_000);
+        assert_eq!(table.len().unwrap(), 15_000);
+        for i in 0u64..30_000 {
+            let value = table.get(&i).unwrap();
+            assert_eq!(value.is_some(), i % 2 != 0);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_from_if_range() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..30_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+
+        let mut count = 0u64;
+        let mut iter = table
+            .extract_from_if(10_000u64..20_000, |key, _| key % 3 == 0)
+            .unwrap();
+        while iter.next().is_some() {
+            count += 1;
+        }
+        drop(iter);
+        // Multiples of 3 in [10_000, 20_000): 10_002, 10_005, ..., 19_998 -> 3_333 entries.
+        assert_eq!(count, 3_333);
+        for i in 0u64..30_000 {
+            let value = table.get(&i).unwrap();
+            let in_extract_range = (10_000..20_000).contains(&i);
+            let extracted = in_extract_range && i % 3 == 0;
+            assert_eq!(value.is_some(), !extracted);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_if_unread_entries_are_kept() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, u64> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..1000 {
+            table.insert(i, i).unwrap();
+        }
+        // Read only the first three matching entries; the rest must remain.
+        let mut iter = table.extract_if(|_, _| true).unwrap();
+        assert_eq!(iter.next().unwrap().unwrap().0.value(), 0);
+        assert_eq!(iter.next().unwrap().unwrap().0.value(), 1);
+        assert_eq!(iter.next().unwrap().unwrap().0.value(), 2);
+        drop(iter);
+        assert_eq!(table.len().unwrap(), 997);
+        for i in 0u64..1000 {
+            assert_eq!(table.get(&i).unwrap().is_some(), i >= 3);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_if_double_ended() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, u64> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..1000 {
+            table.insert(i, i).unwrap();
+        }
+        // Extract from both ends, alternating, until the cursors meet.
+        let mut iter = table.extract_if(|_, _| true).unwrap();
+        assert_eq!(iter.next().unwrap().unwrap().0.value(), 0);
+        assert_eq!(iter.next_back().unwrap().unwrap().0.value(), 999);
+        assert_eq!(iter.next().unwrap().unwrap().0.value(), 1);
+        assert_eq!(iter.next_back().unwrap().unwrap().0.value(), 998);
+        drop(iter);
+        assert_eq!(table.len().unwrap(), 996);
+        for i in 0u64..1000 {
+            let in_kept = (2..=997).contains(&i);
+            assert_eq!(table.get(&i).unwrap().is_some(), in_kept);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
 fn retain_in_empty() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();

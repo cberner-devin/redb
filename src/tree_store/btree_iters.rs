@@ -252,6 +252,10 @@ impl Iterator for AllPageNumbersBtreeIter {
     }
 }
 
+// Buffers keys yielded by the iterator and applies them as a single bulk
+// extract in `Drop`. Yielded `EntryGuard` values remain valid past the
+// iterator's drop because each holds an `Arc<[u8]>` page reference that
+// is independent of the page allocator's reuse state.
 pub(crate) struct BtreeExtractIf<
     'a,
     K: Key + 'static,
@@ -261,7 +265,8 @@ pub(crate) struct BtreeExtractIf<
     root: &'a mut Option<BtreeHeader>,
     inner: BtreeRangeIter<K, V>,
     predicate: F,
-    free_on_drop: Vec<PageNumber>,
+    forward_extracted: Vec<Vec<u8>>,
+    backward_extracted: Vec<Vec<u8>>,
     master_free_list: Arc<Mutex<Vec<PageNumber>>>,
     allocated: Arc<Mutex<PageTrackerPolicy>>,
     page_allocator: PageAllocator,
@@ -282,7 +287,8 @@ impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) ->
             root,
             inner,
             predicate,
-            free_on_drop: vec![],
+            forward_extracted: vec![],
+            backward_extracted: vec![],
             master_free_list,
             allocated,
             page_allocator,
@@ -299,20 +305,7 @@ impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> boo
         let mut item = self.inner.next();
         while let Some(Ok(ref entry)) = item {
             if (self.predicate)(entry.key(), entry.value()) {
-                let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new_do_not_modify(
-                    self.root,
-                    self.page_allocator.clone(),
-                    &mut self.free_on_drop,
-                    self.allocated.clone(),
-                );
-                match operation.delete(&entry.key()) {
-                    Ok(x) => {
-                        assert!(x.is_some());
-                    }
-                    Err(x) => {
-                        return Some(Err(x));
-                    }
-                }
+                self.forward_extracted.push(entry.key_data());
                 break;
             }
             item = self.inner.next();
@@ -328,20 +321,7 @@ impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> boo
         let mut item = self.inner.next_back();
         while let Some(Ok(ref entry)) = item {
             if (self.predicate)(entry.key(), entry.value()) {
-                let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new_do_not_modify(
-                    self.root,
-                    self.page_allocator.clone(),
-                    &mut self.free_on_drop,
-                    self.allocated.clone(),
-                );
-                match operation.delete(&entry.key()) {
-                    Ok(x) => {
-                        assert!(x.is_some());
-                    }
-                    Err(x) => {
-                        return Some(Err(x));
-                    }
-                }
+                self.backward_extracted.push(entry.key_data());
                 break;
             }
             item = self.inner.next_back();
@@ -355,16 +335,30 @@ impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> boo
 {
     fn drop(&mut self) {
         self.inner.close();
-        let mut master_free_list = self.master_free_list.lock().unwrap();
-        let mut allocated = self.allocated.lock().unwrap();
-        for page in self.free_on_drop.drain(..) {
-            if !self
-                .page_allocator
-                .free_if_uncommitted(page, &mut allocated)
-            {
-                master_free_list.push(page);
-            }
+
+        let mut sorted_keys = std::mem::take(&mut self.forward_extracted);
+        let mut backward = std::mem::take(&mut self.backward_extracted);
+        backward.reverse();
+        sorted_keys.append(&mut backward);
+
+        if sorted_keys.is_empty() {
+            return;
         }
+
+        let removed = sorted_keys.len() as u64;
+        let mut freed = vec![];
+        let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new(
+            self.root,
+            self.page_allocator.clone(),
+            &mut freed,
+            self.allocated.clone(),
+        );
+        // Drop cannot return errors. A storage failure here matches retain's
+        // mid-walk failure mode, leaving the caller to abort the transaction.
+        let _ = operation.extract_keys_in_range(&sorted_keys, removed);
+
+        let mut master_free_list = self.master_free_list.lock().unwrap();
+        master_free_list.extend(freed);
     }
 }
 

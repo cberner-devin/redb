@@ -2,6 +2,7 @@
 
 ## 4.2.0 - 2026-XX-XX
 * Optimize `Table::retain()` and `Table::retain_in()`. Some benchmarks on large tables show a 25x speedup.
+* Optimize `Table::extract_if()` and `Table::extract_from_if()` using the same streaming subtree builder used by `retain()`. The tree is no longer mutated per yielded entry; instead, all extractions are applied as a single bulk pass when the iterator is dropped.
 * Add `Table::entry()` and the associated `Entry`, `OccupiedEntry`, and `VacantEntry`
   types, mirroring `std::collections::BTreeMap::entry`. Supports `or_insert`,
   `or_insert_with`, `or_insert_with_key`, `and_modify`, and the usual `OccupiedEntry`
