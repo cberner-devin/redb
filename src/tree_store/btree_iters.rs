@@ -8,7 +8,7 @@ use crate::tree_store::{BtreeHeader, PageAllocator, PageNumber, PageResolver, Pa
 use crate::types::{Key, Value};
 use Bound::{Excluded, Included, Unbounded};
 use std::borrow::Borrow;
-use std::collections::Bound;
+use std::collections::{Bound, HashMap};
 use std::marker::PhantomData;
 use std::ops::{Range, RangeBounds};
 use std::sync::{Arc, Mutex};
@@ -252,6 +252,14 @@ impl Iterator for AllPageNumbersBtreeIter {
     }
 }
 
+// Captures the page-allocator state shared between the iterator and the
+// deferred batch removal at Drop.
+pub(crate) struct ExtractIfContext {
+    pub(crate) master_free_list: Arc<Mutex<Vec<PageNumber>>>,
+    pub(crate) allocated: Arc<Mutex<PageTrackerPolicy>>,
+    pub(crate) page_allocator: PageAllocator,
+}
+
 pub(crate) struct BtreeExtractIf<
     'a,
     K: Key + 'static,
@@ -261,10 +269,21 @@ pub(crate) struct BtreeExtractIf<
     root: &'a mut Option<BtreeHeader>,
     inner: BtreeRangeIter<K, V>,
     predicate: F,
+    // (leaf page number) -> entry indexes in that leaf that have been yielded
+    // and must be removed at finalize time. The inner Vec is built in walk
+    // order during iteration; mixed next()/next_back() may scramble it, so
+    // `extract_recorded` sorts each entry once before consuming it.
+    matched: HashMap<PageNumber, Vec<u16>>,
+    matched_count: u64,
+    // Owned bounds derived from the user's range. Unbounded -> None.
+    range_start: Bound<Vec<u8>>,
+    range_end: Bound<Vec<u8>>,
     free_on_drop: Vec<PageNumber>,
-    master_free_list: Arc<Mutex<Vec<PageNumber>>>,
-    allocated: Arc<Mutex<PageTrackerPolicy>>,
-    page_allocator: PageAllocator,
+    ctx: ExtractIfContext,
+    // Idempotency latch for `finalize`. When the high-level wrapper calls
+    // `finalize` explicitly to capture the rebuild Result, the auto-drop must
+    // skip the second call.
+    finalized: bool,
 }
 
 impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>
@@ -274,19 +293,70 @@ impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) ->
         root: &'a mut Option<BtreeHeader>,
         inner: BtreeRangeIter<K, V>,
         predicate: F,
-        master_free_list: Arc<Mutex<Vec<PageNumber>>>,
-        allocated: Arc<Mutex<PageTrackerPolicy>>,
-        page_allocator: PageAllocator,
+        range_start: Bound<Vec<u8>>,
+        range_end: Bound<Vec<u8>>,
+        ctx: ExtractIfContext,
     ) -> Self {
         Self {
             root,
             inner,
             predicate,
+            matched: HashMap::new(),
+            matched_count: 0,
+            range_start,
+            range_end,
             free_on_drop: vec![],
-            master_free_list,
-            allocated,
-            page_allocator,
+            ctx,
+            finalized: false,
         }
+    }
+
+    // Records the (leaf page, entry index) of the entry that the underlying
+    // BtreeRangeIter just yielded via the supplied state cursor (`left` for
+    // forward iteration, `right` for next_back).
+    fn record_match(state: Option<&RangeIterState>, matched: &mut HashMap<PageNumber, Vec<u16>>) {
+        if let Some(Leaf { page, entry, .. }) = state {
+            let index = u16::try_from(*entry).unwrap();
+            matched
+                .entry(page.get_page_number())
+                .or_default()
+                .push(index);
+        } else {
+            unreachable!("BtreeRangeIter must yield from a Leaf state");
+        }
+    }
+
+    // Run the deferred batch removal of all yielded entries. Idempotent —
+    // safe to call from both the high-level wrapper's Drop and the auto-drop.
+    pub(crate) fn finalize(&mut self) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        // Release the iterator's leaf cursors before mutating the tree.
+        // Otherwise outstanding `PageImpl` refs in `inner.left`/`inner.right`
+        // would block freeing leaves that are about to be rebuilt.
+        self.inner.close();
+        if self.matched_count == 0 {
+            return Ok(());
+        }
+        let mut helper = MutateHelper::<K, V>::new(
+            self.root,
+            self.ctx.page_allocator.clone(),
+            &mut self.free_on_drop,
+            self.ctx.allocated.clone(),
+        );
+        let start = match &self.range_start {
+            Bound::Included(k) => Bound::Included(k.as_slice()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let end = match &self.range_end {
+            Bound::Included(k) => Bound::Included(k.as_slice()),
+            Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        helper.extract_recorded(&mut self.matched, self.matched_count, start, end)
     }
 }
 
@@ -296,28 +366,18 @@ impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> boo
     type Item = Result<EntryGuard<K, V>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut item = self.inner.next();
-        while let Some(Ok(ref entry)) = item {
+        loop {
+            let item = self.inner.next()?;
+            let entry = match item {
+                Ok(e) => e,
+                Err(e) => return Some(Err(e)),
+            };
             if (self.predicate)(entry.key(), entry.value()) {
-                let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new_do_not_modify(
-                    self.root,
-                    self.page_allocator.clone(),
-                    &mut self.free_on_drop,
-                    self.allocated.clone(),
-                );
-                match operation.delete(&entry.key()) {
-                    Ok(x) => {
-                        assert!(x.is_some());
-                    }
-                    Err(x) => {
-                        return Some(Err(x));
-                    }
-                }
-                break;
+                Self::record_match(self.inner.left.as_ref(), &mut self.matched);
+                self.matched_count += 1;
+                return Some(Ok(entry));
             }
-            item = self.inner.next();
         }
-        item
     }
 }
 
@@ -325,28 +385,18 @@ impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> boo
     DoubleEndedIterator for BtreeExtractIf<'_, K, V, F>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let mut item = self.inner.next_back();
-        while let Some(Ok(ref entry)) = item {
+        loop {
+            let item = self.inner.next_back()?;
+            let entry = match item {
+                Ok(e) => e,
+                Err(e) => return Some(Err(e)),
+            };
             if (self.predicate)(entry.key(), entry.value()) {
-                let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new_do_not_modify(
-                    self.root,
-                    self.page_allocator.clone(),
-                    &mut self.free_on_drop,
-                    self.allocated.clone(),
-                );
-                match operation.delete(&entry.key()) {
-                    Ok(x) => {
-                        assert!(x.is_some());
-                    }
-                    Err(x) => {
-                        return Some(Err(x));
-                    }
-                }
-                break;
+                Self::record_match(self.inner.right.as_ref(), &mut self.matched);
+                self.matched_count += 1;
+                return Some(Ok(entry));
             }
-            item = self.inner.next_back();
         }
-        item
     }
 }
 
@@ -355,10 +405,17 @@ impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> boo
 {
     fn drop(&mut self) {
         self.inner.close();
-        let mut master_free_list = self.master_free_list.lock().unwrap();
-        let mut allocated = self.allocated.lock().unwrap();
+        if !self.finalized && !std::thread::panicking() {
+            // Internal-caller path (e.g. SystemTable). Drop swallows the error
+            // because we cannot return Result from Drop. Higher-level wrappers
+            // should call `finalize` explicitly to surface the error.
+            let _ = self.finalize();
+        }
+        let mut master_free_list = self.ctx.master_free_list.lock().unwrap();
+        let mut allocated = self.ctx.allocated.lock().unwrap();
         for page in self.free_on_drop.drain(..) {
             if !self
+                .ctx
                 .page_allocator
                 .free_if_uncommitted(page, &mut allocated)
             {

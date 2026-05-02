@@ -254,6 +254,132 @@ fn extract_if() {
 }
 
 #[test]
+fn extract_if_full_drain() {
+    // Drains every entry in a moderately deep tree and verifies the resulting
+    // root is empty. Exercises the streaming subtree builder's ability to
+    // collapse to None when all leaves are removed.
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..2000u64 {
+            table.insert(&i, &i).unwrap();
+        }
+        let mut count = 0u64;
+        for entry in table.extract_if(|_, _| true).unwrap() {
+            let (_k, _v) = entry.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 2000);
+        assert_eq!(table.len().unwrap(), 0);
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_if_interleaved_next_and_next_back() {
+    // Mixed forward/reverse iteration may record matched entries in non-tree
+    // order; the deferred rebuild must still see a sorted index list per leaf.
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..500u64 {
+            table.insert(&i, &i).unwrap();
+        }
+        let mut extracted = table.extract_if(|k, _| k % 3 == 0).unwrap();
+        // Interleave: pull a few from the front, then a few from the back, then
+        // a few more from the front.
+        let mut yielded: Vec<u64> = Vec::new();
+        for _ in 0..10 {
+            let (k, _) = extracted.next().unwrap().unwrap();
+            yielded.push(k.value());
+        }
+        for _ in 0..10 {
+            let (k, _) = extracted.next_back().unwrap().unwrap();
+            yielded.push(k.value());
+        }
+        for _ in 0..5 {
+            let (k, _) = extracted.next().unwrap().unwrap();
+            yielded.push(k.value());
+        }
+        drop(extracted);
+        for k in &yielded {
+            assert!(table.get(k).unwrap().is_none(), "{k} should be gone");
+        }
+        // Multiples of 3 not pulled should still be present.
+        for i in (0..500u64).filter(|i| i % 3 == 0 && !yielded.contains(i)) {
+            assert!(table.get(&i).unwrap().is_some(), "{i} should still exist");
+        }
+        // Non-multiples of 3 are untouched.
+        for i in (0..500u64).filter(|i| i % 3 != 0) {
+            assert_eq!(table.get(&i).unwrap().unwrap().value(), i);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_if_partial_consume_only_removes_yielded() {
+    // Regression: the deferred-rebuild iterator must remove only the entries
+    // the caller actually pulled, even when a large match-set is left
+    // unconsumed.
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..1000u64 {
+            table.insert(&i, &i).unwrap();
+        }
+        let mut extracted = table.extract_if(|_, _| true).unwrap();
+        // Yield exactly three entries, then drop the iterator.
+        for expected in 0..3u64 {
+            let (k, _) = extracted.next().unwrap().unwrap();
+            assert_eq!(k.value(), expected);
+        }
+        drop(extracted);
+        assert_eq!(table.len().unwrap(), 997);
+        for i in 0..3u64 {
+            assert!(table.get(&i).unwrap().is_none());
+        }
+        for i in 3..1000u64 {
+            assert_eq!(table.get(&i).unwrap().unwrap().value(), i);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_if_predicate_panic_poisons_transaction() {
+    use redb::CommitError;
+
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..32u64 {
+            table.insert(&i, &i).unwrap();
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut extracted = table
+                .extract_if(|k, _| if k == 5 { panic!() } else { false })
+                .unwrap();
+            // Pull until the predicate panics.
+            while extracted.next().is_some() {}
+        }));
+        assert!(result.is_err());
+    }
+    assert!(matches!(
+        write_txn.commit(),
+        Err(CommitError::TransactionPoisoned)
+    ));
+}
+
+#[test]
 fn retain() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();

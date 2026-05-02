@@ -3,7 +3,7 @@ use crate::tree_store::btree_base::{
     AccessGuardMut, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF,
     LeafAccessor, LeafPageMut, branch_checksum, leaf_checksum,
 };
-use crate::tree_store::btree_iters::BtreeExtractIf;
+use crate::tree_store::btree_iters::{BtreeExtractIf, ExtractIfContext};
 use crate::tree_store::btree_mutator::MutateHelper;
 use crate::tree_store::page_store::{Page, PageImpl, PageMut};
 use crate::tree_store::{
@@ -16,7 +16,7 @@ use crate::{AccessGuard, Result};
 use log::trace;
 use std::borrow::Borrow;
 use std::cmp::max;
-use std::collections::HashMap;
+use std::collections::{Bound, HashMap};
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
@@ -676,14 +676,30 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
         K: 'a0,
     {
         let iter = self.range(range)?;
+        // Capture owned bounds so the iterator can clip the deferred rebuild
+        // walk to the original range without borrowing from `range`.
+        let range_start = match range.start_bound() {
+            Bound::Included(k) => Bound::Included(K::as_bytes(k.borrow()).as_ref().to_vec()),
+            Bound::Excluded(k) => Bound::Excluded(K::as_bytes(k.borrow()).as_ref().to_vec()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let range_end = match range.end_bound() {
+            Bound::Included(k) => Bound::Included(K::as_bytes(k.borrow()).as_ref().to_vec()),
+            Bound::Excluded(k) => Bound::Excluded(K::as_bytes(k.borrow()).as_ref().to_vec()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
 
         let result = BtreeExtractIf::new(
             &mut self.root,
             iter,
             predicate,
-            self.freed_pages.clone(),
-            self.allocated_pages.clone(),
-            self.page_allocator.clone(),
+            range_start,
+            range_end,
+            ExtractIfContext {
+                master_free_list: self.freed_pages.clone(),
+                allocated: self.allocated_pages.clone(),
+                page_allocator: self.page_allocator.clone(),
+            },
         );
 
         Ok(result)

@@ -147,6 +147,11 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     /// `predicate` evaluates to `true` are returned in an iterator, and those which are read from the iterator are removed
     ///
     /// Note: values not read from the iterator will not be removed
+    ///
+    /// The predicate must not panic. If it panics, or if the deferred batch
+    /// removal fails when the iterator is dropped, the write transaction is
+    /// poisoned and [`crate::WriteTransaction::commit`] will return
+    /// [`crate::CommitError::TransactionPoisoned`].
     pub fn extract_if<F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
         predicate: F,
@@ -158,6 +163,11 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     /// `predicate` evaluates to `true` are returned in an iterator, and those which are read from the iterator are removed
     ///
     /// Note: values not read from the iterator will not be removed
+    ///
+    /// The predicate must not panic. If it panics, or if the deferred batch
+    /// removal fails when the iterator is dropped, the write transaction is
+    /// poisoned and [`crate::WriteTransaction::commit`] will return
+    /// [`crate::CommitError::TransactionPoisoned`].
     pub fn extract_from_if<'a, KR, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
         range: impl RangeBounds<KR> + 'a,
@@ -168,7 +178,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     {
         self.tree
             .extract_from_if(&range, predicate)
-            .map(ExtractIf::new)
+            .map(|inner| ExtractIf::new(inner, Some(self.transaction)))
     }
 
     /// Applies `predicate` to all key-value pairs. All entries for which
@@ -609,6 +619,10 @@ pub struct ExtractIf<
     F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
 > {
     inner: BtreeExtractIf<'a, K, V, F>,
+    // When `Some`, drop-time failures (panics during iteration, errors or
+    // panics during the deferred rebuild) poison this transaction. System
+    // tables pass `None` because they have no `commit()` surface.
+    poison_target: Option<&'a WriteTransaction>,
 }
 
 impl<
@@ -618,8 +632,43 @@ impl<
     F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
 > ExtractIf<'a, K, V, F>
 {
-    pub(crate) fn new(inner: BtreeExtractIf<'a, K, V, F>) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        inner: BtreeExtractIf<'a, K, V, F>,
+        poison_target: Option<&'a WriteTransaction>,
+    ) -> Self {
+        Self {
+            inner,
+            poison_target,
+        }
+    }
+}
+
+impl<
+    K: Key + 'static,
+    V: Value + 'static,
+    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+> Drop for ExtractIf<'_, K, V, F>
+{
+    fn drop(&mut self) {
+        if thread::panicking() {
+            // The thread is already unwinding (e.g. user predicate panicked
+            // during iteration). Don't perform the deferred mutation - the
+            // tree has not been touched yet and we'd risk a double panic.
+            // Just poison and let the auto-drop release pages.
+            if let Some(txn) = self.poison_target {
+                txn.poison();
+            }
+            return;
+        }
+        // Normal path: explicitly run the deferred batch removal so we can
+        // observe the error. The auto-drop of `inner` will see `finalized`
+        // and skip rebuilding a second time, but it will still release
+        // freed pages.
+        if self.inner.finalize().is_err()
+            && let Some(txn) = self.poison_target
+        {
+            txn.poison();
+        }
     }
 }
 
@@ -635,9 +684,14 @@ impl<
     fn next(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next()?;
         Some(entry.map(|entry| {
+            // Use `with_arc_page` so the returned guards share the page's
+            // immutable byte-slice without pinning the `PageImpl` ref count.
+            // The deferred batch removal at Drop frees the underlying leaves;
+            // user-held guards must not block that free.
             let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
-            let value = AccessGuard::with_page(page, value_range);
+            let arc = page.to_arc();
+            let key = AccessGuard::with_arc_page(arc.clone(), key_range);
+            let value = AccessGuard::with_arc_page(arc, value_range);
             (key, value)
         }))
     }
@@ -653,8 +707,9 @@ impl<
         let entry = self.inner.next_back()?;
         Some(entry.map(|entry| {
             let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
-            let value = AccessGuard::with_page(page, value_range);
+            let arc = page.to_arc();
+            let key = AccessGuard::with_arc_page(arc.clone(), key_range);
+            let value = AccessGuard::with_arc_page(arc, value_range);
             (key, value)
         }))
     }

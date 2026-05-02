@@ -2,6 +2,13 @@
 
 ## 4.2.0 - 2026-XX-XX
 * Optimize `Table::retain()` and `Table::retain_in()`. Some benchmarks on large tables show a 25x speedup.
+* Optimize `Table::extract_if()` and `Table::extract_from_if()`. The iterator now
+  defers all tree mutation until it is dropped, then performs a single streaming
+  rebuild walk over the touched range instead of an O(log n) re-walk per yielded
+  entry. The redb_benchmark `extract_if` workload runs about 56x faster.
+* `Table::extract_if()` and `Table::extract_from_if()` now poison the write
+  transaction if the predicate panics or if the deferred batch removal fails,
+  causing `WriteTransaction::commit()` to return `CommitError::TransactionPoisoned`.
 * Add `Table::entry()` and the associated `Entry`, `OccupiedEntry`, and `VacantEntry`
   types, mirroring `std::collections::BTreeMap::entry`. Supports `or_insert`,
   `or_insert_with`, `or_insert_with_key`, `and_modify`, and the usual `OccupiedEntry`

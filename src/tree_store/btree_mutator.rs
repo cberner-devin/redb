@@ -14,7 +14,7 @@ use crate::types::{Key, Value};
 use crate::{AccessGuard, Result};
 use std::borrow::Borrow;
 use std::cmp::{Ordering, max, min};
-use std::collections::Bound;
+use std::collections::{Bound, HashMap};
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
@@ -134,7 +134,6 @@ struct InsertionResult<'a, V: Value + 'static> {
 
 pub(crate) struct MutateHelper<'a, 'b, K: Key, V: Value> {
     root: &'b mut Option<BtreeHeader>,
-    modify_uncommitted: bool,
     page_allocator: PageAllocator,
     freed: &'b mut Vec<PageNumber>,
     allocated: Arc<Mutex<PageTrackerPolicy>>,
@@ -152,27 +151,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     ) -> Self {
         Self {
             root,
-            modify_uncommitted: true,
-            page_allocator,
-            freed,
-            allocated,
-            _key_type: PhantomData,
-            _value_type: PhantomData,
-            _lifetime: PhantomData,
-        }
-    }
-
-    // Creates a new mutator which will not modify any existing uncommitted pages, or free any existing pages.
-    // It will still queue pages for future freeing in the freed vec
-    pub(crate) fn new_do_not_modify(
-        root: &'b mut Option<BtreeHeader>,
-        page_allocator: PageAllocator,
-        freed: &'b mut Vec<PageNumber>,
-        allocated: Arc<Mutex<PageTrackerPolicy>>,
-    ) -> Self {
-        Self {
-            root,
-            modify_uncommitted: false,
             page_allocator,
             freed,
             allocated,
@@ -183,15 +161,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     }
 
     fn conditional_free(&mut self, page_number: PageNumber) {
-        if self.modify_uncommitted {
-            let mut allocated = self.allocated.lock().unwrap();
-            if !self
-                .page_allocator
-                .free_if_uncommitted(page_number, &mut allocated)
-            {
-                self.freed.push(page_number);
-            }
-        } else {
+        let mut allocated = self.allocated.lock().unwrap();
+        if !self
+            .page_allocator
+            .free_if_uncommitted(page_number, &mut allocated)
+        {
             self.freed.push(page_number);
         }
     }
@@ -224,7 +198,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         KR: Borrow<K::SelfType<'r>> + 'r,
         F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
     {
-        assert!(self.modify_uncommitted);
         let Some(header) = *self.root else {
             return Ok(());
         };
@@ -255,7 +228,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                 &self.page_allocator,
                 &self.allocated,
                 self.freed,
-                self.modify_uncommitted,
             );
             let mut builder = RetainSubtreeBuilder::new();
             let root_page = retain_context.get_page(header.root)?;
@@ -478,6 +450,221 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         Ok(RetainWalkResult::Changed)
     }
 
+    // Removes a precomputed set of (leaf page, entry index) pairs collected
+    // during a prior lazy walk of the tree (typically by `BtreeExtractIf`).
+    // Performs a single retain-style streaming rebuild: leaves whose page is
+    // not present in `matched` are returned as `Unchanged` without iterating
+    // their entries; matched leaves are rebuilt skipping the recorded indexes.
+    pub(crate) fn extract_recorded(
+        &mut self,
+        matched: &mut HashMap<PageNumber, Vec<u16>>,
+        matched_count: u64,
+        range_start: Bound<&[u8]>,
+        range_end: Bound<&[u8]>,
+    ) -> Result<()> {
+        let bounds = KeyRange::<K>::new(range_start, range_end);
+        if matched_count == 0 {
+            return Ok(());
+        }
+        let Some(header) = *self.root else {
+            return Ok(());
+        };
+
+        // Drop walks visit each matched leaf in tree order, but next/next_back
+        // interleaving can record indexes out of order within a leaf. Sort
+        // each per-leaf list once so the leaf rebuild can advance with a
+        // single forward cursor.
+        for indexes in matched.values_mut() {
+            indexes.sort_unstable();
+        }
+
+        let new_root = {
+            let mut ctx = RetainBuilderContext::<K, V>::new(
+                &self.page_allocator,
+                &self.allocated,
+                self.freed,
+            );
+            let mut builder = RetainSubtreeBuilder::new();
+            let root_page = ctx.get_page(header.root)?;
+            let result = Self::extract_walk(
+                &mut ctx,
+                root_page,
+                RetainWalkContext {
+                    checksum: header.checksum,
+                    upper_key: None,
+                    root_distance: 0,
+                },
+                bounds,
+                matched,
+                &mut builder,
+            )?;
+            match result {
+                RetainWalkResult::Unchanged(_) => Some(header),
+                RetainWalkResult::Changed => {
+                    if let Some((root, checksum)) = builder.finish_root(&mut ctx)? {
+                        Some(BtreeHeader::new(
+                            root,
+                            checksum,
+                            header.length - matched_count,
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        *self.root = new_root;
+
+        Ok(())
+    }
+
+    fn extract_walk(
+        ctx: &mut RetainBuilderContext<'_, K, V>,
+        page: PageImpl,
+        context: RetainWalkContext,
+        bounds: KeyRange<'_, K>,
+        matched: &HashMap<PageNumber, Vec<u16>>,
+        builder: &mut RetainSubtreeBuilder,
+    ) -> Result<RetainWalkResult> {
+        match page.memory()[0] {
+            LEAF => Self::extract_walk_leaf(ctx, page, context, matched, builder),
+            BRANCH => Self::extract_walk_branch(ctx, page, context, bounds, matched, builder),
+            _ => unreachable!(),
+        }
+    }
+
+    fn extract_walk_leaf(
+        ctx: &mut RetainBuilderContext<'_, K, V>,
+        page: PageImpl,
+        context: RetainWalkContext,
+        matched: &HashMap<PageNumber, Vec<u16>>,
+        builder: &mut RetainSubtreeBuilder,
+    ) -> Result<RetainWalkResult> {
+        let page_number = page.get_page_number();
+        let Some(removed_indexes) = matched.get(&page_number) else {
+            // No matches in this leaf - fast path, do not iterate entries.
+            return Ok(RetainWalkResult::Unchanged(RetainSubtree::new(
+                page_number,
+                context.checksum,
+                context.upper_key,
+                context.root_distance,
+            )));
+        };
+
+        debug_assert!(!removed_indexes.is_empty());
+        let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+        let num_pairs = accessor.num_pairs();
+        debug_assert!(removed_indexes.len() <= num_pairs);
+
+        if removed_indexes.len() == num_pairs {
+            drop(page);
+            ctx.conditional_free(page_number);
+            return Ok(RetainWalkResult::Changed);
+        }
+
+        let mut remove_cursor = 0usize;
+        for i in 0..num_pairs {
+            if remove_cursor < removed_indexes.len()
+                && usize::from(removed_indexes[remove_cursor]) == i
+            {
+                remove_cursor += 1;
+                continue;
+            }
+            let entry = accessor.entry(i).unwrap();
+            builder.push_leaf_entry(ctx, entry.key(), entry.value(), context.root_distance)?;
+        }
+        debug_assert_eq!(remove_cursor, removed_indexes.len());
+        drop(page);
+        ctx.conditional_free(page_number);
+        Ok(RetainWalkResult::Changed)
+    }
+
+    fn extract_walk_branch(
+        ctx: &mut RetainBuilderContext<'_, K, V>,
+        page: PageImpl,
+        context: RetainWalkContext,
+        bounds: KeyRange<'_, K>,
+        matched: &HashMap<PageNumber, Vec<u16>>,
+        builder: &mut RetainSubtreeBuilder,
+    ) -> Result<RetainWalkResult> {
+        let page_number = page.get_page_number();
+        let accessor = BranchAccessor::new(&page, K::fixed_width());
+        let child_count = accessor.count_children();
+        let mut pending_unchanged = Vec::new();
+        let child_root_distance = context.root_distance + 1;
+        let mut changed = false;
+
+        for i in 0..child_count {
+            let child_upper_key = if i + 1 < child_count {
+                Some(accessor.key(i).unwrap().to_vec())
+            } else {
+                context.upper_key.clone()
+            };
+            let below_start =
+                i + 1 < child_count && bounds.less_than_start(accessor.key(i).unwrap());
+            let above_end =
+                i > 0 && bounds.child_lower_bound_is_past_end(accessor.key(i - 1).unwrap());
+            if below_start || above_end {
+                pending_unchanged.push(RetainSubtree::branch_child(
+                    &accessor,
+                    context.upper_key.as_deref(),
+                    child_root_distance,
+                    i,
+                ));
+                continue;
+            }
+
+            let child_page_number = accessor.child_page(i).unwrap();
+            let child_checksum = accessor.child_checksum(i).unwrap();
+            let child_page = ctx.get_page(child_page_number)?;
+            let mut child_builder = RetainSubtreeBuilder::new();
+            let child = Self::extract_walk(
+                ctx,
+                child_page,
+                RetainWalkContext {
+                    checksum: child_checksum,
+                    upper_key: child_upper_key,
+                    root_distance: child_root_distance,
+                },
+                bounds,
+                matched,
+                &mut child_builder,
+            )?;
+            match child {
+                RetainWalkResult::Unchanged(node) => {
+                    debug_assert!(child_builder.is_empty());
+                    debug_assert_eq!(node.root_distance(), child_root_distance);
+                    pending_unchanged.push(node);
+                }
+                RetainWalkResult::Changed => {
+                    changed = true;
+                    for subtree in pending_unchanged.drain(..) {
+                        builder.push_subtree(ctx, subtree)?;
+                    }
+                    builder.append(ctx, child_builder)?;
+                }
+            }
+        }
+
+        if !changed {
+            return Ok(RetainWalkResult::Unchanged(RetainSubtree::new(
+                page_number,
+                context.checksum,
+                context.upper_key,
+                context.root_distance,
+            )));
+        }
+
+        for subtree in pending_unchanged {
+            builder.push_subtree(ctx, subtree)?;
+        }
+
+        drop(page);
+        ctx.conditional_free(page_number);
+
+        Ok(RetainWalkResult::Changed)
+    }
+
     fn delete_target(
         &mut self,
         target: DeleteTarget<'_>,
@@ -689,10 +876,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                         )
                     }
                 };
-                if self.page_allocator.uncommitted(page.get_page_number())
-                    && self.modify_uncommitted
-                    && has_inplace_space()
-                {
+                if self.page_allocator.uncommitted(page.get_page_number()) && has_inplace_space() {
                     let page_number = page.get_page_number();
                     let existing_value = if found {
                         let copied_value = accessor.entry(position).unwrap().value().to_vec();
@@ -747,7 +931,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     let page_number = page.get_page_number();
                     let existing_value = if found {
                         let (start, end) = accessor.value_range(position).unwrap();
-                        if self.modify_uncommitted && self.page_allocator.uncommitted(page_number) {
+                        if self.page_allocator.uncommitted(page_number) {
                             let arc = page.to_arc();
                             drop(page);
                             let mut allocated = self.allocated.lock().unwrap();
@@ -782,7 +966,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     let page_number = page.get_page_number();
                     let existing_value = if found {
                         let (start, end) = accessor.value_range(position).unwrap();
-                        if self.modify_uncommitted && self.page_allocator.uncommitted(page_number) {
+                        if self.page_allocator.uncommitted(page_number) {
                             let arc = page.to_arc();
                             drop(page);
                             let mut allocated = self.allocated.lock().unwrap();
@@ -859,7 +1043,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                 }
 
                 if sub_result.additional_sibling.is_none()
-                    && self.modify_uncommitted
                     && self.page_allocator.uncommitted(page.get_page_number())
                 {
                     let page_number = page.get_page_number();
@@ -962,7 +1145,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         key: &K::SelfType<'_>,
         value: &V::SelfType<'_>,
     ) -> Result<()> {
-        assert!(self.modify_uncommitted);
         let header = self.root.expect("Key not found (tree is empty)");
         self.insert_inplace_helper(
             self.page_allocator.get_page_mut(header.root)?,
@@ -1036,7 +1218,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         // The threshold matches the merge threshold (page_size/3) so that we use in-place
         // removal for all cases where the page won't need merging with a sibling.
         if uncommitted
-            && self.modify_uncommitted
             && new_required_bytes >= self.page_allocator.get_page_size() / 3
             && accessor.num_pairs() > 1
         {
@@ -1090,7 +1271,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             Subtree(new_page.get_page_number())
         };
         let (key_range, value_range) = accessor.entry_ranges(position).unwrap();
-        let guard = if uncommitted && self.modify_uncommitted {
+        let guard = if uncommitted {
             let page_number = page.get_page_number();
             let arc = page.to_arc();
             drop(page);
@@ -1167,9 +1348,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                 return Ok((Subtree(original_page_number), found));
             }
 
-            let result_page = if self.page_allocator.uncommitted(original_page_number)
-                && self.modify_uncommitted
-            {
+            let result_page = if self.page_allocator.uncommitted(original_page_number) {
                 drop(page);
                 let mut mutpage = self.page_allocator.get_page_mut(original_page_number)?;
                 let mut mutator = BranchMutator::new(mutpage.memory_mut());
