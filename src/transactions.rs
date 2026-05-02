@@ -438,7 +438,7 @@ impl<'s, K: Key + 'static, V: Value + 'static> SystemTable<'s, K, V> {
         &mut self,
         range: impl RangeBounds<KR> + 'a,
         predicate: F,
-    ) -> Result<ExtractIf<'_, K, V, F>>
+    ) -> Result<ExtractIf<'_, K, V>>
     where
         KR: Borrow<K::SelfType<'a>> + 'a,
     {

@@ -2,6 +2,7 @@ mod btree;
 mod btree_base;
 mod btree_iters;
 mod btree_mutator;
+mod extract;
 mod multimap_btree;
 mod page_store;
 mod retain;

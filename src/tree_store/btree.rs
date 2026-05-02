@@ -662,31 +662,38 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
     }
 
     pub(crate) fn extract_from_if<
-        'a,
         'a0,
         T: RangeBounds<KR> + 'a0,
         KR: Borrow<K::SelfType<'a0>> + 'a0,
         F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
     >(
-        &'a mut self,
+        &mut self,
         range: &'_ T,
         predicate: F,
-    ) -> Result<BtreeExtractIf<'a, K, V, F>>
+    ) -> Result<BtreeExtractIf<K, V>>
     where
         K: 'a0,
     {
-        let iter = self.range(range)?;
-
-        let result = BtreeExtractIf::new(
+        let mut freed = vec![];
+        let result = crate::tree_store::extract::extract_from_if::<K, V, KR, F>(
             &mut self.root,
-            iter,
+            &self.page_allocator,
+            &self.allocated_pages,
+            &mut freed,
+            range,
             predicate,
+        )?;
+        let mut freed_pages = self.freed_pages.lock().unwrap();
+        freed_pages.extend(freed);
+        drop(freed_pages);
+
+        Ok(BtreeExtractIf::new(
+            result.buffer,
+            result.deferred_free,
             self.freed_pages.clone(),
             self.allocated_pages.clone(),
             self.page_allocator.clone(),
-        );
-
-        Ok(result)
+        ))
     }
 
     pub(crate) fn retain_in<'a, KR, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(

@@ -144,31 +144,43 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     }
 
     /// Applies `predicate` to all key-value pairs. All entries for which
-    /// `predicate` evaluates to `true` are returned in an iterator, and those which are read from the iterator are removed
+    /// `predicate` evaluates to `true` are removed and returned in an iterator.
     ///
-    /// Note: values not read from the iterator will not be removed
+    /// All matching entries are removed when this method is called, regardless of whether
+    /// the returned iterator is fully consumed.
+    ///
+    /// The predicate must not panic. If it panics, the write transaction is poisoned and
+    /// [`crate::WriteTransaction::commit`] will return [`crate::CommitError::TransactionPoisoned`].
     pub fn extract_if<F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
         predicate: F,
-    ) -> Result<ExtractIf<'_, K, V, F>> {
+    ) -> Result<ExtractIf<'_, K, V>> {
         self.extract_from_if::<K::SelfType<'_>, F>(.., predicate)
     }
 
     /// Applies `predicate` to all key-value pairs in the specified range. All entries for which
-    /// `predicate` evaluates to `true` are returned in an iterator, and those which are read from the iterator are removed
+    /// `predicate` evaluates to `true` are removed and returned in an iterator.
     ///
-    /// Note: values not read from the iterator will not be removed
+    /// All matching entries are removed when this method is called, regardless of whether
+    /// the returned iterator is fully consumed.
+    ///
+    /// The predicate must not panic. If it panics, the write transaction is poisoned and
+    /// [`crate::WriteTransaction::commit`] will return [`crate::CommitError::TransactionPoisoned`].
     pub fn extract_from_if<'a, KR, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
         range: impl RangeBounds<KR> + 'a,
         predicate: F,
-    ) -> Result<ExtractIf<'_, K, V, F>>
+    ) -> Result<ExtractIf<'_, K, V>>
     where
         KR: Borrow<K::SelfType<'a>> + 'a,
     {
-        self.tree
+        let mut panic_guard = RetainPanicGuard::new(self.transaction);
+        let result = self
+            .tree
             .extract_from_if(&range, predicate)
-            .map(ExtractIf::new)
+            .map(ExtractIf::new);
+        panic_guard.disarm();
+        result
     }
 
     /// Applies `predicate` to all key-value pairs. All entries for which
@@ -602,34 +614,21 @@ impl<K: Key + 'static, V: Value + 'static> Debug for ReadOnlyTable<K, V> {
     }
 }
 
-pub struct ExtractIf<
-    'a,
-    K: Key + 'static,
-    V: Value + 'static,
-    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
-> {
-    inner: BtreeExtractIf<'a, K, V, F>,
+pub struct ExtractIf<'a, K: Key + 'static, V: Value + 'static> {
+    inner: BtreeExtractIf<K, V>,
+    _lifetime: PhantomData<&'a ()>,
 }
 
-impl<
-    'a,
-    K: Key + 'static,
-    V: Value + 'static,
-    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
-> ExtractIf<'a, K, V, F>
-{
-    pub(crate) fn new(inner: BtreeExtractIf<'a, K, V, F>) -> Self {
-        Self { inner }
+impl<K: Key + 'static, V: Value + 'static> ExtractIf<'_, K, V> {
+    pub(crate) fn new(inner: BtreeExtractIf<K, V>) -> Self {
+        Self {
+            inner,
+            _lifetime: PhantomData,
+        }
     }
 }
 
-impl<
-    'a,
-    K: Key + 'static,
-    V: Value + 'static,
-    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
-> Iterator for ExtractIf<'a, K, V, F>
-{
+impl<'a, K: Key + 'static, V: Value + 'static> Iterator for ExtractIf<'a, K, V> {
     type Item = Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -643,12 +642,7 @@ impl<
     }
 }
 
-impl<
-    K: Key + 'static,
-    V: Value + 'static,
-    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
-> DoubleEndedIterator for ExtractIf<'_, K, V, F>
-{
+impl<K: Key + 'static, V: Value + 'static> DoubleEndedIterator for ExtractIf<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next_back()?;
         Some(entry.map(|entry| {

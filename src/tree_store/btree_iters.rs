@@ -2,13 +2,12 @@ use crate::Result;
 use crate::tree_store::btree_base::{BRANCH, LEAF};
 use crate::tree_store::btree_base::{BranchAccessor, LeafAccessor};
 use crate::tree_store::btree_iters::RangeIterState::{Internal, Leaf};
-use crate::tree_store::btree_mutator::MutateHelper;
 use crate::tree_store::page_store::{Page, PageHint, PageImpl};
-use crate::tree_store::{BtreeHeader, PageAllocator, PageNumber, PageResolver, PageTrackerPolicy};
+use crate::tree_store::{PageAllocator, PageNumber, PageResolver, PageTrackerPolicy};
 use crate::types::{Key, Value};
 use Bound::{Excluded, Included, Unbounded};
 use std::borrow::Borrow;
-use std::collections::Bound;
+use std::collections::{Bound, VecDeque};
 use std::marker::PhantomData;
 use std::ops::{Range, RangeBounds};
 use std::sync::{Arc, Mutex};
@@ -157,7 +156,7 @@ pub(crate) struct EntryGuard<K: Key, V: Value> {
 }
 
 impl<K: Key, V: Value> EntryGuard<K, V> {
-    fn new(page: PageImpl, key_range: Range<usize>, value_range: Range<usize>) -> Self {
+    pub(super) fn new(page: PageImpl, key_range: Range<usize>, value_range: Range<usize>) -> Self {
         Self {
             page,
             key_range,
@@ -252,37 +251,29 @@ impl Iterator for AllPageNumbersBtreeIter {
     }
 }
 
-pub(crate) struct BtreeExtractIf<
-    'a,
-    K: Key + 'static,
-    V: Value + 'static,
-    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
-> {
-    root: &'a mut Option<BtreeHeader>,
-    inner: BtreeRangeIter<K, V>,
-    predicate: F,
-    free_on_drop: Vec<PageNumber>,
+// Buffer-backed iterator returned by `BtreeMut::extract_from_if`. Extraction is performed
+// eagerly in a single tree walk; this iterator drains pre-built `EntryGuard`s and defers
+// freeing the original leaf pages until it is dropped, since the buffered guards reference
+// those pages' bytes.
+pub(crate) struct BtreeExtractIf<K: Key + 'static, V: Value + 'static> {
+    buffer: VecDeque<EntryGuard<K, V>>,
+    deferred_free: Vec<PageNumber>,
     master_free_list: Arc<Mutex<Vec<PageNumber>>>,
     allocated: Arc<Mutex<PageTrackerPolicy>>,
     page_allocator: PageAllocator,
 }
 
-impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>
-    BtreeExtractIf<'a, K, V, F>
-{
+impl<K: Key, V: Value> BtreeExtractIf<K, V> {
     pub(crate) fn new(
-        root: &'a mut Option<BtreeHeader>,
-        inner: BtreeRangeIter<K, V>,
-        predicate: F,
+        buffer: VecDeque<EntryGuard<K, V>>,
+        deferred_free: Vec<PageNumber>,
         master_free_list: Arc<Mutex<Vec<PageNumber>>>,
         allocated: Arc<Mutex<PageTrackerPolicy>>,
         page_allocator: PageAllocator,
     ) -> Self {
         Self {
-            root,
-            inner,
-            predicate,
-            free_on_drop: vec![],
+            buffer,
+            deferred_free,
             master_free_list,
             allocated,
             page_allocator,
@@ -290,74 +281,29 @@ impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) ->
     }
 }
 
-impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool> Iterator
-    for BtreeExtractIf<'_, K, V, F>
-{
+impl<K: Key, V: Value> Iterator for BtreeExtractIf<K, V> {
     type Item = Result<EntryGuard<K, V>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut item = self.inner.next();
-        while let Some(Ok(ref entry)) = item {
-            if (self.predicate)(entry.key(), entry.value()) {
-                let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new_do_not_modify(
-                    self.root,
-                    self.page_allocator.clone(),
-                    &mut self.free_on_drop,
-                    self.allocated.clone(),
-                );
-                match operation.delete(&entry.key()) {
-                    Ok(x) => {
-                        assert!(x.is_some());
-                    }
-                    Err(x) => {
-                        return Some(Err(x));
-                    }
-                }
-                break;
-            }
-            item = self.inner.next();
-        }
-        item
+        self.buffer.pop_front().map(Ok)
     }
 }
 
-impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>
-    DoubleEndedIterator for BtreeExtractIf<'_, K, V, F>
-{
+impl<K: Key, V: Value> DoubleEndedIterator for BtreeExtractIf<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let mut item = self.inner.next_back();
-        while let Some(Ok(ref entry)) = item {
-            if (self.predicate)(entry.key(), entry.value()) {
-                let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new_do_not_modify(
-                    self.root,
-                    self.page_allocator.clone(),
-                    &mut self.free_on_drop,
-                    self.allocated.clone(),
-                );
-                match operation.delete(&entry.key()) {
-                    Ok(x) => {
-                        assert!(x.is_some());
-                    }
-                    Err(x) => {
-                        return Some(Err(x));
-                    }
-                }
-                break;
-            }
-            item = self.inner.next_back();
-        }
-        item
+        self.buffer.pop_back().map(Ok)
     }
 }
 
-impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool> Drop
-    for BtreeExtractIf<'_, K, V, F>
-{
+impl<K: Key, V: Value> Drop for BtreeExtractIf<K, V> {
     fn drop(&mut self) {
-        self.inner.close();
-        let mut master_free_list = self.master_free_list.lock().unwrap();
+        // Drop any remaining buffered guards first so the page Arc refcounts settle, then
+        // hand the deferred pages back to the allocator (or queue them for commit-time free
+        // if they are already committed).
+        self.buffer.clear();
         let mut allocated = self.allocated.lock().unwrap();
-        for page in self.free_on_drop.drain(..) {
+        let mut master_free_list = self.master_free_list.lock().unwrap();
+        for page in self.deferred_free.drain(..) {
             if !self
                 .page_allocator
                 .free_if_uncommitted(page, &mut allocated)

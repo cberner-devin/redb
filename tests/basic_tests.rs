@@ -200,20 +200,31 @@ fn extract_if() {
         for i in 0..10 {
             table.insert(&i, &i).unwrap();
         }
-        // Test retain uncommitted data
+        // Eager extraction: every matching entry is removed when the iterator is created,
+        // regardless of how many entries the caller actually pulls.
         let mut extracted = table.extract_if(|k, _| k >= 5).unwrap();
-        assert_eq!(extracted.next().unwrap().unwrap().0.value(), 5);
+        let mut yielded = vec![];
+        while let Some(entry) = extracted.next() {
+            yielded.push(entry.unwrap().0.value());
+        }
+        assert_eq!(yielded, [5, 6, 7, 8, 9]);
         drop(extracted);
-        assert_eq!(table.len().unwrap(), 9);
+        assert_eq!(table.len().unwrap(), 5);
 
-        let mut extracted = table.extract_from_if(5.., |k, _| k < 8).unwrap();
+        // Re-insert the removed entries before testing the bounded variant
+        for i in 5..10 {
+            table.insert(&i, &i).unwrap();
+        }
+        assert_eq!(table.len().unwrap(), 10);
+
+        let mut extracted = table.extract_from_if(6.., |k, _| k < 8).unwrap();
         assert_eq!(extracted.next().unwrap().unwrap().0.value(), 6);
         assert_eq!(extracted.next().unwrap().unwrap().0.value(), 7);
         assert!(extracted.next().is_none());
         drop(extracted);
-        assert_eq!(table.len().unwrap(), 7);
+        assert_eq!(table.len().unwrap(), 8);
 
-        for i in 5..8 {
+        for i in [6, 7] {
             assert!(table.insert(&i, &i).unwrap().is_none());
         }
         assert_eq!(table.len().unwrap(), 10);
@@ -225,9 +236,10 @@ fn extract_if() {
         let mut table = write_txn.open_table(U64_TABLE).unwrap();
         assert_eq!(table.len().unwrap(), 10);
         let mut extracted = table.extract_if(|_, _| true).unwrap();
+        // Only consume the first entry, but eager removal already cleared the table
         assert_eq!(extracted.next().unwrap().unwrap().1.value(), 0);
         drop(extracted);
-        assert_eq!(table.len().unwrap(), 9);
+        assert_eq!(table.len().unwrap(), 0);
     }
     write_txn.abort().unwrap();
 
@@ -236,6 +248,7 @@ fn extract_if() {
         let mut table = write_txn.open_table(U64_TABLE).unwrap();
         assert_eq!(table.len().unwrap(), 10);
         for _ in table.extract_if(|x, _| x % 2 != 0).unwrap() {}
+        // Eager: this empties the table regardless of how the iterator is consumed
         table.extract_if(|_, _| true).unwrap().next_back();
     }
     write_txn.commit().unwrap();
@@ -243,13 +256,8 @@ fn extract_if() {
     let read_txn = db.begin_write().unwrap();
     {
         let table = read_txn.open_table(U64_TABLE).unwrap();
-        assert_eq!(table.len().unwrap(), 4);
-        let mut iter = table.iter().unwrap();
-        for x in [0, 2, 4, 6] {
-            let (k, v) = iter.next().unwrap().unwrap();
-            assert_eq!(k.value(), x);
-            assert_eq!(k.value(), v.value());
-        }
+        assert_eq!(table.len().unwrap(), 0);
+        assert!(table.iter().unwrap().next().is_none());
     }
 }
 
@@ -2122,6 +2130,181 @@ fn retain_predicate_panic_poisons_transaction() {
                 .retain(|key, _| {
                     assert_ne!(key, 2, "retain predicate panic");
                     key != 0
+                })
+                .unwrap();
+        }));
+        assert!(result.is_err());
+    }
+
+    assert!(matches!(
+        write_txn.commit(),
+        Err(CommitError::TransactionPoisoned)
+    ));
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(definition).unwrap();
+    assert_eq!(table.len().unwrap(), 4);
+    for i in 0u64..4 {
+        assert_eq!(table.get(i).unwrap().unwrap().value(), i);
+    }
+    assert!(table.get(4).unwrap().is_none());
+}
+
+#[test]
+fn extract_if_predicate_not_called_outside_range() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, u64> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..1000 {
+            table.insert(i, i).unwrap();
+        }
+
+        let mut called = false;
+        let mut iter = table
+            .extract_from_if(2000..3000, |_, _| {
+                called = true;
+                true
+            })
+            .unwrap();
+        assert!(iter.next().is_none());
+        drop(iter);
+        assert!(!called);
+        assert_eq!(table.len().unwrap(), 1000);
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_in_rebuilds_range_boundaries() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..30_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+        let height_before = table.stats().unwrap().tree_height();
+
+        let extracted: Vec<u64> = table
+            .extract_from_if(10_000..20_000, |key, _| key != 15_000)
+            .unwrap()
+            .map(|res| res.unwrap().0.value())
+            .collect();
+        assert_eq!(extracted.len(), 9_999);
+        assert_eq!(extracted[0], 10_000);
+        assert_eq!(extracted[extracted.len() - 1], 19_999);
+        assert!(!extracted.contains(&15_000));
+
+        assert_eq!(table.len().unwrap(), 20_001);
+        let stats = table.stats().unwrap();
+        assert!(stats.tree_height() <= height_before);
+        assert!(stats.leaf_pages() < 2_100);
+        assert!(table.get(&9_999).unwrap().is_some());
+        assert!(table.get(&10_000).unwrap().is_none());
+        assert!(table.get(&14_999).unwrap().is_none());
+        assert!(table.get(&15_000).unwrap().is_some());
+        assert!(table.get(&15_001).unwrap().is_none());
+        assert!(table.get(&19_999).unwrap().is_none());
+        assert!(table.get(&20_000).unwrap().is_some());
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_alternating_yields_and_removes() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 200]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..20_000 {
+            table.insert(i, &[0u8; 200]).unwrap();
+        }
+
+        let mut yielded: Vec<u64> = Vec::new();
+        for entry in table.extract_if(|key, _| key % 2 == 1).unwrap() {
+            yielded.push(entry.unwrap().0.value());
+        }
+        assert_eq!(yielded.len(), 10_000);
+        assert!(
+            yielded
+                .iter()
+                .enumerate()
+                .all(|(i, &k)| k == 2 * i as u64 + 1)
+        );
+
+        assert_eq!(table.len().unwrap(), 10_000);
+        assert!(table.stats().unwrap().leaf_pages() < 2_500);
+        for i in 0u64..20_000 {
+            assert_eq!(table.get(&i).unwrap().is_some(), i % 2 == 0);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
+fn extract_drops_pages_held_by_unread_iterator() {
+    // Even if the caller drops the iterator without consuming it, the matching entries are
+    // already gone from the table.
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 100]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..5_000 {
+            table.insert(i, &[1u8; 100]).unwrap();
+        }
+        let iter = table.extract_if(|key, _| key % 3 == 0).unwrap();
+        drop(iter);
+        for i in 0u64..5_000 {
+            assert_eq!(table.get(&i).unwrap().is_some(), i % 3 != 0);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[cfg(not(target_os = "wasi"))]
+#[test]
+fn extract_predicate_panic_poisons_transaction() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, u64> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..4 {
+            table.insert(i, i).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        table.insert(4, 4).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = table
+                .extract_if(|key, _| {
+                    assert_ne!(key, 2, "extract predicate panic");
+                    key == 0
                 })
                 .unwrap();
         }));

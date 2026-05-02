@@ -2,6 +2,15 @@
 
 ## 4.2.0 - 2026-XX-XX
 * Optimize `Table::retain()` and `Table::retain_in()`. Some benchmarks on large tables show a 25x speedup.
+* Optimize `Table::extract_if()` and `Table::extract_from_if()` using the same streaming
+  rebuild used by `retain()`. The predicate now runs eagerly when the iterator is created,
+  and all matching entries are removed regardless of whether the returned iterator is fully
+  consumed (matching `std::collections::BTreeMap::extract_if`'s behavior). The previous
+  contract documented that unread entries would not be removed; that contract no longer
+  applies.
+* `Table::extract_if()` and `Table::extract_from_if()` now poison the write transaction if
+  their predicate panics, causing `WriteTransaction::commit()` to return
+  `CommitError::TransactionPoisoned`.
 * Add `Table::entry()` and the associated `Entry`, `OccupiedEntry`, and `VacantEntry`
   types, mirroring `std::collections::BTreeMap::entry`. Supports `or_insert`,
   `or_insert_with`, `or_insert_with_key`, `and_modify`, and the usual `OccupiedEntry`
