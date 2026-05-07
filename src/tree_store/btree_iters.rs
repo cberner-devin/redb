@@ -10,6 +10,7 @@ use std::borrow::Borrow;
 use std::collections::Bound;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeBounds};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 enum RangeIterState {
@@ -147,6 +148,14 @@ impl RangeSubtree {
 
     pub(crate) fn root_distance(&self) -> u32 {
         self.root_distance
+    }
+
+    pub(crate) fn upper_key(&self) -> Option<&[u8]> {
+        self.upper_key.as_deref()
+    }
+
+    pub(crate) fn child_root_distance(&self) -> u32 {
+        self.root_distance + 1
     }
 
     pub(crate) fn into_parts(self) -> (PageNumber, Checksum, Option<Vec<u8>>, u32) {
@@ -517,6 +526,10 @@ impl<K: Key, V: Value> EntryGuard<K, V> {
     pub(crate) fn into_raw(self) -> (PageImpl, Range<usize>, Range<usize>) {
         (self.page, self.key_range, self.value_range)
     }
+
+    pub(crate) fn into_arc_page_raw(self) -> (Arc<[u8]>, Range<usize>, Range<usize>) {
+        (self.page.to_arc(), self.key_range, self.value_range)
+    }
 }
 
 pub(crate) struct AllPageNumbersBtreeIter {
@@ -747,6 +760,22 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         self.right = None;
         self.include_right = false;
         self.next_state(&mut visitor)
+    }
+
+    pub(crate) fn next_entry_with_visitor(
+        &mut self,
+        mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Option<Result<EntryGuard<K, V>>> {
+        self.next_state(&mut visitor)
+            .map(|result| result.map(|()| self.left.as_ref().unwrap().get_entry().unwrap()))
+    }
+
+    pub(crate) fn next_back_entry_with_visitor(
+        &mut self,
+        mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Option<Result<EntryGuard<K, V>>> {
+        self.next_back_state(&mut visitor)
+            .map(|result| result.map(|()| self.right.as_ref().unwrap().get_entry().unwrap()))
     }
 
     fn advance(

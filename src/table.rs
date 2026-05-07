@@ -644,7 +644,12 @@ impl<
 > Drop for ExtractIf<'_, K, V, F>
 {
     fn drop(&mut self) {
-        if self.inner.predicate_panicked()
+        if self.inner.predicate_panicked() {
+            if let Some(transaction) = self.poison_target {
+                transaction.poison();
+            }
+            self.inner.cancel_unfinalized();
+        } else if (self.inner.finalize().is_err() || self.inner.finalize_failed())
             && let Some(transaction) = self.poison_target
         {
             transaction.poison();
@@ -664,9 +669,9 @@ impl<
     fn next(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next()?;
         Some(entry.map(|entry| {
-            let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
-            let value = AccessGuard::with_page(page, value_range);
+            let (arc_page, key_range, value_range) = entry.into_arc_page_raw();
+            let key = AccessGuard::with_arc_page(arc_page.clone(), key_range);
+            let value = AccessGuard::with_arc_page(arc_page, value_range);
             (key, value)
         }))
     }
@@ -681,9 +686,9 @@ impl<
     fn next_back(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next_back()?;
         Some(entry.map(|entry| {
-            let (page, key_range, value_range) = entry.into_raw();
-            let key = AccessGuard::with_page(page.clone(), key_range);
-            let value = AccessGuard::with_page(page, value_range);
+            let (arc_page, key_range, value_range) = entry.into_arc_page_raw();
+            let key = AccessGuard::with_arc_page(arc_page.clone(), key_range);
+            let value = AccessGuard::with_arc_page(arc_page, value_range);
             (key, value)
         }))
     }

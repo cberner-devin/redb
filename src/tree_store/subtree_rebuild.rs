@@ -16,6 +16,12 @@ use std::sync::Mutex;
 type BufferedLeafEntry = (Vec<u8>, Vec<u8>);
 type BufferedLeafEntries = VecDeque<BufferedLeafEntry>;
 
+#[derive(Copy, Clone)]
+pub(super) enum ClaimSide {
+    Low,
+    High,
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum BuildDirection {
     LeftToRight,
@@ -123,6 +129,10 @@ impl<'a, K: Key, V: Value> SubtreeRebuildContext<'a, K, V> {
             self.freed.push(page_number);
         }
     }
+
+    pub(super) fn defer_free(&mut self, page_number: PageNumber) {
+        self.freed.push(page_number);
+    }
 }
 
 // A sealed B-tree subtree, annotated with its distance from the original traversal root.
@@ -175,6 +185,13 @@ impl SealedSubtree {
     pub(super) fn from_range(subtree: RangeSubtree) -> Self {
         let (page, checksum, upper_key, root_distance) = subtree.into_parts();
         Self::new(page, checksum, upper_key, root_distance)
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.page == other.page
+            && self.checksum == other.checksum
+            && self.upper_key == other.upper_key
+            && self.root_distance == other.root_distance
     }
 
     fn graft_ordered<K: Key, V: Value>(
@@ -504,6 +521,12 @@ impl InProgressSubtree {
         }
     }
 
+    pub(super) fn mark_all_changed(&mut self) {
+        for branch in &mut self.branch_stack {
+            branch.mark_changed();
+        }
+    }
+
     pub(super) fn exit_branch_into<K: Key, V: Value>(
         &mut self,
         context: &mut SubtreeRebuildContext<'_, K, V>,
@@ -593,6 +616,147 @@ pub(super) fn finish_rebuilt_root<K: Key, V: Value>(
     }
 }
 
+pub(super) struct OriginalSubtreeClaimer<'a, K: Key, V: Value> {
+    builder: &'a mut SubtreeBuilder,
+    context: SubtreeRebuildContext<'a, K, V>,
+}
+
+impl<'a, K: Key, V: Value> OriginalSubtreeClaimer<'a, K, V> {
+    pub(super) fn new(
+        builder: &'a mut SubtreeBuilder,
+        page_allocator: &'a PageAllocator,
+        allocated: &'a Mutex<PageTrackerPolicy>,
+        pending_free: &'a mut Vec<PageNumber>,
+    ) -> Self {
+        Self {
+            builder,
+            context: SubtreeRebuildContext::new(page_allocator, allocated, pending_free, true),
+        }
+    }
+
+    pub(super) fn push_side(
+        &mut self,
+        header: Option<BtreeHeader>,
+        key: &[u8],
+        side: ClaimSide,
+        siblings_before_path: bool,
+    ) -> Result {
+        let Some(header) = header else {
+            return Ok(());
+        };
+        let root = RangeSubtree::root(header);
+        let page = self.context.get_page(header.root)?;
+        self.push_side_inner(page, root, key, side, siblings_before_path)
+    }
+
+    pub(super) fn push_between(
+        &mut self,
+        header: Option<BtreeHeader>,
+        left_key: &[u8],
+        right_key: &[u8],
+    ) -> Result {
+        let Some(header) = header else {
+            return Ok(());
+        };
+        let root = RangeSubtree::root(header);
+        let page = self.context.get_page(header.root)?;
+        self.push_between_inner(page, root, left_key, right_key)
+    }
+
+    fn push_side_inner(
+        &mut self,
+        page: PageImpl,
+        subtree: RangeSubtree,
+        key: &[u8],
+        side: ClaimSide,
+        siblings_before_path: bool,
+    ) -> Result {
+        if page.memory()[0] != BRANCH {
+            return Ok(());
+        }
+
+        let accessor = BranchAccessor::new(&page, K::fixed_width());
+        let child = accessor.child_for_key::<K>(key).0;
+        let child_subtree = subtree.child(&accessor, child);
+        let child_page = self.context.get_page(child_subtree.page_number())?;
+
+        self.context.defer_free(subtree.page_number());
+        if siblings_before_path {
+            self.push_sibling_children(&accessor, &subtree, child, side)?;
+            self.push_side_inner(child_page, child_subtree, key, side, true)
+        } else {
+            self.push_side_inner(child_page, child_subtree, key, side, false)?;
+            self.push_sibling_children(&accessor, &subtree, child, side)
+        }
+    }
+
+    fn push_between_inner(
+        &mut self,
+        page: PageImpl,
+        subtree: RangeSubtree,
+        left_key: &[u8],
+        right_key: &[u8],
+    ) -> Result {
+        if page.memory()[0] != BRANCH {
+            return Ok(());
+        }
+
+        let accessor = BranchAccessor::new(&page, K::fixed_width());
+        let left_child = accessor.child_for_key::<K>(left_key).0;
+        let right_child = accessor.child_for_key::<K>(right_key).0;
+        assert!(
+            left_child <= right_child,
+            "range iterator produced reversed frontier keys"
+        );
+
+        self.context.defer_free(subtree.page_number());
+        if left_child == right_child {
+            let child_subtree = subtree.child(&accessor, left_child);
+            let child_page = self.context.get_page(child_subtree.page_number())?;
+            return self.push_between_inner(child_page, child_subtree, left_key, right_key);
+        }
+
+        let left_subtree = subtree.child(&accessor, left_child);
+        let left_page = self.context.get_page(left_subtree.page_number())?;
+        self.push_side_inner(left_page, left_subtree, left_key, ClaimSide::High, false)?;
+
+        self.push_branch_children(&accessor, &subtree, left_child + 1..right_child)?;
+
+        let right_subtree = subtree.child(&accessor, right_child);
+        let right_page = self.context.get_page(right_subtree.page_number())?;
+        self.push_side_inner(right_page, right_subtree, right_key, ClaimSide::Low, true)
+    }
+
+    fn push_sibling_children(
+        &mut self,
+        accessor: &BranchAccessor<'_, '_, PageImpl>,
+        parent: &RangeSubtree,
+        child: usize,
+        side: ClaimSide,
+    ) -> Result {
+        let range = match side {
+            ClaimSide::Low => 0..child,
+            ClaimSide::High => child + 1..accessor.count_children(),
+        };
+        self.push_branch_children(accessor, parent, range)
+    }
+
+    fn push_branch_children(
+        &mut self,
+        accessor: &BranchAccessor<'_, '_, PageImpl>,
+        parent: &RangeSubtree,
+        range: Range<usize>,
+    ) -> Result {
+        self.builder.push_branch_children(
+            &mut self.context,
+            accessor,
+            parent.upper_key(),
+            parent.child_root_distance(),
+            range,
+        )
+    }
+}
+
 pub(super) struct LeafRewrite {
     page: PageImpl,
     subtree: RangeSubtree,
@@ -604,6 +768,14 @@ impl LeafRewrite {
         Self {
             page: entry.page().clone(),
             subtree: entry.subtree().clone(),
+            removed_indexes: vec![],
+        }
+    }
+
+    pub(super) fn from_parts(page: PageImpl, subtree: RangeSubtree) -> Self {
+        Self {
+            page,
+            subtree,
             removed_indexes: vec![],
         }
     }
@@ -629,6 +801,29 @@ impl LeafRewrite {
         );
         self.removed_indexes.push(index);
         first_removed
+    }
+
+    pub(super) fn mark_removed_unordered(&mut self, index: usize) {
+        self.removed_indexes.push(index);
+    }
+
+    pub(super) fn merge_removed_unordered(&mut self, other: Self) {
+        self.removed_indexes.extend(other.removed_indexes);
+    }
+
+    fn normalize_removed_indexes(&mut self) {
+        self.removed_indexes.sort_unstable();
+        self.removed_indexes.dedup();
+    }
+
+    pub(super) fn complete_unordered_into<K: Key, V: Value>(
+        mut self,
+        context: &mut SubtreeRebuildContext<'_, K, V>,
+        in_progress: &mut InProgressSubtree,
+        builder: &mut SubtreeBuilder,
+    ) -> Result {
+        self.normalize_removed_indexes();
+        self.complete_into(context, in_progress, builder)
     }
 
     pub(super) fn complete_into<K: Key, V: Value>(
@@ -659,7 +854,7 @@ impl LeafRewrite {
         Ok(())
     }
 
-    fn into_subtree(self) -> SealedSubtree {
+    pub(super) fn into_subtree(self) -> SealedSubtree {
         SealedSubtree::from_range(self.subtree)
     }
 }
@@ -1060,6 +1255,14 @@ impl SubtreeBuilder {
     }
 
     fn push_subtree_to_active_edge(&mut self, subtree: SealedSubtree) {
+        let active_edge = match self.direction {
+            BuildDirection::LeftToRight => self.frontier.back(),
+            BuildDirection::RightToLeft => self.frontier.front(),
+        };
+        if active_edge.is_some_and(|edge| edge.matches(&subtree)) {
+            return;
+        }
+
         match self.direction {
             BuildDirection::LeftToRight => self.frontier.push_back(subtree),
             BuildDirection::RightToLeft => self.frontier.push_front(subtree),
@@ -1190,6 +1393,45 @@ impl SubtreeBuilder {
             self.push_ordered_pair_to_active_edge(left, right);
         }
         self.normalize_frontier(context)
+    }
+
+    pub(super) fn push_branch_children<K: Key, V: Value>(
+        &mut self,
+        context: &mut SubtreeRebuildContext<'_, K, V>,
+        accessor: &BranchAccessor<'_, '_, PageImpl>,
+        parent_upper_key: Option<&[u8]>,
+        child_root_distance: u32,
+        range: Range<usize>,
+    ) -> Result<()> {
+        match self.direction {
+            BuildDirection::LeftToRight => {
+                for index in range {
+                    self.push_subtree(
+                        context,
+                        SealedSubtree::branch_child(
+                            accessor,
+                            parent_upper_key,
+                            child_root_distance,
+                            index,
+                        ),
+                    )?;
+                }
+            }
+            BuildDirection::RightToLeft => {
+                for index in range.rev() {
+                    self.push_subtree(
+                        context,
+                        SealedSubtree::branch_child(
+                            accessor,
+                            parent_upper_key,
+                            child_root_distance,
+                            index,
+                        ),
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]

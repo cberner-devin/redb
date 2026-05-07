@@ -651,6 +651,7 @@ fn is_simulated_io_error(err: &redb::Error) -> bool {
         Error::Io(io_err) => {
             matches!(io_err.kind(), ErrorKind::Other)
         }
+        Error::PreviousIo => true,
         _ => false,
     }
 }
