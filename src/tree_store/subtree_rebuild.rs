@@ -86,8 +86,14 @@ pub(super) struct SubtreeRebuildContext<'a, K: Key, V: Value> {
     page_allocator: &'a PageAllocator,
     allocated: &'a Mutex<PageTrackerPolicy>,
     freed: &'a mut Vec<PageNumber>,
-    modify_uncommitted: bool,
+    free_policy: FreePolicy,
     _types: PhantomData<(K, V)>,
+}
+
+#[derive(Copy, Clone)]
+enum FreePolicy {
+    RecycleUncommitted,
+    DeferRecycling,
 }
 
 impl<'a, K: Key, V: Value> SubtreeRebuildContext<'a, K, V> {
@@ -95,13 +101,27 @@ impl<'a, K: Key, V: Value> SubtreeRebuildContext<'a, K, V> {
         page_allocator: &'a PageAllocator,
         allocated: &'a Mutex<PageTrackerPolicy>,
         freed: &'a mut Vec<PageNumber>,
-        modify_uncommitted: bool,
     ) -> Self {
         Self {
             page_allocator,
             allocated,
             freed,
-            modify_uncommitted,
+            free_policy: FreePolicy::RecycleUncommitted,
+            _types: PhantomData,
+        }
+    }
+
+    // Record free candidates without trying to recycle uncommitted pages yet.
+    pub(super) fn defer_recycling(
+        page_allocator: &'a PageAllocator,
+        allocated: &'a Mutex<PageTrackerPolicy>,
+        freed: &'a mut Vec<PageNumber>,
+    ) -> Self {
+        Self {
+            page_allocator,
+            allocated,
+            freed,
+            free_policy: FreePolicy::DeferRecycling,
             _types: PhantomData,
         }
     }
@@ -111,15 +131,16 @@ impl<'a, K: Key, V: Value> SubtreeRebuildContext<'a, K, V> {
     }
 
     pub(super) fn conditional_free(&mut self, page_number: PageNumber) {
-        if self.modify_uncommitted {
-            let mut allocated = self.allocated.lock().unwrap();
-            if !self
-                .page_allocator
-                .free_if_uncommitted(page_number, &mut allocated)
-            {
-                self.freed.push(page_number);
-            }
-        } else {
+        if matches!(self.free_policy, FreePolicy::DeferRecycling) {
+            self.freed.push(page_number);
+            return;
+        }
+
+        let mut allocated = self.allocated.lock().unwrap();
+        if !self
+            .page_allocator
+            .free_if_uncommitted(page_number, &mut allocated)
+        {
             self.freed.push(page_number);
         }
     }
@@ -175,6 +196,13 @@ impl SealedSubtree {
     pub(super) fn from_range(subtree: RangeSubtree) -> Self {
         let (page, checksum, upper_key, root_distance) = subtree.into_parts();
         Self::new(page, checksum, upper_key, root_distance)
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.page == other.page
+            && self.checksum == other.checksum
+            && self.upper_key == other.upper_key
+            && self.root_distance == other.root_distance
     }
 
     fn graft_ordered<K: Key, V: Value>(
@@ -608,6 +636,14 @@ impl LeafRewrite {
         }
     }
 
+    pub(super) fn from_parts(page: PageImpl, subtree: RangeSubtree) -> Self {
+        Self {
+            page,
+            subtree,
+            removed_indexes: vec![],
+        }
+    }
+
     pub(super) fn page_number(&self) -> PageNumber {
         self.subtree.page_number()
     }
@@ -629,6 +665,32 @@ impl LeafRewrite {
         );
         self.removed_indexes.push(index);
         first_removed
+    }
+
+    pub(super) fn mark_removed_unordered(&mut self, index: usize) -> bool {
+        let first_removed = self.removed_indexes.is_empty();
+        self.removed_indexes.push(index);
+        first_removed
+    }
+
+    pub(super) fn merge_same_leaf(&mut self, other: Self) {
+        assert_eq!(self.page_number(), other.page_number());
+        self.removed_indexes.extend(other.removed_indexes);
+    }
+
+    fn normalize_removed_indexes(&mut self) {
+        self.removed_indexes.sort_unstable();
+        self.removed_indexes.dedup();
+    }
+
+    pub(super) fn complete_unordered_into<K: Key, V: Value>(
+        mut self,
+        context: &mut SubtreeRebuildContext<'_, K, V>,
+        in_progress: &mut InProgressSubtree,
+        builder: &mut SubtreeBuilder,
+    ) -> Result {
+        self.normalize_removed_indexes();
+        self.complete_into(context, in_progress, builder)
     }
 
     pub(super) fn complete_into<K: Key, V: Value>(
@@ -659,7 +721,7 @@ impl LeafRewrite {
         Ok(())
     }
 
-    fn into_subtree(self) -> SealedSubtree {
+    pub(super) fn into_subtree(self) -> SealedSubtree {
         SealedSubtree::from_range(self.subtree)
     }
 }
@@ -1060,6 +1122,14 @@ impl SubtreeBuilder {
     }
 
     fn push_subtree_to_active_edge(&mut self, subtree: SealedSubtree) {
+        let active_edge = match self.direction {
+            BuildDirection::LeftToRight => self.frontier.back(),
+            BuildDirection::RightToLeft => self.frontier.front(),
+        };
+        if active_edge.is_some_and(|edge| edge.matches(&subtree)) {
+            return;
+        }
+
         match self.direction {
             BuildDirection::LeftToRight => self.frontier.push_back(subtree),
             BuildDirection::RightToLeft => self.frontier.push_front(subtree),

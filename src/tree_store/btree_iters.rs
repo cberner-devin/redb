@@ -10,6 +10,7 @@ use std::borrow::Borrow;
 use std::collections::Bound;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeBounds};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 enum RangeIterState {
@@ -109,6 +110,12 @@ pub(crate) enum RangeVisit<'a> {
     BranchExit { branch: &'a RangeSubtree },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RangeIterCursor {
+    Front,
+    Back,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RangeSubtree {
     page: PageNumber,
@@ -201,6 +208,106 @@ impl RangeIterState {
 
     fn is_leaf(&self) -> bool {
         matches!(self, Leaf { .. })
+    }
+
+    // The parent chain is the active path from the root to this cursor state.
+    // This is used when two range cursors meet: one side must not claim a whole
+    // subtree that still contains the other side's live cursor.
+    fn path_contains_page(&self, page_number: PageNumber) -> bool {
+        let (current_page, parent) = match self {
+            Enter {
+                subtree, parent, ..
+            }
+            | Leaf {
+                subtree, parent, ..
+            }
+            | BranchChild {
+                subtree, parent, ..
+            } => (subtree.as_ref().map(RangeSubtree::page_number), parent),
+            Exit { subtree, parent } => (Some(subtree.page_number()), parent),
+        };
+        current_page == Some(page_number)
+            || parent
+                .as_ref()
+                .is_some_and(|parent| parent.path_contains_page(page_number))
+    }
+
+    // The page that would be consumed by a structural drain step without
+    // descending into individual entries.
+    fn drain_target_page(&self) -> Option<PageNumber> {
+        match self {
+            Enter {
+                subtree: Some(subtree),
+                ..
+            }
+            | Exit { subtree, .. } => Some(subtree.page_number()),
+            BranchChild {
+                page,
+                fixed_key_size,
+                child,
+                subtree: Some(subtree),
+                ..
+            } => {
+                let accessor = BranchAccessor::new(page, *fixed_key_size);
+                Some(subtree.child(&accessor, *child).page_number())
+            }
+            Leaf { .. } | Enter { .. } | BranchChild { .. } => None,
+        }
+    }
+
+    fn exit_path_parent(parent: Option<Box<RangeIterState>>) -> Option<Box<RangeIterState>> {
+        parent.and_then(|parent| (*parent).into_exit_path().map(Box::new))
+    }
+
+    // Keep the current cursor path but replace sibling traversal states with
+    // branch exits. Bidirectional extract_if uses this after the front cursor
+    // has claimed the middle of the range; the back cursor only needs to finish
+    // its current path and must not reclaim those middle siblings.
+    fn into_exit_path(self) -> Option<RangeIterState> {
+        match self {
+            Enter {
+                page,
+                fixed_key_size,
+                fixed_value_size,
+                subtree,
+                parent,
+            } => Some(Enter {
+                page,
+                fixed_key_size,
+                fixed_value_size,
+                subtree,
+                parent: Self::exit_path_parent(parent),
+            }),
+            Leaf {
+                page,
+                fixed_key_size,
+                fixed_value_size,
+                entry,
+                start,
+                end,
+                subtree,
+                parent,
+            } => Some(Leaf {
+                page,
+                fixed_key_size,
+                fixed_value_size,
+                entry,
+                start,
+                end,
+                subtree,
+                parent: Self::exit_path_parent(parent),
+            }),
+            BranchChild {
+                subtree: Some(subtree),
+                parent,
+                ..
+            }
+            | Exit { subtree, parent } => Some(Exit {
+                subtree,
+                parent: Self::exit_path_parent(parent),
+            }),
+            BranchChild { parent, .. } => parent.and_then(|parent| (*parent).into_exit_path()),
+        }
     }
 
     fn next<K: Key>(
@@ -400,6 +507,82 @@ impl RangeIterState {
         }
     }
 
+    fn drain<K: Key>(
+        self,
+        left_bound: Bound<&[u8]>,
+        right_bound: Bound<&[u8]>,
+        reverse: bool,
+        manager: &PageResolver,
+        hint: PageHint,
+        visitor: &mut impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Result<Option<RangeIterState>> {
+        match self {
+            Enter {
+                page,
+                fixed_key_size: _,
+                fixed_value_size: _,
+                subtree: Some(subtree),
+                parent,
+            } => {
+                drop(page);
+                visitor(RangeVisit::SkippedSubtree { subtree: &subtree })?;
+                Ok(parent.map(|x| *x))
+            }
+            Leaf {
+                page,
+                subtree: Some(subtree),
+                parent,
+                ..
+            } => {
+                let page_number = page.get_page_number();
+                drop(page);
+                assert_eq!(page_number, subtree.page_number());
+                visitor(RangeVisit::LeafExit { subtree: &subtree })?;
+                Ok(parent.map(|x| *x))
+            }
+            BranchChild {
+                page,
+                fixed_key_size,
+                fixed_value_size,
+                child,
+                first_range_child,
+                last_range_child,
+                subtree: Some(subtree),
+                parent,
+            } => {
+                let child_count;
+                {
+                    let accessor = BranchAccessor::new(&page, fixed_key_size);
+                    child_count = accessor.count_children();
+                    let child_subtree = subtree.child(&accessor, child);
+                    visitor(RangeVisit::SkippedSubtree {
+                        subtree: &child_subtree,
+                    })?;
+                }
+                Ok(Self::next_branch_child(
+                    BranchChild {
+                        page,
+                        fixed_key_size,
+                        fixed_value_size,
+                        child,
+                        first_range_child,
+                        last_range_child,
+                        subtree: Some(subtree),
+                        parent,
+                    },
+                    child_count,
+                    reverse,
+                )
+                .map(|state| *state))
+            }
+            Exit { subtree, parent } => {
+                visitor(RangeVisit::BranchExit { branch: &subtree })?;
+                Ok(parent.map(|x| *x))
+            }
+            state => state.next::<K>(left_bound, right_bound, reverse, manager, hint, visitor),
+        }
+    }
+
     fn next_branch_child(
         state: RangeIterState,
         child_count: usize,
@@ -516,6 +699,10 @@ impl<K: Key, V: Value> EntryGuard<K, V> {
 
     pub(crate) fn into_raw(self) -> (PageImpl, Range<usize>, Range<usize>) {
         (self.page, self.key_range, self.value_range)
+    }
+
+    pub(crate) fn into_arc_page_raw(self) -> (Arc<[u8]>, Range<usize>, Range<usize>) {
+        (self.page.to_arc(), self.key_range, self.value_range)
     }
 }
 
@@ -740,6 +927,16 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         self.right = None;
     }
 
+    fn discard_front_cursor(&mut self) {
+        self.left = None;
+        self.include_left = false;
+    }
+
+    fn discard_back_cursor(&mut self) {
+        self.right = None;
+        self.include_right = false;
+    }
+
     pub(crate) fn next_with_visitor(
         &mut self,
         mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
@@ -749,6 +946,22 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         self.next_state(&mut visitor)
     }
 
+    pub(crate) fn next_entry_with_visitor(
+        &mut self,
+        mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Option<Result<EntryGuard<K, V>>> {
+        self.next_state(&mut visitor)
+            .map(|result| result.map(|()| self.left.as_ref().unwrap().get_entry().unwrap()))
+    }
+
+    pub(crate) fn next_back_entry_with_visitor(
+        &mut self,
+        mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Option<Result<EntryGuard<K, V>>> {
+        self.next_back_state(&mut visitor)
+            .map(|result| result.map(|()| self.right.as_ref().unwrap().get_entry().unwrap()))
+    }
+
     fn advance(
         &self,
         current: RangeIterState,
@@ -756,6 +969,22 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         visitor: &mut impl for<'a> FnMut(RangeVisit<'a>) -> Result,
     ) -> Result<Option<RangeIterState>> {
         current.next::<K>(
+            self.left_bound.as_ref().map(Vec::as_slice),
+            self.right_bound.as_ref().map(Vec::as_slice),
+            reverse,
+            &self.manager,
+            self.hint,
+            visitor,
+        )
+    }
+
+    fn drain_advance(
+        &self,
+        current: RangeIterState,
+        reverse: bool,
+        visitor: &mut impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Result<Option<RangeIterState>> {
+        current.drain::<K>(
             self.left_bound.as_ref().map(Vec::as_slice),
             self.right_bound.as_ref().map(Vec::as_slice),
             reverse,
@@ -812,6 +1041,97 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
             *right_start = (*right_start).max(start);
             // Entries before this leaf boundary belong to the left cursor.
             *right_parent = None;
+        }
+    }
+
+    fn drain_front_with_visitor(
+        &mut self,
+        mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Result {
+        loop {
+            self.limit_left_to_right_cursor();
+            let Some(current) = self.left.take() else {
+                self.close();
+                return Ok(());
+            };
+            self.left = self.drain_advance(current, false, &mut visitor)?;
+        }
+    }
+
+    fn drain_front_until_back_with_visitor(
+        &mut self,
+        mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Result {
+        // The front cursor owns the unvisited middle of a bidirectional drain,
+        // but must stop before claiming the subtree that still contains the
+        // back cursor's current path.
+        loop {
+            self.limit_left_to_right_cursor();
+            if let (Some(left), Some(right)) = (&self.left, &self.right)
+                && let Some(page) = left.drain_target_page()
+                && right.path_contains_page(page)
+            {
+                return Ok(());
+            }
+            let Some(current) = self.left.take() else {
+                return Ok(());
+            };
+            self.left = self.drain_advance(current, false, &mut visitor)?;
+        }
+    }
+
+    fn drain_back_with_visitor(
+        &mut self,
+        mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Result {
+        loop {
+            self.limit_right_to_left_cursor();
+            let Some(current) = self.right.take() else {
+                self.close();
+                return Ok(());
+            };
+            self.right = self.drain_advance(current, true, &mut visitor)?;
+        }
+    }
+
+    fn drain_back_path_with_visitor(
+        &mut self,
+        visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
+    ) -> Result {
+        // The front cursor has already claimed the middle subtrees. The back
+        // cursor only closes its current leaf-to-root path.
+        self.right = self.right.take().and_then(RangeIterState::into_exit_path);
+        self.drain_back_with_visitor(visitor)
+    }
+
+    pub(crate) fn close_with_exit_visitor(
+        &mut self,
+        front_changed: bool,
+        back_changed: bool,
+        mut visitor: impl for<'a> FnMut(RangeIterCursor, RangeVisit<'a>) -> Result,
+    ) -> Result {
+        // The changed cursor owns unvisited subtrees on its side. If both
+        // cursors changed, the front cursor claims the middle and the back
+        // cursor only exits its current path.
+        match (front_changed, back_changed) {
+            (true, true) => {
+                self.drain_front_until_back_with_visitor(|event| {
+                    visitor(RangeIterCursor::Front, event)
+                })?;
+                self.drain_back_path_with_visitor(|event| visitor(RangeIterCursor::Back, event))
+            }
+            (true, false) => {
+                self.discard_back_cursor();
+                self.drain_front_with_visitor(|event| visitor(RangeIterCursor::Front, event))
+            }
+            (false, true) => {
+                self.discard_front_cursor();
+                self.drain_back_with_visitor(|event| visitor(RangeIterCursor::Back, event))
+            }
+            (false, false) => {
+                self.close();
+                Ok(())
+            }
         }
     }
 }

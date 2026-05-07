@@ -420,6 +420,49 @@ fn extract_from_if_next_back_large_range() {
 }
 
 #[test]
+fn extract_from_if_alternating_meets_in_leaf() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    let n = 20_000u64;
+    let range = 291u64..685u64;
+    let expected = range.clone().filter(|key| key % 5 == 0).collect::<Vec<_>>();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..n {
+            table.insert(&i, &i).unwrap();
+        }
+
+        let mut extracted = table.extract_from_if(range, |key, _| key % 5 == 0).unwrap();
+        let mut removed = vec![];
+        loop {
+            let Some(entry) = extracted.next() else {
+                break;
+            };
+            removed.push(entry.unwrap().0.value());
+
+            let Some(entry) = extracted.next_back() else {
+                break;
+            };
+            removed.push(entry.unwrap().0.value());
+        }
+        drop(extracted);
+
+        removed.sort_unstable();
+        assert_eq!(removed, expected);
+        assert_eq!(table.len().unwrap(), n - expected.len() as u64);
+        for key in 0..n {
+            if expected.binary_search(&key).is_ok() {
+                assert!(table.get(&key).unwrap().is_none());
+            } else {
+                assert_eq!(table.get(&key).unwrap().unwrap().value(), key);
+            }
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
+#[test]
 fn extract_if_returned_guards_survive_finalize() {
     let tmpfile = create_tempfile();
     let db = Database::create(tmpfile.path()).unwrap();

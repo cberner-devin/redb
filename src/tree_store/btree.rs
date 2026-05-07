@@ -674,16 +674,14 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
     where
         K: 'a0,
     {
-        let iter = self.range(range)?;
-
         let result = BtreeExtractIf::new(
             &mut self.root,
-            iter,
+            range,
             predicate,
             self.freed_pages.clone(),
             self.allocated_pages.clone(),
             self.page_allocator.clone(),
-        );
+        )?;
 
         Ok(result)
     }
