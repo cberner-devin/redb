@@ -2,7 +2,7 @@ use crate::Result;
 use crate::tree_store::btree_base::{BRANCH, BtreeHeader, Checksum, EntryAccessor, LEAF};
 use crate::tree_store::btree_base::{BranchAccessor, LeafAccessor};
 use crate::tree_store::btree_iters::RangeIterState::{BranchChild, Enter, Exit, Leaf};
-use crate::tree_store::page_store::{Page, PageHint, PageImpl};
+use crate::tree_store::page_store::{Page, PageHint, PageImpl, PageNumberHashSet};
 use crate::tree_store::{PageNumber, PageResolver};
 use crate::types::{Key, Value};
 use Bound::{Excluded, Included, Unbounded};
@@ -227,10 +227,7 @@ impl RangeIterState {
         left_page.get_page_number() == right_page.get_page_number()
     }
 
-    // The parent chain is the active path from the root to this cursor state.
-    // This is used when two range cursors meet: one side must not claim a whole
-    // subtree that still contains the other side's live cursor.
-    fn path_contains_page(&self, page_number: PageNumber) -> bool {
+    fn add_path_pages(&self, pages: &mut PageNumberHashSet) {
         let (current_page, parent) = match self {
             Enter {
                 subtree, parent, ..
@@ -243,19 +240,21 @@ impl RangeIterState {
             } => (subtree.as_ref().map(RangeSubtree::page_number), parent),
             Exit { subtree, parent } => (Some(subtree.page_number()), parent),
         };
-        current_page == Some(page_number)
-            || parent
-                .as_ref()
-                .is_some_and(|parent| parent.path_contains_page(page_number))
+        if let Some(page) = current_page {
+            pages.insert(page);
+        }
+        if let Some(parent) = parent {
+            parent.add_path_pages(pages);
+        }
     }
 
     fn structural_drain_step(
         &self,
-        right: Option<&RangeIterState>,
+        right_path: Option<&PageNumberHashSet>,
         manager: &PageResolver,
         hint: PageHint,
     ) -> Result<StructuralDrainStep> {
-        let Some(right) = right else {
+        let Some(right_path) = right_path else {
             return Ok(StructuralDrainStep::Drain);
         };
         let step = match self {
@@ -263,7 +262,7 @@ impl RangeIterState {
                 page,
                 subtree: Some(subtree),
                 ..
-            } if right.path_contains_page(subtree.page_number()) => match page.memory()[0] {
+            } if right_path.contains(&subtree.page_number()) => match page.memory()[0] {
                 BRANCH => StructuralDrainStep::Enter,
                 LEAF => StructuralDrainStep::Stop,
                 _ => unreachable!(),
@@ -277,7 +276,7 @@ impl RangeIterState {
             } => {
                 let accessor = BranchAccessor::new(page, *fixed_key_size);
                 let child_subtree = subtree.child(&accessor, *child);
-                if right.path_contains_page(child_subtree.page_number()) {
+                if right_path.contains(&child_subtree.page_number()) {
                     let child_page = manager.get_page(child_subtree.page_number(), hint)?;
                     match child_page.memory()[0] {
                         BRANCH => StructuralDrainStep::Enter,
@@ -288,7 +287,7 @@ impl RangeIterState {
                     StructuralDrainStep::Drain
                 }
             }
-            Exit { subtree, .. } if right.path_contains_page(subtree.page_number()) => {
+            Exit { subtree, .. } if right_path.contains(&subtree.page_number()) => {
                 StructuralDrainStep::Stop
             }
             _ => StructuralDrainStep::Drain,
@@ -1024,6 +1023,14 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         &mut self,
         mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
     ) -> Result {
+        // The close drain may skip many sibling subtrees before reaching the
+        // back cursor. Cache that cursor's path so each skip only checks set
+        // membership.
+        let mut right_path = self.right.as_ref().map(|right| {
+            let mut pages = PageNumberHashSet::default();
+            right.add_path_pages(&mut pages);
+            pages
+        });
         loop {
             self.limit_left_to_right_cursor();
             if self
@@ -1034,12 +1041,13 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
             {
                 self.right = None;
                 self.include_right = false;
+                right_path = None;
             }
             let Some(left) = self.left.as_ref() else {
                 self.close();
                 return Ok(());
             };
-            let step = left.structural_drain_step(self.right.as_ref(), &self.manager, self.hint)?;
+            let step = left.structural_drain_step(right_path.as_ref(), &self.manager, self.hint)?;
             if step == StructuralDrainStep::Stop {
                 return Ok(());
             }
