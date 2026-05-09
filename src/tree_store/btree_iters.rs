@@ -47,13 +47,6 @@ enum RangeIterState {
     },
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum StructuralDrainStep {
-    Drain,
-    Enter,
-    Stop,
-}
-
 fn lower_bound_entry<K: Key>(accessor: &LeafAccessor<'_>, bound: Bound<&[u8]>) -> usize {
     match bound {
         Included(query) | Excluded(query) => {
@@ -123,9 +116,12 @@ fn leaf_entries<K: Key>(
 //   the range iterator holds no PageImpl references to the exited page or to
 //   pages inside the exited subtree. Callers may rebuild or eagerly free those
 //   pages from the visitor.
-// * BranchEnter and BranchExit events are balanced and nested for visited
-//   branch pages. A SkippedSubtree event is terminal for that subtree: the range
-//   iterator will not later emit entries or exits from inside it.
+// * BranchEnter and BranchExit events are nested for visited branch pages. A
+//   full traversal balances them. A close drain may stop at the back cursor
+//   with open BranchEnter events for ancestors on that path; callers that track
+//   branch frames must finish those frames when finalizing the partial drain.
+//   A SkippedSubtree event is terminal for that subtree: the range iterator
+//   will not later emit entries or exits from inside it.
 // * LeafEntry is the only event that borrows a live leaf page. It is emitted
 //   immediately before yielding that entry and does not imply the page is safe
 //   to rebuild or free.
@@ -139,6 +135,11 @@ pub(crate) enum RangeVisit<'a> {
     BranchExit { branch: &'a RangeSubtree },
 }
 
+// `RangeIterState::next()` cannot call the visitor directly: the owning
+// `BtreeRangeIter` must first install the returned cursor state, and for Exit
+// events possibly drop the opposite cursor, before callers are allowed to
+// rebuild or free the exited page. This owned event is the handoff between
+// computing the next state and invoking the borrowed `RangeVisit` callback.
 enum RangeStructuralEvent {
     BranchEnter,
     SkippedSubtree { subtree: RangeSubtree },
@@ -181,6 +182,9 @@ impl RangeStructuralEvent {
     }
 }
 
+// The result of one state-machine transition. Keeping the next state and
+// structural event together prevents call sites from visiting an Exit while the
+// iterator still holds the page that the visitor is allowed to recycle.
 struct RangeStep {
     next: Option<RangeIterState>,
     event: Option<RangeStructuralEvent>,
@@ -328,53 +332,6 @@ impl RangeIterState {
         if let Some(parent) = parent {
             parent.add_path_pages(pages);
         }
-    }
-
-    fn structural_drain_step(
-        &self,
-        right_path: Option<&PageNumberHashSet>,
-        manager: &PageResolver,
-        hint: PageHint,
-    ) -> Result<StructuralDrainStep> {
-        let Some(right_path) = right_path else {
-            return Ok(StructuralDrainStep::Drain);
-        };
-        let step = match self {
-            Enter {
-                page,
-                subtree: Some(subtree),
-                ..
-            } if right_path.contains(&subtree.page_number()) => match page.memory()[0] {
-                BRANCH => StructuralDrainStep::Enter,
-                LEAF => StructuralDrainStep::Stop,
-                _ => unreachable!(),
-            },
-            BranchChild {
-                page,
-                fixed_key_size,
-                child,
-                subtree: Some(subtree),
-                ..
-            } => {
-                let accessor = BranchAccessor::new(page, *fixed_key_size);
-                let child_subtree = subtree.child(&accessor, *child);
-                if right_path.contains(&child_subtree.page_number()) {
-                    let child_page = manager.get_page(child_subtree.page_number(), hint)?;
-                    match child_page.memory()[0] {
-                        BRANCH => StructuralDrainStep::Enter,
-                        LEAF => StructuralDrainStep::Stop,
-                        _ => unreachable!(),
-                    }
-                } else {
-                    StructuralDrainStep::Drain
-                }
-            }
-            Exit { subtree, .. } if right_path.contains(&subtree.page_number()) => {
-                StructuralDrainStep::Stop
-            }
-            _ => StructuralDrainStep::Drain,
-        };
-        Ok(step)
     }
 
     fn next<K: Key>(
@@ -587,88 +544,6 @@ impl RangeIterState {
                 parent.map(|x| *x),
                 RangeStructuralEvent::BranchExit { branch: subtree },
             )),
-        }
-    }
-
-    fn drain<K: Key>(
-        self,
-        left_bound: Bound<&[u8]>,
-        right_bound: Bound<&[u8]>,
-        reverse: bool,
-        manager: &PageResolver,
-        hint: PageHint,
-    ) -> Result<RangeStep> {
-        match self {
-            Enter {
-                page,
-                fixed_key_size: _,
-                fixed_value_size: _,
-                subtree: Some(subtree),
-                parent,
-            } => {
-                drop(page);
-                Ok(RangeStep::with_event(
-                    parent.map(|x| *x),
-                    RangeStructuralEvent::SkippedSubtree { subtree },
-                ))
-            }
-            Leaf {
-                page,
-                subtree: Some(subtree),
-                parent,
-                ..
-            } => {
-                let page_number = page.get_page_number();
-                drop(page);
-                assert_eq!(page_number, subtree.page_number());
-                Ok(RangeStep::with_event(
-                    parent.map(|x| *x),
-                    RangeStructuralEvent::LeafExit { subtree },
-                ))
-            }
-            BranchChild {
-                page,
-                fixed_key_size,
-                fixed_value_size,
-                child,
-                first_range_child,
-                last_range_child,
-                subtree: Some(subtree),
-                parent,
-            } => {
-                let (child_count, child_subtree) = {
-                    let accessor = BranchAccessor::new(&page, fixed_key_size);
-                    let child_count = accessor.count_children();
-                    let child_subtree = subtree.child(&accessor, child);
-                    (child_count, child_subtree)
-                };
-                let next = Self::next_branch_child(
-                    BranchChild {
-                        page,
-                        fixed_key_size,
-                        fixed_value_size,
-                        child,
-                        first_range_child,
-                        last_range_child,
-                        subtree: Some(subtree),
-                        parent,
-                    },
-                    child_count,
-                    reverse,
-                )
-                .map(|state| *state);
-                Ok(RangeStep::with_event(
-                    next,
-                    RangeStructuralEvent::SkippedSubtree {
-                        subtree: child_subtree,
-                    },
-                ))
-            }
-            Exit { subtree, parent } => Ok(RangeStep::with_event(
-                parent.map(|x| *x),
-                RangeStructuralEvent::BranchExit { branch: subtree },
-            )),
-            state => state.next::<K>(left_bound, right_bound, reverse, manager, hint),
         }
     }
 
@@ -1043,16 +918,6 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         )
     }
 
-    fn drain_advance(&self, current: RangeIterState, reverse: bool) -> Result<RangeStep> {
-        current.drain::<K>(
-            self.left_bound.as_ref().map(Vec::as_slice),
-            self.right_bound.as_ref().map(Vec::as_slice),
-            reverse,
-            &self.manager,
-            self.hint,
-        )
-    }
-
     fn limit_left_to_right_cursor(&mut self) {
         let (
             Some(Leaf {
@@ -1117,6 +982,22 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
             right.add_path_pages(&mut pages);
             pages
         });
+        let mut visit_event = |iter: &mut Self,
+                               event: RangeStructuralEvent,
+                               right_path: &mut Option<PageNumberHashSet>|
+         -> Result {
+            // Exit visitors may rebuild/free the exited subtree. Drop any
+            // cached opposite cursor path first so the range iterator keeps no
+            // PageImpl references into that subtree during the callback.
+            if let Some(page) = event.exited_page()
+                && right_path.as_ref().is_some_and(|path| path.contains(&page))
+            {
+                iter.right = None;
+                iter.include_right = false;
+                *right_path = None;
+            }
+            event.visit(iter.left.as_ref(), &mut visitor)
+        };
         loop {
             self.limit_left_to_right_cursor();
             if self
@@ -1129,33 +1010,173 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                 self.include_right = false;
                 right_path = None;
             }
-            let Some(left) = self.left.as_ref() else {
+            if self.left.is_none() {
                 self.close();
-                return Ok(());
-            };
-            let step = left.structural_drain_step(right_path.as_ref(), &self.manager, self.hint)?;
-            if step == StructuralDrainStep::Stop {
                 return Ok(());
             }
             let current = self.left.take().unwrap();
-            let range_step = if step == StructuralDrainStep::Enter {
-                self.advance(current, false)?
-            } else {
-                self.drain_advance(current, false)?
-            };
-            self.left = range_step.next;
-            if let Some(event) = range_step.event {
-                // Exit visitors may rebuild/free the exited subtree. Drop any
-                // cached opposite cursor path first so the range iterator keeps
-                // no PageImpl references into that subtree during the callback.
-                if let Some(page) = event.exited_page()
-                    && right_path.as_ref().is_some_and(|path| path.contains(&page))
-                {
-                    self.right = None;
-                    self.include_right = false;
-                    right_path = None;
+            match current {
+                Enter {
+                    page,
+                    fixed_key_size,
+                    fixed_value_size,
+                    subtree: Some(subtree),
+                    parent,
+                } => {
+                    let contains_back = right_path
+                        .as_ref()
+                        .is_some_and(|path| path.contains(&subtree.page_number()));
+                    if contains_back {
+                        match page.memory()[0] {
+                            BRANCH => {
+                                let accessor = BranchAccessor::new(&page, fixed_key_size);
+                                let first_range_child = child_to_visit::<K>(
+                                    &accessor,
+                                    self.left_bound.as_ref().map(Vec::as_slice),
+                                    false,
+                                );
+                                let last_range_child = child_to_visit::<K>(
+                                    &accessor,
+                                    self.right_bound.as_ref().map(Vec::as_slice),
+                                    true,
+                                );
+                                self.left = Some(BranchChild {
+                                    child: 0,
+                                    first_range_child,
+                                    last_range_child,
+                                    page,
+                                    fixed_key_size,
+                                    fixed_value_size,
+                                    subtree: Some(subtree),
+                                    parent,
+                                });
+                                visit_event(
+                                    self,
+                                    RangeStructuralEvent::BranchEnter,
+                                    &mut right_path,
+                                )?;
+                            }
+                            LEAF => {
+                                self.left = Some(Enter {
+                                    page,
+                                    fixed_key_size,
+                                    fixed_value_size,
+                                    subtree: Some(subtree),
+                                    parent,
+                                });
+                                return Ok(());
+                            }
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        drop(page);
+                        self.left = parent.map(|state| *state);
+                        visit_event(
+                            self,
+                            RangeStructuralEvent::SkippedSubtree { subtree },
+                            &mut right_path,
+                        )?;
+                    }
                 }
-                event.visit(self.left.as_ref(), &mut visitor)?;
+                Leaf {
+                    page,
+                    subtree: Some(subtree),
+                    parent,
+                    ..
+                } => {
+                    let page_number = page.get_page_number();
+                    drop(page);
+                    assert_eq!(page_number, subtree.page_number());
+                    self.left = parent.map(|state| *state);
+                    visit_event(
+                        self,
+                        RangeStructuralEvent::LeafExit { subtree },
+                        &mut right_path,
+                    )?;
+                }
+                BranchChild {
+                    page,
+                    fixed_key_size,
+                    fixed_value_size,
+                    child,
+                    first_range_child,
+                    last_range_child,
+                    subtree: Some(subtree),
+                    parent,
+                } => {
+                    let (child_count, child_subtree) = {
+                        let accessor = BranchAccessor::new(&page, fixed_key_size);
+                        (accessor.count_children(), subtree.child(&accessor, child))
+                    };
+                    let child_contains_back = right_path
+                        .as_ref()
+                        .is_some_and(|path| path.contains(&child_subtree.page_number()));
+                    let current = BranchChild {
+                        page,
+                        fixed_key_size,
+                        fixed_value_size,
+                        child,
+                        first_range_child,
+                        last_range_child,
+                        subtree: Some(subtree),
+                        parent,
+                    };
+                    if child_contains_back {
+                        let child_page = self
+                            .manager
+                            .get_page(child_subtree.page_number(), self.hint)?;
+                        match child_page.memory()[0] {
+                            BRANCH => {
+                                let parent =
+                                    RangeIterState::next_branch_child(current, child_count, false);
+                                self.left = Some(Enter {
+                                    page: child_page,
+                                    fixed_key_size,
+                                    fixed_value_size,
+                                    subtree: Some(child_subtree),
+                                    parent,
+                                });
+                            }
+                            LEAF => {
+                                self.left = Some(current);
+                                return Ok(());
+                            }
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        self.left = RangeIterState::next_branch_child(current, child_count, false)
+                            .map(|state| *state);
+                        visit_event(
+                            self,
+                            RangeStructuralEvent::SkippedSubtree {
+                                subtree: child_subtree,
+                            },
+                            &mut right_path,
+                        )?;
+                    }
+                }
+                Exit { subtree, parent } => {
+                    if right_path
+                        .as_ref()
+                        .is_some_and(|path| path.contains(&subtree.page_number()))
+                    {
+                        self.left = Some(Exit { subtree, parent });
+                        return Ok(());
+                    }
+                    self.left = parent.map(|state| *state);
+                    visit_event(
+                        self,
+                        RangeStructuralEvent::BranchExit { branch: subtree },
+                        &mut right_path,
+                    )?;
+                }
+                state => {
+                    let range_step = self.advance(state, false)?;
+                    self.left = range_step.next;
+                    if let Some(event) = range_step.event {
+                        visit_event(self, event, &mut right_path)?;
+                    }
+                }
             }
         }
     }
