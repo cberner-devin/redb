@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::tree_store::btree_iters::{BtreeRangeIter, RangeLeafEntry, RangeVisit};
+use crate::tree_store::btree_iters::{BtreeRangeIter, RangeLeafEntry, RangeTraversalEvent};
 use crate::tree_store::subtree_rebuild::{
     InProgressSubtree, LeafRewrite, SealedSubtree, SubtreeBuilder, SubtreeRebuildContext,
     finish_rebuilt_root,
@@ -57,34 +57,36 @@ impl Retain {
     fn visit<K: Key, V: Value, F>(
         &mut self,
         context: &mut SubtreeRebuildContext<'_, K, V>,
-        event: RangeVisit<'_>,
+        event: RangeTraversalEvent<'_>,
         predicate: &mut F,
     ) -> Result
     where
         F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
     {
         match event {
-            RangeVisit::BranchEnter { branch } => {
-                self.in_progress.enter_branch(branch.clone());
+            RangeTraversalEvent::BranchEnter { branch } => {
+                self.in_progress.enter_branch(branch);
                 Ok(())
             }
-            RangeVisit::SkippedSubtree { subtree } => {
+            RangeTraversalEvent::SkippedSubtree { subtree } => {
                 self.in_progress
-                    .push_subtree(SealedSubtree::from_range(subtree.clone()));
+                    .push_subtree(SealedSubtree::from_range(subtree));
                 Ok(())
             }
-            RangeVisit::LeafEntry { entry } => self.visit_leaf_entry(context, entry, predicate),
-            RangeVisit::LeafExit { subtree } => {
+            RangeTraversalEvent::LeafEntry { entry } => {
+                self.visit_leaf_entry(context, entry, predicate)
+            }
+            RangeTraversalEvent::LeafExit { subtree } => {
                 let page_number = subtree.page_number();
                 if self.current_leaf_page() == Some(page_number) {
                     self.complete_current_leaf(context)?;
                 }
                 Ok(())
             }
-            RangeVisit::BranchExit { branch } => {
+            RangeTraversalEvent::BranchExit { branch } => {
                 if let Some(replaced_page) =
                     self.in_progress
-                        .exit_branch_into(context, &mut self.builder, branch)?
+                        .exit_branch_into(context, &mut self.builder, &branch)?
                 {
                     context.conditional_free(replaced_page);
                 }
