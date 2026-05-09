@@ -47,6 +47,13 @@ enum RangeIterState {
     },
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum StructuralDrainStep {
+    Drain,
+    Enter,
+    Stop,
+}
+
 fn lower_bound_entry<K: Key>(accessor: &LeafAccessor<'_>, bound: Bound<&[u8]>) -> usize {
     match bound {
         Included(query) | Excluded(query) => {
@@ -108,12 +115,6 @@ pub(crate) enum RangeVisit<'a> {
     LeafEntry { entry: RangeLeafEntry<'a> },
     LeafExit { subtree: &'a RangeSubtree },
     BranchExit { branch: &'a RangeSubtree },
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RangeIterCursor {
-    Front,
-    Back,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +211,22 @@ impl RangeIterState {
         matches!(self, Leaf { .. })
     }
 
+    fn is_same_leaf_page(&self, other: &RangeIterState) -> bool {
+        let (
+            Leaf {
+                page: left_page, ..
+            },
+            Leaf {
+                page: right_page, ..
+            },
+        ) = (self, other)
+        else {
+            return false;
+        };
+
+        left_page.get_page_number() == right_page.get_page_number()
+    }
+
     // The parent chain is the active path from the root to this cursor state.
     // This is used when two range cursors meet: one side must not claim a whole
     // subtree that still contains the other side's live cursor.
@@ -232,15 +249,25 @@ impl RangeIterState {
                 .is_some_and(|parent| parent.path_contains_page(page_number))
     }
 
-    // The page that would be consumed by a structural drain step without
-    // descending into individual entries.
-    fn drain_target_page(&self) -> Option<PageNumber> {
-        match self {
+    fn structural_drain_step(
+        &self,
+        right: Option<&RangeIterState>,
+        manager: &PageResolver,
+        hint: PageHint,
+    ) -> Result<StructuralDrainStep> {
+        let Some(right) = right else {
+            return Ok(StructuralDrainStep::Drain);
+        };
+        let step = match self {
             Enter {
+                page,
                 subtree: Some(subtree),
                 ..
-            }
-            | Exit { subtree, .. } => Some(subtree.page_number()),
+            } if right.path_contains_page(subtree.page_number()) => match page.memory()[0] {
+                BRANCH => StructuralDrainStep::Enter,
+                LEAF => StructuralDrainStep::Stop,
+                _ => unreachable!(),
+            },
             BranchChild {
                 page,
                 fixed_key_size,
@@ -249,65 +276,24 @@ impl RangeIterState {
                 ..
             } => {
                 let accessor = BranchAccessor::new(page, *fixed_key_size);
-                Some(subtree.child(&accessor, *child).page_number())
+                let child_subtree = subtree.child(&accessor, *child);
+                if right.path_contains_page(child_subtree.page_number()) {
+                    let child_page = manager.get_page(child_subtree.page_number(), hint)?;
+                    match child_page.memory()[0] {
+                        BRANCH => StructuralDrainStep::Enter,
+                        LEAF => StructuralDrainStep::Stop,
+                        _ => unreachable!(),
+                    }
+                } else {
+                    StructuralDrainStep::Drain
+                }
             }
-            Leaf { .. } | Enter { .. } | BranchChild { .. } => None,
-        }
-    }
-
-    fn exit_path_parent(parent: Option<Box<RangeIterState>>) -> Option<Box<RangeIterState>> {
-        parent.and_then(|parent| (*parent).into_exit_path().map(Box::new))
-    }
-
-    // Keep the current cursor path but replace sibling traversal states with
-    // branch exits. Bidirectional extract_if uses this after the front cursor
-    // has claimed the middle of the range; the back cursor only needs to finish
-    // its current path and must not reclaim those middle siblings.
-    fn into_exit_path(self) -> Option<RangeIterState> {
-        match self {
-            Enter {
-                page,
-                fixed_key_size,
-                fixed_value_size,
-                subtree,
-                parent,
-            } => Some(Enter {
-                page,
-                fixed_key_size,
-                fixed_value_size,
-                subtree,
-                parent: Self::exit_path_parent(parent),
-            }),
-            Leaf {
-                page,
-                fixed_key_size,
-                fixed_value_size,
-                entry,
-                start,
-                end,
-                subtree,
-                parent,
-            } => Some(Leaf {
-                page,
-                fixed_key_size,
-                fixed_value_size,
-                entry,
-                start,
-                end,
-                subtree,
-                parent: Self::exit_path_parent(parent),
-            }),
-            BranchChild {
-                subtree: Some(subtree),
-                parent,
-                ..
+            Exit { subtree, .. } if right.path_contains_page(subtree.page_number()) => {
+                StructuralDrainStep::Stop
             }
-            | Exit { subtree, parent } => Some(Exit {
-                subtree,
-                parent: Self::exit_path_parent(parent),
-            }),
-            BranchChild { parent, .. } => parent.and_then(|parent| (*parent).into_exit_path()),
-        }
+            _ => StructuralDrainStep::Drain,
+        };
+        Ok(step)
     }
 
     fn next<K: Key>(
@@ -927,16 +913,6 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         self.right = None;
     }
 
-    fn discard_front_cursor(&mut self) {
-        self.left = None;
-        self.include_left = false;
-    }
-
-    fn discard_back_cursor(&mut self) {
-        self.right = None;
-        self.include_right = false;
-    }
-
     pub(crate) fn next_with_visitor(
         &mut self,
         mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
@@ -1044,94 +1020,48 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         }
     }
 
-    fn drain_front_with_visitor(
+    fn drain_until_back_with_visitor(
         &mut self,
         mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
     ) -> Result {
         loop {
             self.limit_left_to_right_cursor();
-            let Some(current) = self.left.take() else {
+            if self
+                .left
+                .as_ref()
+                .zip(self.right.as_ref())
+                .is_some_and(|(left, right)| left.is_same_leaf_page(right))
+            {
+                self.right = None;
+                self.include_right = false;
+            }
+            let Some(left) = self.left.as_ref() else {
                 self.close();
                 return Ok(());
             };
-            self.left = self.drain_advance(current, false, &mut visitor)?;
-        }
-    }
-
-    fn drain_front_until_back_with_visitor(
-        &mut self,
-        mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
-    ) -> Result {
-        // The front cursor owns the unvisited middle of a bidirectional drain,
-        // but must stop before claiming the subtree that still contains the
-        // back cursor's current path.
-        loop {
-            self.limit_left_to_right_cursor();
-            if let (Some(left), Some(right)) = (&self.left, &self.right)
-                && let Some(page) = left.drain_target_page()
-                && right.path_contains_page(page)
-            {
+            let step = left.structural_drain_step(self.right.as_ref(), &self.manager, self.hint)?;
+            if step == StructuralDrainStep::Stop {
                 return Ok(());
             }
-            let Some(current) = self.left.take() else {
-                return Ok(());
+            let current = self.left.take().unwrap();
+            self.left = if step == StructuralDrainStep::Enter {
+                self.advance(current, false, &mut visitor)?
+            } else {
+                self.drain_advance(current, false, &mut visitor)?
             };
-            self.left = self.drain_advance(current, false, &mut visitor)?;
         }
-    }
-
-    fn drain_back_with_visitor(
-        &mut self,
-        mut visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
-    ) -> Result {
-        loop {
-            self.limit_right_to_left_cursor();
-            let Some(current) = self.right.take() else {
-                self.close();
-                return Ok(());
-            };
-            self.right = self.drain_advance(current, true, &mut visitor)?;
-        }
-    }
-
-    fn drain_back_path_with_visitor(
-        &mut self,
-        visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
-    ) -> Result {
-        // The front cursor has already claimed the middle subtrees. The back
-        // cursor only closes its current leaf-to-root path.
-        self.right = self.right.take().and_then(RangeIterState::into_exit_path);
-        self.drain_back_with_visitor(visitor)
     }
 
     pub(crate) fn close_with_exit_visitor(
         &mut self,
-        front_changed: bool,
-        back_changed: bool,
-        mut visitor: impl for<'a> FnMut(RangeIterCursor, RangeVisit<'a>) -> Result,
+        changed: bool,
+        visitor: impl for<'a> FnMut(RangeVisit<'a>) -> Result,
     ) -> Result {
-        // The changed cursor owns unvisited subtrees on its side. If both
-        // cursors changed, the front cursor claims the middle and the back
-        // cursor only exits its current path.
-        match (front_changed, back_changed) {
-            (true, true) => {
-                self.drain_front_until_back_with_visitor(|event| {
-                    visitor(RangeIterCursor::Front, event)
-                })?;
-                self.drain_back_path_with_visitor(|event| visitor(RangeIterCursor::Back, event))
-            }
-            (true, false) => {
-                self.discard_back_cursor();
-                self.drain_front_with_visitor(|event| visitor(RangeIterCursor::Front, event))
-            }
-            (false, true) => {
-                self.discard_front_cursor();
-                self.drain_back_with_visitor(|event| visitor(RangeIterCursor::Back, event))
-            }
-            (false, false) => {
-                self.close();
-                Ok(())
-            }
+        if changed {
+            self.drain_until_back_with_visitor(visitor)
+        } else {
+            self.close();
+            Ok(())
         }
     }
 }

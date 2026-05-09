@@ -1,5 +1,5 @@
 use crate::tree_store::btree_iters::{
-    BtreeRangeIter, EntryGuard, RangeIterCursor, RangeLeafEntry, RangeSubtree, RangeVisit,
+    BtreeRangeIter, EntryGuard, RangeLeafEntry, RangeSubtree, RangeVisit,
 };
 use crate::tree_store::page_store::PageImpl;
 use crate::tree_store::subtree_rebuild::{
@@ -232,8 +232,7 @@ impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) ->
     }
 
     fn drain_unvisited(&mut self) -> Result {
-        let (front_changed, back_changed) = self.frontiers.changes();
-        self.close_range_with_exit_visitor(front_changed, back_changed)
+        self.close_range_with_exit_visitor(self.frontiers.has_changes())
     }
 
     pub(crate) fn cancel_unfinalized(&mut self) {
@@ -294,16 +293,10 @@ impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) ->
         }
     }
 
-    fn close_range_with_exit_visitor(&mut self, front_changed: bool, back_changed: bool) -> Result {
+    fn close_range_with_exit_visitor(&mut self, changed: bool) -> Result {
         self.with_visitor_deferred_recycling(|inner, frontiers, context| {
-            inner.close_with_exit_visitor(front_changed, back_changed, |cursor, event| match cursor
-            {
-                RangeIterCursor::Front => {
-                    frontiers.process_structural_event(ExtractEnd::Front, context, event)
-                }
-                RangeIterCursor::Back => {
-                    frontiers.process_structural_event(ExtractEnd::Back, context, event)
-                }
+            inner.close_with_exit_visitor(changed, |event| {
+                frontiers.process_structural_event(ExtractEnd::Front, context, event)
             })
         })
     }
@@ -361,6 +354,10 @@ impl ExtractFrontiers {
         (self.front.has_changes(), self.back.has_changes())
     }
 
+    fn has_changes(&self) -> bool {
+        self.front.has_changes() || self.back.has_changes()
+    }
+
     fn clear(&mut self) {
         self.front.clear();
         self.back.clear();
@@ -382,12 +379,11 @@ impl ExtractFrontiers {
         if front_changed && back_changed {
             self.merge_shared_current_leaf(ExtractEnd::Front);
         }
-        if front_changed {
-            self.front.complete_current_leaf(context)?;
-            self.front.flush_in_progress(context)?;
-        }
         if back_changed {
-            self.back.complete_current_leaf(context)?;
+            self.front.mark_in_progress_changed();
+        }
+        self.front.finish_in_progress(context)?;
+        if back_changed {
             self.back.flush_in_progress(context)?;
             let back_builder =
                 std::mem::replace(&mut self.back.builder, SubtreeBuilder::right_to_left());
@@ -615,12 +611,28 @@ impl ExtractFrontier {
         Ok(())
     }
 
+    fn mark_in_progress_changed(&mut self) {
+        self.in_progress.mark_changed();
+    }
+
     fn complete_current_leaf<K: Key, V: Value>(
         &mut self,
         context: &mut SubtreeRebuildContext<'_, K, V>,
     ) -> Result {
         if let Some(leaf) = self.current_leaf.take() {
             leaf.complete_unordered_into(context, &mut self.in_progress, &mut self.builder)?;
+        }
+        Ok(())
+    }
+
+    fn finish_in_progress<K: Key, V: Value>(
+        &mut self,
+        context: &mut SubtreeRebuildContext<'_, K, V>,
+    ) -> Result {
+        self.complete_current_leaf(context)?;
+        let replaced_pages = self.in_progress.finish_into(context, &mut self.builder)?;
+        for page in replaced_pages {
+            context.conditional_free(page);
         }
         Ok(())
     }
