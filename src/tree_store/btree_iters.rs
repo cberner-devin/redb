@@ -115,9 +115,9 @@ fn leaf_entries<K: Key>(
 //   entries in that leaf, the opposite cursor's parent path is cleared.
 // * Because cursors never pass each other, an Exit event from one cursor means
 //   the other cursor is not logically inside that exited subtree. If the
-//   opposite cursor still physically holds stale PageImpl handles on that path
-//   because it has not been advanced yet, those handles must be dropped before
-//   the Exit visitor runs.
+//   opposite cursor is still physically positioned on the exited page because
+//   it has not been advanced yet, that cursor must be dropped before the Exit
+//   visitor runs.
 // * LeafExit and BranchExit are emitted only after the emitting cursor has
 //   advanced past that page. At the moment the visitor observes an Exit event,
 //   the range iterator holds no PageImpl references to the exited page or to
@@ -307,24 +307,6 @@ impl RangeIterState {
         };
 
         left_page.get_page_number() == right_page.get_page_number()
-    }
-
-    // Checks physical cursor state, not logical ownership. A lazy cursor may
-    // still hold PageImpl handles on a path that it can no longer visit because
-    // the opposite cursor reached the boundary first.
-    fn path_contains_page(&self, page_number: PageNumber) -> bool {
-        if self.page_number() == page_number {
-            return true;
-        }
-        let parent = match self {
-            Enter { parent, .. }
-            | Leaf { parent, .. }
-            | BranchChild { parent, .. }
-            | Exit { parent, .. } => parent,
-        };
-        parent
-            .as_ref()
-            .is_some_and(|parent| parent.path_contains_page(page_number))
     }
 
     fn add_path_pages(&self, pages: &mut PageNumberHashSet) {
@@ -1164,13 +1146,10 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
             self.left = range_step.next;
             if let Some(event) = range_step.event {
                 // Exit visitors may rebuild/free the exited subtree. Drop any
-                // stale opposite cursor path first so the range iterator keeps
+                // cached opposite cursor path first so the range iterator keeps
                 // no PageImpl references into that subtree during the callback.
                 if let Some(page) = event.exited_page()
-                    && self
-                        .right
-                        .as_ref()
-                        .is_some_and(|right| right.path_contains_page(page))
+                    && right_path.as_ref().is_some_and(|path| path.contains(&page))
                 {
                     self.right = None;
                     self.include_right = false;
@@ -1211,7 +1190,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                         self.left = step.next;
                         // See the RangeVisit invariants: an Exit event means
                         // the opposite cursor cannot logically be inside that
-                        // subtree, so any physical path reference is stale.
+                        // subtree. If it still points at the exited page, the
+                        // cursors have reached the empty boundary.
                         if let Some(page) = step
                             .event
                             .as_ref()
@@ -1219,7 +1199,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                             && self
                                 .right
                                 .as_ref()
-                                .is_some_and(|right| right.path_contains_page(page))
+                                .is_some_and(|right| right.page_number() == page)
                         {
                             self.right = None;
                             self.include_right = false;
@@ -1277,7 +1257,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                         self.right = step.next;
                         // See the RangeVisit invariants: an Exit event means
                         // the opposite cursor cannot logically be inside that
-                        // subtree, so any physical path reference is stale.
+                        // subtree. If it still points at the exited page, the
+                        // cursors have reached the empty boundary.
                         if let Some(page) = step
                             .event
                             .as_ref()
@@ -1285,7 +1266,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                             && self
                                 .left
                                 .as_ref()
-                                .is_some_and(|left| left.path_contains_page(page))
+                                .is_some_and(|left| left.page_number() == page)
                         {
                             self.left = None;
                             self.include_left = false;
