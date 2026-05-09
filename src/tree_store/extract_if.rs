@@ -122,32 +122,26 @@ impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) ->
         loop {
             let mut entry_index = None;
             let item = match end {
-                ExtractEnd::Front => {
-                    self.with_visitor_deferred_recycling(|inner, frontiers, context| {
-                        inner.next_entry_with_visitor(|event| {
-                            if let Some(index) = frontiers.process_yielded_event(
-                                ExtractEnd::Front,
-                                context,
-                                event,
-                            )? {
-                                entry_index = Some(index);
-                            }
-                            Ok(())
-                        })
+                ExtractEnd::Front => self.with_rebuild_context(|inner, frontiers, context| {
+                    inner.next_entry_with_visitor(|event| {
+                        if let Some(index) =
+                            frontiers.process_yielded_event(ExtractEnd::Front, context, event)?
+                        {
+                            entry_index = Some(index);
+                        }
+                        Ok(())
                     })
-                }
-                ExtractEnd::Back => {
-                    self.with_visitor_deferred_recycling(|inner, frontiers, context| {
-                        inner.next_back_entry_with_visitor(|event| {
-                            if let Some(index) =
-                                frontiers.process_yielded_event(ExtractEnd::Back, context, event)?
-                            {
-                                entry_index = Some(index);
-                            }
-                            Ok(())
-                        })
+                }),
+                ExtractEnd::Back => self.with_rebuild_context(|inner, frontiers, context| {
+                    inner.next_back_entry_with_visitor(|event| {
+                        if let Some(index) =
+                            frontiers.process_yielded_event(ExtractEnd::Back, context, event)?
+                        {
+                            entry_index = Some(index);
+                        }
+                        Ok(())
                     })
-                }
+                }),
             };
 
             let entry = match item {
@@ -251,7 +245,7 @@ impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) ->
         }
     }
 
-    fn with_visitor_deferred_recycling<T>(
+    fn with_rebuild_context<T>(
         &mut self,
         f: impl FnOnce(
             &mut BtreeRangeIter<K, V>,
@@ -259,42 +253,16 @@ impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) ->
             &mut SubtreeRebuildContext<'_, K, V>,
         ) -> T,
     ) -> T {
-        // Range visitor callbacks run before the iterator step has unwound all
-        // local Page refs. Record free candidates during the callback, then
-        // recycle pages once those refs are gone.
-        let free_start = self.pending_free.len();
-        let result = {
-            let mut context: SubtreeRebuildContext<'_, K, V> =
-                SubtreeRebuildContext::defer_recycling(
-                    &self.page_allocator,
-                    &self.allocated,
-                    &mut self.pending_free,
-                );
-            f(&mut self.inner, &mut self.frontiers, &mut context)
-        };
-        if self.pending_free.len() != free_start {
-            self.recycle_deferred_pages(free_start);
-        }
-        result
-    }
-
-    fn recycle_deferred_pages(&mut self, free_start: usize) {
-        let mut deferred = self.pending_free.split_off(free_start);
-        deferred.sort_unstable();
-        deferred.dedup();
-
         let mut context: SubtreeRebuildContext<'_, K, V> = SubtreeRebuildContext::new(
             &self.page_allocator,
             &self.allocated,
             &mut self.pending_free,
         );
-        for page in deferred {
-            context.conditional_free(page);
-        }
+        f(&mut self.inner, &mut self.frontiers, &mut context)
     }
 
     fn close_range_with_exit_visitor(&mut self, changed: bool) -> Result {
-        self.with_visitor_deferred_recycling(|inner, frontiers, context| {
+        self.with_rebuild_context(|inner, frontiers, context| {
             inner.close_with_exit_visitor(changed, |event| {
                 frontiers.process_structural_event(ExtractEnd::Front, context, event)
             })

@@ -86,14 +86,7 @@ pub(super) struct SubtreeRebuildContext<'a, K: Key, V: Value> {
     page_allocator: &'a PageAllocator,
     allocated: &'a Mutex<PageTrackerPolicy>,
     freed: &'a mut Vec<PageNumber>,
-    free_policy: FreePolicy,
     _types: PhantomData<(K, V)>,
-}
-
-#[derive(Copy, Clone)]
-enum FreePolicy {
-    RecycleUncommitted,
-    DeferRecycling,
 }
 
 impl<'a, K: Key, V: Value> SubtreeRebuildContext<'a, K, V> {
@@ -106,22 +99,6 @@ impl<'a, K: Key, V: Value> SubtreeRebuildContext<'a, K, V> {
             page_allocator,
             allocated,
             freed,
-            free_policy: FreePolicy::RecycleUncommitted,
-            _types: PhantomData,
-        }
-    }
-
-    // Record free candidates without trying to recycle uncommitted pages yet.
-    pub(super) fn defer_recycling(
-        page_allocator: &'a PageAllocator,
-        allocated: &'a Mutex<PageTrackerPolicy>,
-        freed: &'a mut Vec<PageNumber>,
-    ) -> Self {
-        Self {
-            page_allocator,
-            allocated,
-            freed,
-            free_policy: FreePolicy::DeferRecycling,
             _types: PhantomData,
         }
     }
@@ -131,11 +108,6 @@ impl<'a, K: Key, V: Value> SubtreeRebuildContext<'a, K, V> {
     }
 
     pub(super) fn conditional_free(&mut self, page_number: PageNumber) {
-        if matches!(self.free_policy, FreePolicy::DeferRecycling) {
-            self.freed.push(page_number);
-            return;
-        }
-
         let mut allocated = self.allocated.lock().unwrap();
         if !self
             .page_allocator
