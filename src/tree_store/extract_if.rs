@@ -515,12 +515,12 @@ impl ExtractFrontier {
     ) -> Result {
         match event {
             RangeVisit::BranchEnter { branch } => {
-                self.in_progress.enter_branch(branch.clone());
+                self.in_progress.enter_branch(branch);
                 Ok(())
             }
             RangeVisit::SkippedSubtree { subtree } => {
                 self.in_progress
-                    .push_subtree(SealedSubtree::from_range(subtree.clone()));
+                    .push_subtree(SealedSubtree::from_range(subtree));
                 Ok(())
             }
             RangeVisit::LeafExit { subtree } => {
@@ -534,7 +534,7 @@ impl ExtractFrontier {
                 self.complete_current_leaf(context)?;
                 if let Some(replaced_page) =
                     self.in_progress
-                        .exit_branch_into(context, &mut self.builder, branch)?
+                        .exit_branch_into(context, &mut self.builder, &branch)?
                 {
                     context.conditional_free(replaced_page);
                 }
