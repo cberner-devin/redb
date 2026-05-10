@@ -683,9 +683,22 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         except: Option<usize>,
     ) {
         for i in 0..accessor.num_pairs() {
-            if let Some(except) = except
-                && except == i
-            {
+            if except == Some(i) {
+                continue;
+            }
+            let entry = accessor.entry(i).unwrap();
+            self.push(entry.key(), entry.value());
+        }
+    }
+
+    pub(super) fn push_all_except_indexes(
+        &mut self,
+        accessor: &'a LeafAccessor<'_>,
+        except: &[usize],
+    ) {
+        let mut except = except.iter().copied().peekable();
+        for i in 0..accessor.num_pairs() {
+            if except.next_if_eq(&i).is_some() {
                 continue;
             }
             let entry = accessor.entry(i).unwrap();
@@ -701,7 +714,57 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         required_size > self.page_allocator.get_page_size() && self.pairs.len() > 1
     }
 
+    pub(super) fn split_key_len(&self) -> usize {
+        let (division, _, _) = self.split_division();
+        self.pairs[division - 1].0.len()
+    }
+
     pub(super) fn build_split<'txn>(self) -> Result<(PageMut<'txn>, &'a [u8], PageMut<'txn>)> {
+        let (division, first_split_key_bytes, first_split_value_bytes) = self.split_division();
+        let division_key = self.pairs[division - 1].0;
+
+        let required_size =
+            self.required_bytes(division, first_split_key_bytes + first_split_value_bytes);
+        let mut allocated_pages = self.allocated_pages.lock().unwrap();
+        let mut page1 = self
+            .page_allocator
+            .allocate(required_size, &mut allocated_pages)?;
+        self.write_split_first_page(page1.memory_mut(), division, first_split_key_bytes);
+
+        let page2 = self.build_split_second_page(
+            division,
+            first_split_key_bytes,
+            first_split_value_bytes,
+            &mut allocated_pages,
+        )?;
+
+        Ok((page1, division_key, page2))
+    }
+
+    pub(super) fn build_split_reusing_first<'txn>(
+        self,
+        mut page1: PageMut<'txn>,
+    ) -> Result<(&'a [u8], PageMut<'txn>)> {
+        let (division, first_split_key_bytes, first_split_value_bytes) = self.split_division();
+        let division_key = self.pairs[division - 1].0;
+
+        let required_size =
+            self.required_bytes(division, first_split_key_bytes + first_split_value_bytes);
+        assert!(required_size <= page1.memory().len());
+        self.write_split_first_page(page1.memory_mut(), division, first_split_key_bytes);
+
+        let mut allocated_pages = self.allocated_pages.lock().unwrap();
+        let page2 = self.build_split_second_page(
+            division,
+            first_split_key_bytes,
+            first_split_value_bytes,
+            &mut allocated_pages,
+        )?;
+
+        Ok((division_key, page2))
+    }
+
+    fn split_division(&self) -> (usize, usize, usize) {
         let total_size = self.total_key_bytes + self.total_value_bytes;
         let mut division = 0;
         let mut first_split_key_bytes = 0;
@@ -714,15 +777,17 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
                 break;
             }
         }
+        (division, first_split_key_bytes, first_split_value_bytes)
+    }
 
-        let required_size =
-            self.required_bytes(division, first_split_key_bytes + first_split_value_bytes);
-        let mut allocated_pages = self.allocated_pages.lock().unwrap();
-        let mut page1 = self
-            .page_allocator
-            .allocate(required_size, &mut allocated_pages)?;
+    fn write_split_first_page(
+        &self,
+        page: &mut [u8],
+        division: usize,
+        first_split_key_bytes: usize,
+    ) {
         let mut builder = RawLeafBuilder::new(
-            page1.memory_mut(),
+            page,
             division,
             self.fixed_key_size,
             self.fixed_value_size,
@@ -731,8 +796,15 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         for (key, value) in self.pairs.iter().take(division) {
             builder.append(key, value);
         }
-        drop(builder);
+    }
 
+    fn build_split_second_page<'txn>(
+        &self,
+        division: usize,
+        first_split_key_bytes: usize,
+        first_split_value_bytes: usize,
+        allocated_pages: &mut PageTrackerPolicy,
+    ) -> Result<PageMut<'txn>> {
         let required_size = self.required_bytes(
             self.pairs.len() - division,
             self.total_key_bytes + self.total_value_bytes
@@ -741,7 +813,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         );
         let mut page2 = self
             .page_allocator
-            .allocate(required_size, &mut allocated_pages)?;
+            .allocate(required_size, allocated_pages)?;
         let mut builder = RawLeafBuilder::new(
             page2.memory_mut(),
             self.pairs.len() - division,
@@ -754,7 +826,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         }
         drop(builder);
 
-        Ok((page1, self.pairs[division - 1].0, page2))
+        Ok(page2)
     }
 
     pub(super) fn build<'txn>(self) -> Result<PageMut<'txn>> {
@@ -1238,6 +1310,49 @@ impl<'b> LeafMutator<'b> {
         let start = value_end;
         let end = last_value_end;
         self.page.copy_within(start..end, dest);
+    }
+
+    pub(super) fn remove_indexes(&mut self, indexes: &[usize]) {
+        assert!(!indexes.is_empty());
+        if indexes.len() == 1 {
+            self.remove(indexes[0]);
+            return;
+        }
+
+        let page_copy = self.page.to_vec();
+        let accessor = LeafAccessor::new(
+            page_copy.as_slice(),
+            self.fixed_key_size,
+            self.fixed_value_size,
+        );
+        assert!(indexes.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(indexes.last().unwrap() < &accessor.num_pairs());
+        assert!(indexes.len() < accessor.num_pairs());
+
+        let remaining = accessor.num_pairs() - indexes.len();
+        let mut total_key_bytes = 0;
+        let mut removed = indexes.iter().copied().peekable();
+        for i in 0..accessor.num_pairs() {
+            if removed.next_if_eq(&i).is_none() {
+                total_key_bytes += accessor.entry(i).unwrap().key().len();
+            }
+        }
+
+        let mut builder = RawLeafBuilder::new(
+            self.page,
+            remaining,
+            self.fixed_key_size,
+            self.fixed_value_size,
+            total_key_bytes,
+        );
+        let mut removed = indexes.iter().copied().peekable();
+        for i in 0..accessor.num_pairs() {
+            if removed.next_if_eq(&i).is_some() {
+                continue;
+            }
+            let entry = accessor.entry(i).unwrap();
+            builder.append(entry.key(), entry.value());
+        }
     }
 
     fn update_key_end(&mut self, i: usize, delta: isize) {
@@ -1769,6 +1884,45 @@ impl<'b> BranchMutator<'b> {
 
     fn num_keys(&self) -> usize {
         u16::from_le_bytes(self.page[2..4].try_into().unwrap()) as usize
+    }
+
+    fn count_children(&self) -> usize {
+        self.num_keys() + 1
+    }
+
+    fn key_section_start(&self, fixed_key_size: Option<usize>) -> usize {
+        let mut offset =
+            8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * self.count_children();
+        if fixed_key_size.is_none() {
+            offset += size_of::<u32>() * self.num_keys();
+        }
+        offset
+    }
+
+    fn key_end(&self, n: usize, fixed_key_size: Option<usize>) -> usize {
+        if let Some(fixed) = fixed_key_size {
+            return self.key_section_start(fixed_key_size) + fixed * (n + 1);
+        }
+        let offset = 8
+            + (PageNumber::serialized_size() + size_of::<Checksum>()) * self.count_children()
+            + size_of::<u32>() * n;
+        u32::from_le_bytes(
+            self.page[offset..(offset + size_of::<u32>())]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    }
+
+    pub(crate) fn write_key(&mut self, i: usize, key: &[u8], fixed_key_size: Option<usize>) {
+        debug_assert!(i < self.num_keys());
+        let offset = if i == 0 {
+            self.key_section_start(fixed_key_size)
+        } else {
+            self.key_end(i - 1, fixed_key_size)
+        };
+        let end = self.key_end(i, fixed_key_size);
+        assert_eq!(key.len(), end - offset);
+        self.page[offset..end].copy_from_slice(key);
     }
 
     pub(crate) fn write_child_page(
