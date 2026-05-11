@@ -2,13 +2,13 @@ use crate::Result;
 use crate::tree_store::btree_base::{BRANCH, LEAF};
 use crate::tree_store::btree_base::{BranchAccessor, LeafAccessor};
 use crate::tree_store::btree_iters::RangeIterState::{BranchChild, Enter, Leaf};
+use crate::tree_store::btree_range::{child_index_for_bound, leaf_entries, range_is_empty};
 use crate::tree_store::page_store::{Page, PageHint, PageImpl};
 use crate::tree_store::{PageNumber, PageResolver};
 use crate::types::{Key, Value};
-use Bound::{Excluded, Included, Unbounded};
 use std::borrow::Borrow;
-use std::collections::Bound;
 use std::marker::PhantomData;
+use std::ops::Bound::{self, Unbounded};
 use std::ops::{Range, RangeBounds};
 
 #[derive(Debug, Clone)]
@@ -37,57 +37,17 @@ enum RangeIterState {
     },
 }
 
-fn lower_bound_entry<K: Key>(accessor: &LeafAccessor<'_>, bound: Bound<&[u8]>) -> usize {
-    match bound {
-        Included(query) | Excluded(query) => {
-            let (mut position, found) = accessor.position::<K>(query);
-            if matches!(bound, Excluded(_)) && found {
-                position += 1;
-            }
-            position
-        }
-        Unbounded => 0,
-    }
-}
-
-fn upper_bound_entry<K: Key>(accessor: &LeafAccessor<'_>, bound: Bound<&[u8]>) -> usize {
-    match bound {
-        Included(query) | Excluded(query) => {
-            let (mut position, found) = accessor.position::<K>(query);
-            if matches!(bound, Included(_)) && found {
-                position += 1;
-            }
-            position
-        }
-        Unbounded => accessor.num_pairs(),
-    }
-}
-
 fn child_to_visit<K: Key>(
     accessor: &BranchAccessor<'_, '_, PageImpl>,
     bound: Bound<&[u8]>,
     reverse: bool,
 ) -> usize {
-    match bound {
-        Included(query) | Excluded(query) => accessor.child_for_key::<K>(query).0,
-        Unbounded => {
-            if reverse {
-                accessor.count_children() - 1
-            } else {
-                0
-            }
-        }
-    }
-}
-
-fn leaf_entries<K: Key>(
-    accessor: &LeafAccessor<'_>,
-    left_bound: Bound<&[u8]>,
-    right_bound: Bound<&[u8]>,
-) -> Range<usize> {
-    let start = lower_bound_entry::<K>(accessor, left_bound);
-    let end = upper_bound_entry::<K>(accessor, right_bound);
-    start..end
+    let unbounded_child = if reverse {
+        accessor.count_children() - 1
+    } else {
+        0
+    };
+    child_index_for_bound::<K>(accessor, bound, unbounded_child)
 }
 
 impl RangeIterState {
@@ -282,7 +242,7 @@ pub(crate) struct EntryGuard<K: Key, V: Value> {
 }
 
 impl<K: Key, V: Value> EntryGuard<K, V> {
-    fn new(page: PageImpl, key_range: Range<usize>, value_range: Range<usize>) -> Self {
+    pub(crate) fn new(page: PageImpl, key_range: Range<usize>, value_range: Range<usize>) -> Self {
         Self {
             page,
             key_range,
@@ -393,28 +353,6 @@ pub(crate) struct BtreeRangeIter<K: Key + 'static, V: Value + 'static> {
     hint: PageHint,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
-}
-
-fn range_is_empty<'a, K: Key + 'static, KR: Borrow<K::SelfType<'a>>, T: RangeBounds<KR>>(
-    range: &T,
-) -> bool {
-    match (range.start_bound(), range.end_bound()) {
-        (Unbounded, _) | (_, Unbounded) => false,
-        (Included(start), Excluded(end)) | (Excluded(start), Included(end) | Excluded(end)) => {
-            let start_tmp = K::as_bytes(start.borrow());
-            let start_value = start_tmp.as_ref();
-            let end_tmp = K::as_bytes(end.borrow());
-            let end_value = end_tmp.as_ref();
-            K::compare(start_value, end_value).is_ge()
-        }
-        (Included(start), Included(end)) => {
-            let start_tmp = K::as_bytes(start.borrow());
-            let start_value = start_tmp.as_ref();
-            let end_tmp = K::as_bytes(end.borrow());
-            let end_value = end_tmp.as_ref();
-            K::compare(start_value, end_value).is_gt()
-        }
-    }
 }
 
 impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {

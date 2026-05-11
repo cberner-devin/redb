@@ -14,8 +14,10 @@ use crate::{AccessGuard, Result};
 use std::borrow::Borrow;
 use std::cmp::{max, min};
 use std::marker::PhantomData;
-use std::ops::{Bound, Range, RangeBounds};
+use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
+
+mod retain_cursor;
 
 // Describes which entry to delete. `Key` navigates via key comparison; `First`
 // and `Last` navigate to the leftmost or rightmost entry, and also cause the
@@ -26,48 +28,6 @@ enum DeleteTarget<'a> {
     Key(&'a [u8]),
     First,
     Last,
-}
-
-fn range_is_empty<'r, K: Key + 'static, KR: Borrow<K::SelfType<'r>>>(
-    range: &'_ impl RangeBounds<KR>,
-) -> bool {
-    match (range.start_bound(), range.end_bound()) {
-        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
-        (Bound::Included(start), Bound::Excluded(end))
-        | (Bound::Excluded(start), Bound::Included(end) | Bound::Excluded(end)) => {
-            let start = K::as_bytes(start.borrow());
-            let end = K::as_bytes(end.borrow());
-            K::compare(start.as_ref(), end.as_ref()).is_ge()
-        }
-        (Bound::Included(start), Bound::Included(end)) => {
-            let start = K::as_bytes(start.borrow());
-            let end = K::as_bytes(end.borrow());
-            K::compare(start.as_ref(), end.as_ref()).is_gt()
-        }
-    }
-}
-
-fn lower_bound_entry<K: Key>(accessor: &LeafAccessor<'_>, bound: Bound<&[u8]>) -> usize {
-    match bound {
-        Bound::Included(query) | Bound::Excluded(query) => {
-            let (mut position, found) = accessor.position::<K>(query);
-            if matches!(bound, Bound::Excluded(_)) && found {
-                position += 1;
-            }
-            position
-        }
-        Bound::Unbounded => 0,
-    }
-}
-
-fn child_for_lower_bound<K: Key>(
-    accessor: &BranchAccessor<'_, '_, PageImpl>,
-    bound: Bound<&[u8]>,
-) -> (usize, PageNumber) {
-    match bound {
-        Bound::Included(query) | Bound::Excluded(query) => accessor.child_for_key::<K>(query),
-        Bound::Unbounded => (0, accessor.child_page(0).unwrap()),
-    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -123,581 +83,10 @@ struct InsertionResult<'a, V: Value + 'static> {
     old_value: Option<AccessGuard<'a, V>>,
 }
 
-#[derive(Clone)]
-struct CursorBranch {
-    page: PageImpl,
-    current_page: PageNumber,
-    child_index: usize,
-}
-
-struct CursorLeaf {
-    page: PageImpl,
-    entry_index: usize,
-}
-
-struct BtreeCursorEntry<'cursor> {
-    page: &'cursor PageImpl,
-    entry_index: usize,
-}
-
-impl BtreeCursorEntry<'_> {
-    fn entry<K: Key, V: Value>(&self) -> crate::tree_store::btree_base::EntryAccessor<'_> {
-        LeafAccessor::new(self.page.memory(), K::fixed_width(), V::fixed_width())
-            .entry(self.entry_index)
-            .expect("cursor entry must exist")
-    }
-}
-
-struct BufferedRetainLeaf {
-    page: PageImpl,
-    retained_spans: Vec<Range<usize>>,
-    retained_pairs: usize,
-}
-
-impl BufferedRetainLeaf {
-    fn new<K: Key, V: Value>(leaf: CursorLeaf, removed_indexes: &[usize]) -> Self {
-        let accessor = LeafAccessor::new(leaf.page.memory(), K::fixed_width(), V::fixed_width());
-        let mut retained_spans = vec![];
-        let mut start = 0;
-        for &removed in removed_indexes {
-            if start < removed {
-                retained_spans.push(start..removed);
-            }
-            start = removed + 1;
-        }
-        if start < accessor.num_pairs() {
-            retained_spans.push(start..accessor.num_pairs());
-        }
-
-        let retained_pairs = retained_spans.iter().map(Range::len).sum();
-
-        Self {
-            page: leaf.page,
-            retained_spans,
-            retained_pairs,
-        }
-    }
-}
-
-struct RetainLeafPageSpan {
-    leaf_index: usize,
-    entries: Range<usize>,
-}
-
-#[derive(Default)]
-struct RetainLeafPagePlan {
-    spans: Vec<RetainLeafPageSpan>,
-    pairs: usize,
-    key_bytes: usize,
-    keys_values_bytes: usize,
-}
-
-impl RetainLeafPagePlan {
-    fn push_entry(
-        &mut self,
-        leaf_index: usize,
-        entry_index: usize,
-        key_len: usize,
-        value_len: usize,
-    ) {
-        let entry_end = entry_index + 1;
-        if let Some(span) = self.spans.last_mut() {
-            if span.leaf_index == leaf_index && span.entries.end == entry_index {
-                span.entries.end = entry_end;
-            } else {
-                self.spans.push(RetainLeafPageSpan {
-                    leaf_index,
-                    entries: entry_index..entry_end,
-                });
-            }
-        } else {
-            self.spans.push(RetainLeafPageSpan {
-                leaf_index,
-                entries: entry_index..entry_end,
-            });
-        }
-        self.pairs += 1;
-        self.key_bytes += key_len;
-        self.keys_values_bytes += key_len + value_len;
-    }
-
-    fn clear(&mut self) {
-        self.spans.clear();
-        self.pairs = 0;
-        self.key_bytes = 0;
-        self.keys_values_bytes = 0;
-    }
-}
-
-// Changed leaves under the same parent are rebuilt together so sparse survivors
-// can be coalesced and the parent is rewritten once.
-struct BufferedRetainLeafGroup {
-    path: Vec<CursorBranch>,
-    start_child_index: usize,
-    end_child_index: usize,
-    leaves: Vec<BufferedRetainLeaf>,
-    retained_pairs: usize,
-    removed: u64,
-}
-
-impl BufferedRetainLeafGroup {
-    fn new(path: Vec<CursorBranch>, child_index: usize) -> Self {
-        Self {
-            path,
-            start_child_index: child_index,
-            end_child_index: child_index,
-            leaves: vec![],
-            retained_pairs: 0,
-            removed: 0,
-        }
-    }
-
-    fn parent_page(&self) -> PageNumber {
-        self.path
-            .last()
-            .expect("buffered retain leaf groups require a parent branch")
-            .current_page
-    }
-}
-
-struct BtreeCursorMut<'m, 'a, 'b, K: Key, V: Value> {
-    helper: &'m mut MutateHelper<'a, 'b, K, V>,
-    right_bound: Bound<Vec<u8>>,
-    path: Vec<CursorBranch>,
-    leaf: Option<CursorLeaf>,
-    removed_indexes: Vec<usize>,
-    buffered_leaf_group: Option<BufferedRetainLeafGroup>,
-    last_yielded: Option<(PageNumber, usize)>,
-    finished: bool,
-}
-
-impl<'m, 'a, 'b, K, V> BtreeCursorMut<'m, 'a, 'b, K, V>
-where
-    K: Key + 'static,
-    V: Value + 'static,
-{
-    fn new<'r, KR>(
-        helper: &'m mut MutateHelper<'a, 'b, K, V>,
-        range: &'_ impl RangeBounds<KR>,
-    ) -> Result<Self>
-    where
-        KR: Borrow<K::SelfType<'r>> + 'r,
-    {
-        let left_bound = Self::owned_bound(range.start_bound());
-        let right_bound = Self::owned_bound(range.end_bound());
-        let mut cursor = Self {
-            helper,
-            right_bound,
-            path: vec![],
-            leaf: None,
-            removed_indexes: vec![],
-            buffered_leaf_group: None,
-            last_yielded: None,
-            finished: range_is_empty::<K, KR>(range),
-        };
-        if !cursor.finished {
-            cursor.seek(left_bound)?;
-        }
-        Ok(cursor)
-    }
-
-    fn owned_bound<'r, KR>(bound: Bound<&KR>) -> Bound<Vec<u8>>
-    where
-        KR: Borrow<K::SelfType<'r>> + 'r,
-    {
-        match bound {
-            Bound::Included(value) => {
-                Bound::Included(K::as_bytes(value.borrow()).as_ref().to_vec())
-            }
-            Bound::Excluded(value) => {
-                Bound::Excluded(K::as_bytes(value.borrow()).as_ref().to_vec())
-            }
-            Bound::Unbounded => Bound::Unbounded,
-        }
-    }
-
-    fn seek(&mut self, bound: Bound<Vec<u8>>) -> Result {
-        assert!(self.buffered_leaf_group.is_none());
-        self.path.clear();
-        self.leaf = None;
-        let Some(header) = *self.helper.root else {
-            self.finished = true;
-            return Ok(());
-        };
-        let page = self
-            .helper
-            .page_allocator
-            .get_page(header.root, PageHint::None)?;
-        self.descend_to_bound(page, bound)
-    }
-
-    fn descend_to_bound(&mut self, mut page: PageImpl, bound: Bound<Vec<u8>>) -> Result {
-        loop {
-            match page.memory()[0] {
-                LEAF => {
-                    let accessor =
-                        LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
-                    let entry_index =
-                        lower_bound_entry::<K>(&accessor, bound.as_ref().map(Vec::as_slice));
-                    self.leaf = Some(CursorLeaf { page, entry_index });
-                    return Ok(());
-                }
-                BRANCH => {
-                    let (child_index, child_page) = {
-                        let accessor = BranchAccessor::new(&page, K::fixed_width());
-                        child_for_lower_bound::<K>(&accessor, bound.as_ref().map(Vec::as_slice))
-                    };
-                    let current_page = page.get_page_number();
-                    self.path.push(CursorBranch {
-                        page,
-                        current_page,
-                        child_index,
-                    });
-                    page = self
-                        .helper
-                        .page_allocator
-                        .get_page(child_page, PageHint::None)?;
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    fn descend_leftmost(&mut self, mut page: PageImpl) -> Result {
-        loop {
-            match page.memory()[0] {
-                LEAF => {
-                    self.leaf = Some(CursorLeaf {
-                        page,
-                        entry_index: 0,
-                    });
-                    return Ok(());
-                }
-                BRANCH => {
-                    let child_page = {
-                        let accessor = BranchAccessor::new(&page, K::fixed_width());
-                        accessor.child_page(0).unwrap()
-                    };
-                    let current_page = page.get_page_number();
-                    self.path.push(CursorBranch {
-                        page,
-                        current_page,
-                        child_index: 0,
-                    });
-                    page = self
-                        .helper
-                        .page_allocator
-                        .get_page(child_page, PageHint::None)?;
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    fn next(&mut self) -> Result<Option<BtreeCursorEntry<'_>>> {
-        loop {
-            if self.finished {
-                return Ok(None);
-            }
-
-            if self.next_entry_is_ready()? {
-                break;
-            }
-        }
-
-        let leaf = self.leaf.as_mut().expect("cursor must have a ready leaf");
-        let entry_index = leaf.entry_index;
-        let page_number = leaf.page.get_page_number();
-        leaf.entry_index += 1;
-        self.last_yielded = Some((page_number, entry_index));
-        Ok(Some(BtreeCursorEntry {
-            page: &leaf.page,
-            entry_index,
-        }))
-    }
-
-    fn next_entry_is_ready(&mut self) -> Result<bool> {
-        let Some(leaf) = self.leaf.as_ref() else {
-            self.finished = true;
-            return Ok(false);
-        };
-        let accessor = LeafAccessor::new(leaf.page.memory(), K::fixed_width(), V::fixed_width());
-        if leaf.entry_index < accessor.num_pairs() {
-            if matches!(self.right_bound, Bound::Unbounded) {
-                return Ok(true);
-            }
-            let right_bound = self.right_bound.as_ref().map(Vec::as_slice);
-            let entry = accessor.entry(leaf.entry_index).unwrap();
-            if Self::before_right_bound(right_bound, entry.key()) {
-                return Ok(true);
-            }
-            self.finish_current_leaf(None, false)?;
-            self.finished = true;
-            return Ok(false);
-        }
-
-        self.finish_current_leaf(None, true)?;
-        Ok(false)
-    }
-
-    fn remove_prev(&mut self) -> Result<bool> {
-        let Some((page, index)) = self.last_yielded.take() else {
-            return Ok(false);
-        };
-        let Some(leaf) = self.leaf.as_ref() else {
-            return Ok(false);
-        };
-        assert_eq!(leaf.page.get_page_number(), page);
-        if self
-            .removed_indexes
-            .last()
-            .is_none_or(|last| *last != index)
-        {
-            self.removed_indexes.push(index);
-        }
-        Ok(true)
-    }
-
-    fn close(&mut self) -> Result {
-        self.finish_current_leaf(None, false)?;
-        self.flush_buffered_leaf_group(None, false)?;
-        self.finished = true;
-        Ok(())
-    }
-
-    fn before_right_bound(right_bound: Bound<&[u8]>, key: &[u8]) -> bool {
-        match right_bound {
-            Bound::Included(bound) => K::compare(key, bound).is_le(),
-            Bound::Excluded(bound) => K::compare(key, bound).is_lt(),
-            Bound::Unbounded => true,
-        }
-    }
-
-    fn next_bound_after_current_leaf(&self) -> Option<Bound<Vec<u8>>> {
-        for frame in self.path.iter().rev() {
-            let accessor = BranchAccessor::new(&frame.page, K::fixed_width());
-            if frame.child_index + 1 < accessor.count_children() {
-                return Some(Bound::Excluded(
-                    accessor.key(frame.child_index).unwrap().to_vec(),
-                ));
-            }
-        }
-        None
-    }
-
-    fn move_to_next_leaf(&mut self) -> Result {
-        assert!(self.buffered_leaf_group.is_none());
-        loop {
-            let Some(mut frame) = self.path.pop() else {
-                self.leaf = None;
-                self.finished = true;
-                return Ok(());
-            };
-            let next_child = {
-                let accessor = BranchAccessor::new(&frame.page, K::fixed_width());
-                let child = frame.child_index + 1;
-                (child < accessor.count_children())
-                    .then(|| (child, accessor.child_page(child).unwrap()))
-            };
-            if let Some((child_index, child_page)) = next_child {
-                frame.child_index = child_index;
-                self.path.push(frame);
-                let page = self
-                    .helper
-                    .page_allocator
-                    .get_page(child_page, PageHint::None)?;
-                return self.descend_leftmost(page);
-            }
-        }
-    }
-
-    fn finish_current_leaf(&mut self, next_bound: Option<Bound<Vec<u8>>>, advance: bool) -> Result {
-        self.last_yielded = None;
-        let Some(leaf) = self.leaf.take() else {
-            return Ok(());
-        };
-        if self.removed_indexes.is_empty() {
-            if self.buffered_leaf_group.is_some() {
-                self.buffer_leaf_for_group(leaf, &[]);
-                return self.finish_buffered_leaf_group(next_bound, advance);
-            }
-            self.leaf = Some(leaf);
-            if advance {
-                return self.move_to_next_leaf();
-            }
-            return Ok(());
-        }
-
-        let removed_bytes = Self::removed_pair_bytes(&leaf, &self.removed_indexes);
-        let preserve_path = self.leaf_rewrite_preserves_path(&leaf, removed_bytes);
-        if self.buffered_leaf_group.is_some() || (!preserve_path && self.path.last().is_some()) {
-            let mut removed_indexes = std::mem::take(&mut self.removed_indexes);
-            self.buffer_leaf_for_group(leaf, &removed_indexes);
-            removed_indexes.clear();
-            self.removed_indexes = removed_indexes;
-            return self.finish_buffered_leaf_group(next_bound, advance);
-        }
-        let next_bound = if preserve_path || !advance {
-            next_bound
-        } else {
-            next_bound.or_else(|| self.next_bound_after_current_leaf())
-        };
-        let path = std::mem::take(&mut self.path);
-        let mut removed_indexes = Vec::new();
-        std::mem::swap(&mut removed_indexes, &mut self.removed_indexes);
-        let result = if preserve_path {
-            self.path = self.helper.rewrite_cursor_leaf_preserving_path(
-                leaf.page,
-                path,
-                &removed_indexes,
-                removed_bytes,
-            )?;
-            if advance {
-                self.move_to_next_leaf()?;
-            } else {
-                self.finished = true;
-            }
-            Ok(())
-        } else if let Some(bound) = next_bound {
-            self.helper
-                .delete_cursor_leaf(leaf.page, path, &removed_indexes, removed_bytes)?;
-            self.seek(bound)?;
-            Ok(())
-        } else {
-            self.helper
-                .delete_cursor_leaf(leaf.page, path, &removed_indexes, removed_bytes)?;
-            self.finished = true;
-            Ok(())
-        };
-        removed_indexes.clear();
-        self.removed_indexes = removed_indexes;
-        result
-    }
-
-    fn finish_buffered_leaf_group(
-        &mut self,
-        next_bound: Option<Bound<Vec<u8>>>,
-        advance: bool,
-    ) -> Result {
-        let should_flush = !advance || self.current_leaf_is_last_in_parent();
-        let next_bound = if should_flush && advance {
-            next_bound.or_else(|| self.next_bound_after_current_leaf())
-        } else {
-            next_bound
-        };
-        if should_flush {
-            self.flush_buffered_leaf_group(next_bound, advance)
-        } else if advance {
-            self.move_to_next_leaf_in_buffered_parent()
-        } else {
-            Ok(())
-        }
-    }
-
-    fn current_leaf_is_last_in_parent(&self) -> bool {
-        let Some(frame) = self.path.last() else {
-            return true;
-        };
-        let accessor = BranchAccessor::new(&frame.page, K::fixed_width());
-        frame.child_index + 1 == accessor.count_children()
-    }
-
-    fn move_to_next_leaf_in_buffered_parent(&mut self) -> Result {
-        assert!(self.buffered_leaf_group.is_some());
-        let Some(frame) = self.path.last_mut() else {
-            self.leaf = None;
-            self.finished = true;
-            return Ok(());
-        };
-        let child_page = {
-            let accessor = BranchAccessor::new(&frame.page, K::fixed_width());
-            let child = frame.child_index + 1;
-            assert!(child < accessor.count_children());
-            frame.child_index = child;
-            accessor.child_page(child).unwrap()
-        };
-        let page = self
-            .helper
-            .page_allocator
-            .get_page(child_page, PageHint::None)?;
-        self.descend_leftmost(page)
-    }
-
-    fn buffer_leaf_for_group(&mut self, leaf: CursorLeaf, removed_indexes: &[usize]) {
-        let child_index = self
-            .path
-            .last()
-            .expect("buffered retain leaf groups require a parent branch")
-            .child_index;
-        if self.buffered_leaf_group.is_none() {
-            self.buffered_leaf_group =
-                Some(BufferedRetainLeafGroup::new(self.path.clone(), child_index));
-        }
-
-        let group = self.buffered_leaf_group.as_mut().unwrap();
-        debug_assert_eq!(
-            group.parent_page(),
-            self.path
-                .last()
-                .expect("buffered retain leaf groups require a parent branch")
-                .current_page
-        );
-        debug_assert!(child_index >= group.start_child_index);
-        group.end_child_index = child_index;
-        group.removed += removed_indexes.len() as u64;
-
-        let buffered_leaf = BufferedRetainLeaf::new::<K, V>(leaf, removed_indexes);
-        group.retained_pairs += buffered_leaf.retained_pairs;
-        group.leaves.push(buffered_leaf);
-    }
-
-    fn flush_buffered_leaf_group(
-        &mut self,
-        next_bound: Option<Bound<Vec<u8>>>,
-        advance: bool,
-    ) -> Result {
-        let Some(group) = self.buffered_leaf_group.take() else {
-            return Ok(());
-        };
-        self.path.clear();
-        self.leaf = None;
-        self.helper.replace_buffered_retain_leaf_group(group)?;
-        if advance {
-            if let Some(bound) = next_bound {
-                self.seek(bound)?;
-            } else {
-                self.finished = true;
-            }
-        } else {
-            self.finished = true;
-        }
-        Ok(())
-    }
-
-    fn removed_pair_bytes(leaf: &CursorLeaf, removed_indexes: &[usize]) -> usize {
-        let accessor = LeafAccessor::new(leaf.page.memory(), K::fixed_width(), V::fixed_width());
-        removed_indexes
-            .iter()
-            .map(|&index| accessor.length_of_pairs(index, index + 1))
-            .sum()
-    }
-
-    fn leaf_rewrite_preserves_path(&self, leaf: &CursorLeaf, removed_bytes: usize) -> bool {
-        let accessor = LeafAccessor::new(leaf.page.memory(), K::fixed_width(), V::fixed_width());
-        let remaining = accessor.num_pairs() - self.removed_indexes.len();
-        if remaining == 0 {
-            return false;
-        }
-        let new_kv_bytes = accessor.length_of_pairs(0, accessor.num_pairs()) - removed_bytes;
-        let new_required_bytes = RawLeafBuilder::required_bytes(
-            remaining,
-            new_kv_bytes,
-            K::fixed_width(),
-            V::fixed_width(),
-        );
-        new_required_bytes >= self.helper.page_allocator.get_page_size() / 3
-    }
-}
+pub(crate) use self::retain_cursor::BtreeRangeCursorMut;
+use self::retain_cursor::{
+    BtreeCursorMut, BufferedRetainLeafGroup, CursorBranch, RetainLeafPagePlan,
+};
 
 pub(crate) struct MutateHelper<'a, 'b, K: Key, V: Value> {
     root: &'b mut Option<BtreeHeader>,
@@ -814,26 +203,13 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     fn delete_cursor_leaf(
         &mut self,
         leaf: PageImpl,
-        mut path: Vec<CursorBranch>,
+        path: Vec<CursorBranch>,
         removed_indexes: &[usize],
         removed_bytes: usize,
     ) -> Result {
         let removed = removed_indexes.len() as u64;
-        let mut result = self.delete_leaf_indexes(leaf, removed_indexes, removed_bytes)?;
-        while let Some(frame) = path.pop() {
-            let (page, child_index) = self.current_branch_page(frame)?;
-            result = self.delete_branch_child(page, child_index, result)?;
-        }
-
-        let Some(header) = *self.root else {
-            return Ok(());
-        };
-        let new_length = header
-            .length
-            .checked_sub(removed)
-            .expect("cursor removed more entries than the tree contains");
-        *self.root = self.finish_delete_root(result, new_length)?;
-        Ok(())
+        let result = self.delete_leaf_indexes(leaf, removed_indexes, removed_bytes)?;
+        self.finish_delete_path(result, path, removed)
     }
 
     fn replace_buffered_retain_leaf_group(&mut self, mut group: BufferedRetainLeafGroup) -> Result {
@@ -845,7 +221,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             .expect("buffered retain leaf groups require a parent branch");
         let (parent_page, _) = self.current_branch_page(parent_frame)?;
         let parent_page_number = parent_page.get_page_number();
-        let mut result = {
+        let result = {
             let accessor = BranchAccessor::new(&parent_page, K::fixed_width());
             assert!(group.start_child_index <= group.end_child_index);
             assert!(group.end_child_index < accessor.count_children());
@@ -896,15 +272,24 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         };
         drop(parent_page);
         for leaf in group.leaves {
-            let page_number = leaf.page.get_page_number();
+            let page_number = leaf.get_page_number();
             drop(leaf);
             self.conditional_free(page_number);
         }
         self.conditional_free(parent_page_number);
 
-        while let Some(frame) = group.path.pop() {
+        self.finish_delete_path(result, group.path, group.removed)
+    }
+
+    fn finish_delete_path(
+        &mut self,
+        mut deletion_result: DeletionResult<'_>,
+        mut path: Vec<CursorBranch>,
+        removed: u64,
+    ) -> Result {
+        while let Some(frame) = path.pop() {
             let (page, child_index) = self.current_branch_page(frame)?;
-            result = self.delete_branch_child(page, child_index, result)?;
+            deletion_result = self.delete_branch_child(page, child_index, deletion_result)?;
         }
 
         let Some(header) = *self.root else {
@@ -912,9 +297,9 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         };
         let new_length = header
             .length
-            .checked_sub(group.removed)
+            .checked_sub(removed)
             .expect("cursor removed more entries than the tree contains");
-        *self.root = self.finish_delete_root(result, new_length)?;
+        *self.root = self.finish_delete_root(deletion_result, new_length)?;
         Ok(())
     }
 
@@ -923,43 +308,41 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         group: &BufferedRetainLeafGroup,
     ) -> Result<Vec<(PageNumber, Checksum, Vec<u8>)>> {
         let mut leaves = vec![];
-        if group.retained_pairs == 0 {
+        if group.retained_spans.is_empty() {
             return Ok(leaves);
         }
 
         let mut plan = RetainLeafPagePlan::default();
-        for (leaf_index, leaf) in group.leaves.iter().enumerate() {
-            let accessor =
-                LeafAccessor::new(leaf.page.memory(), K::fixed_width(), V::fixed_width());
-            for span in &leaf.retained_spans {
-                for entry_index in span.clone() {
-                    let entry = accessor.entry(entry_index).unwrap();
-                    let key_len = entry.key().len();
-                    let value_len = entry.value().len();
-                    let next_pairs = plan.pairs + 1;
-                    let next_bytes = plan.keys_values_bytes + key_len + value_len;
-                    let mut required = RawLeafBuilder::required_bytes(
-                        next_pairs,
-                        next_bytes,
+        for retained_span in &group.retained_spans {
+            let leaf = &group.leaves[retained_span.leaf_index];
+            let accessor = LeafAccessor::new(leaf.memory(), K::fixed_width(), V::fixed_width());
+            for entry_index in retained_span.entries.clone() {
+                let entry = accessor.entry(entry_index).unwrap();
+                let key_len = entry.key().len();
+                let value_len = entry.value().len();
+                let next_pairs = plan.pairs + 1;
+                let next_bytes = plan.keys_values_bytes + key_len + value_len;
+                let mut required = RawLeafBuilder::required_bytes(
+                    next_pairs,
+                    next_bytes,
+                    K::fixed_width(),
+                    V::fixed_width(),
+                );
+                if plan.pairs > 0 && required > self.page_allocator.get_page_size() {
+                    leaves.push(self.build_retain_leaf_page(&plan, &group.leaves)?);
+                    plan.clear();
+                    required = RawLeafBuilder::required_bytes(
+                        1,
+                        key_len + value_len,
                         K::fixed_width(),
                         V::fixed_width(),
                     );
-                    if plan.pairs > 0 && required > self.page_allocator.get_page_size() {
-                        leaves.push(self.build_retain_leaf_page(&plan, &group.leaves)?);
-                        plan.clear();
-                        required = RawLeafBuilder::required_bytes(
-                            1,
-                            key_len + value_len,
-                            K::fixed_width(),
-                            V::fixed_width(),
-                        );
-                    }
+                }
 
-                    plan.push_entry(leaf_index, entry_index, key_len, value_len);
-                    if required > self.page_allocator.get_page_size() {
-                        leaves.push(self.build_retain_leaf_page(&plan, &group.leaves)?);
-                        plan.clear();
-                    }
+                plan.push_entry(retained_span.leaf_index, entry_index, key_len, value_len);
+                if required > self.page_allocator.get_page_size() {
+                    leaves.push(self.build_retain_leaf_page(&plan, &group.leaves)?);
+                    plan.clear();
                 }
             }
         }
@@ -972,15 +355,15 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     fn build_retain_leaf_page(
         &mut self,
         plan: &RetainLeafPagePlan,
-        buffered_leaves: &[BufferedRetainLeaf],
+        leaf_pages: &[PageImpl],
     ) -> Result<(PageNumber, Checksum, Vec<u8>)> {
         let last_span = plan
             .spans
             .last()
             .expect("retain leaf page requires at least one span");
-        let last_leaf = &buffered_leaves[last_span.leaf_index];
+        let last_leaf = &leaf_pages[last_span.leaf_index];
         let last_accessor =
-            LeafAccessor::new(last_leaf.page.memory(), K::fixed_width(), V::fixed_width());
+            LeafAccessor::new(last_leaf.memory(), K::fixed_width(), V::fixed_width());
         let upper_key = last_accessor
             .entry(last_span.entries.end - 1)
             .expect("retain leaf span entry must exist")
@@ -1005,12 +388,9 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             plan.key_bytes,
         );
         for span in &plan.spans {
-            let buffered_leaf = &buffered_leaves[span.leaf_index];
-            let accessor = LeafAccessor::new(
-                buffered_leaf.page.memory(),
-                K::fixed_width(),
-                V::fixed_width(),
-            );
+            let leaf_page = &leaf_pages[span.leaf_index];
+            let accessor =
+                LeafAccessor::new(leaf_page.memory(), K::fixed_width(), V::fixed_width());
             for entry_index in span.entries.clone() {
                 let entry = accessor.entry(entry_index).unwrap();
                 builder.append(entry.key(), entry.value());
@@ -1124,15 +504,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             mutator.remove_indexes(removed_indexes);
             Ok(old_page)
         } else {
-            let mut builder = LeafBuilder::new(
-                &self.page_allocator,
-                &self.allocated,
+            let new_page = self.build_leaf_except_deleted(
+                &accessor,
                 remaining,
-                K::fixed_width(),
-                V::fixed_width(),
-            );
-            builder.push_all_except_indexes(&accessor, removed_indexes);
-            let new_page = builder.build()?;
+                DeletedPairs::Many(removed_indexes),
+            )?;
             drop(page);
             self.conditional_free(old_page);
             Ok(new_page.get_page_number())
@@ -1191,15 +567,8 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                 if remaining == 0 {
                     None
                 } else {
-                    let mut builder = LeafBuilder::new(
-                        &self.page_allocator,
-                        &self.allocated,
-                        remaining,
-                        K::fixed_width(),
-                        V::fixed_width(),
-                    );
-                    Self::push_all_except_deleted(&mut builder, &accessor, deleted_pairs);
-                    let page = builder.build()?;
+                    let page =
+                        self.build_leaf_except_deleted(&accessor, remaining, deleted_pairs)?;
                     assert_eq!(new_length, remaining as u64);
                     Some(BtreeHeader::new(
                         page.get_page_number(),
@@ -1245,6 +614,23 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         }
     }
 
+    fn build_leaf_except_deleted<'txn>(
+        &self,
+        accessor: &LeafAccessor<'_>,
+        retained_pairs: usize,
+        deleted_pairs: DeletedPairs<'_>,
+    ) -> Result<PageMut<'txn>> {
+        let mut builder = LeafBuilder::new(
+            &self.page_allocator,
+            &self.allocated,
+            retained_pairs,
+            K::fixed_width(),
+            V::fixed_width(),
+        );
+        Self::push_all_except_deleted(&mut builder, accessor, deleted_pairs);
+        builder.build()
+    }
+
     fn delete_leaf_indexes<'p>(
         &mut self,
         page: PageImpl,
@@ -1274,15 +660,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     deleted_pairs: DeletedPairs::Many(removed_indexes),
                 }
             } else {
-                let mut builder = LeafBuilder::new(
-                    &self.page_allocator,
-                    &self.allocated,
+                let new_page = self.build_leaf_except_deleted(
+                    &accessor,
                     remaining,
-                    K::fixed_width(),
-                    V::fixed_width(),
-                );
-                builder.push_all_except_indexes(&accessor, removed_indexes);
-                let new_page = builder.build()?;
+                    DeletedPairs::Many(removed_indexes),
+                )?;
                 Subtree(new_page.get_page_number())
             }
         };
@@ -1416,19 +798,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                         && merge_with_accessor.total_length() >= self.page_allocator.get_page_size()
                 };
                 if single_large_value {
-                    let mut child_builder = LeafBuilder::new(
-                        &self.page_allocator,
-                        &self.allocated,
-                        partial_child_pairs,
-                        K::fixed_width(),
-                        V::fixed_width(),
-                    );
-                    Self::push_all_except_deleted(
-                        &mut child_builder,
+                    let new_page = self.build_leaf_except_deleted(
                         &partial_child_accessor,
+                        partial_child_pairs,
                         deleted_pairs,
-                    );
-                    let new_page = child_builder.build()?;
+                    )?;
                     builder.push_all(&accessor);
                     builder.replace_child(child_index, new_page.get_page_number(), DEFERRED);
                     let result = Self::finalize_branch_builder(

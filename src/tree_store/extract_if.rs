@@ -1,8 +1,10 @@
 use crate::Result;
-use crate::tree_store::btree_iters::{BtreeRangeIter, EntryGuard};
-use crate::tree_store::btree_mutator::MutateHelper;
+use crate::tree_store::btree_iters::EntryGuard;
+use crate::tree_store::btree_mutator::BtreeRangeCursorMut;
 use crate::tree_store::{BtreeHeader, PageAllocator, PageNumber, PageTrackerPolicy};
 use crate::types::{Key, Value};
+use std::borrow::Borrow;
+use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct BtreeExtractIf<
@@ -11,36 +13,35 @@ pub(crate) struct BtreeExtractIf<
     V: Value + 'static,
     F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
 > {
-    root: &'a mut Option<BtreeHeader>,
-    inner: BtreeRangeIter<K, V>,
+    inner: BtreeRangeCursorMut<'a, K, V>,
     predicate: F,
     predicate_running: bool,
-    free_on_drop: Vec<PageNumber>,
-    master_free_list: Arc<Mutex<Vec<PageNumber>>>,
-    allocated: Arc<Mutex<PageTrackerPolicy>>,
-    page_allocator: PageAllocator,
 }
 
 impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>
     BtreeExtractIf<'a, K, V, F>
 {
-    pub(crate) fn new(
+    pub(crate) fn new<'r, KR>(
         root: &'a mut Option<BtreeHeader>,
-        inner: BtreeRangeIter<K, V>,
+        range: &'_ impl RangeBounds<KR>,
         predicate: F,
         master_free_list: Arc<Mutex<Vec<PageNumber>>>,
         allocated: Arc<Mutex<PageTrackerPolicy>>,
         page_allocator: PageAllocator,
-    ) -> Self {
+    ) -> Self
+    where
+        KR: Borrow<K::SelfType<'r>> + 'r,
+    {
         Self {
-            root,
-            inner,
+            inner: BtreeRangeCursorMut::new(
+                root,
+                range,
+                page_allocator,
+                allocated,
+                master_free_list,
+            ),
             predicate,
             predicate_running: false,
-            free_on_drop: vec![],
-            master_free_list,
-            allocated,
-            page_allocator,
         }
     }
 
@@ -57,22 +58,7 @@ impl<'a, K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) ->
     }
 
     pub(crate) fn close(&mut self) -> Result {
-        self.inner.close();
-        self.free_pending_pages();
-        Ok(())
-    }
-
-    fn free_pending_pages(&mut self) {
-        let mut master_free_list = self.master_free_list.lock().unwrap();
-        let mut allocated = self.allocated.lock().unwrap();
-        for page in self.free_on_drop.drain(..) {
-            if !self
-                .page_allocator
-                .free_if_uncommitted(page, &mut allocated)
-            {
-                master_free_list.push(page);
-            }
-        }
+        self.inner.close()
     }
 }
 
@@ -82,28 +68,18 @@ impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> boo
     type Item = Result<EntryGuard<K, V>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut item = self.inner.next();
-        while let Some(Ok(ref entry)) = item {
-            if self.predicate_matches(entry) {
-                let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new_do_not_modify(
-                    self.root,
-                    self.page_allocator.clone(),
-                    &mut self.free_on_drop,
-                    self.allocated.clone(),
-                );
-                match operation.delete(&entry.key()) {
-                    Ok(x) => {
-                        assert!(x.is_some());
-                    }
-                    Err(x) => {
-                        return Some(Err(x));
-                    }
-                }
-                break;
+        loop {
+            let entry = match self.inner.next() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return None,
+                Err(err) => return Some(Err(err)),
+            };
+            let guard = entry.into_entry_guard::<K, V>();
+            if self.predicate_matches(&guard) {
+                assert!(self.inner.remove_prev());
+                return Some(Ok(guard));
             }
-            item = self.inner.next();
         }
-        item
     }
 }
 
@@ -111,28 +87,18 @@ impl<K: Key, V: Value, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> boo
     DoubleEndedIterator for BtreeExtractIf<'_, K, V, F>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let mut item = self.inner.next_back();
-        while let Some(Ok(ref entry)) = item {
-            if self.predicate_matches(entry) {
-                let mut operation: MutateHelper<'_, '_, K, V> = MutateHelper::new_do_not_modify(
-                    self.root,
-                    self.page_allocator.clone(),
-                    &mut self.free_on_drop,
-                    self.allocated.clone(),
-                );
-                match operation.delete(&entry.key()) {
-                    Ok(x) => {
-                        assert!(x.is_some());
-                    }
-                    Err(x) => {
-                        return Some(Err(x));
-                    }
-                }
-                break;
+        loop {
+            let entry = match self.inner.next_back() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return None,
+                Err(err) => return Some(Err(err)),
+            };
+            let guard = entry.into_entry_guard::<K, V>();
+            if self.predicate_matches(&guard) {
+                assert!(self.inner.remove_prev());
+                return Some(Ok(guard));
             }
-            item = self.inner.next_back();
         }
-        item
     }
 }
 
