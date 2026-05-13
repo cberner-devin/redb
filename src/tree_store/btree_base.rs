@@ -677,6 +677,14 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         self.pairs.push((key, value));
     }
 
+    pub(super) fn would_split_with(&self, key: &[u8], value: &[u8]) -> bool {
+        let required_size = self.required_bytes(
+            self.pairs.len() + 1,
+            self.total_key_bytes + self.total_value_bytes + key.len() + value.len(),
+        );
+        required_size > self.page_allocator.get_page_size() && !self.pairs.is_empty()
+    }
+
     pub(super) fn push_all_except(
         &mut self,
         accessor: &'a LeafAccessor<'_>,

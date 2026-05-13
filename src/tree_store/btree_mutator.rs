@@ -13,6 +13,8 @@ use crate::types::{Key, Value};
 use crate::{AccessGuard, Result};
 use std::cmp::{max, min};
 use std::marker::PhantomData;
+use std::mem::size_of;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -65,6 +67,94 @@ enum LeafDeleteDisposition {
 struct LeafDeletePlan {
     retained_pairs: usize,
     disposition: LeafDeleteDisposition,
+}
+
+struct BufferedRetainLeaf {
+    page: PageImpl,
+    retained_spans: Vec<Range<usize>>,
+    retained_pairs: usize,
+}
+
+impl BufferedRetainLeaf {
+    fn new<K: Key, V: Value>(page: PageImpl, removed_indexes: &[usize]) -> Self {
+        debug_assert!(removed_indexes.windows(2).all(|pair| pair[0] < pair[1]));
+        let retained_spans = {
+            let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
+            debug_assert!(
+                removed_indexes
+                    .last()
+                    .is_none_or(|index| *index < accessor.num_pairs())
+            );
+            let mut retained_spans = vec![];
+            let mut start = 0;
+            for &removed in removed_indexes {
+                if start < removed {
+                    retained_spans.push(start..removed);
+                }
+                start = removed + 1;
+            }
+            if start < accessor.num_pairs() {
+                retained_spans.push(start..accessor.num_pairs());
+            }
+            retained_spans
+        };
+        let retained_pairs = retained_spans.iter().map(Range::len).sum();
+
+        Self {
+            page,
+            retained_spans,
+            retained_pairs,
+        }
+    }
+}
+
+// A contiguous run of leaf children under one parent branch. Retain buffers the
+// run when deleting from a leaf would leave it sparse, then rebuilds the run
+// into packed replacement leaves and applies one parent update.
+pub(super) struct BufferedRetainLeafGroup {
+    path: Vec<(PageImpl, usize)>,
+    start_child_index: usize,
+    end_child_index: usize,
+    leaves: Vec<BufferedRetainLeaf>,
+    retained_pairs: usize,
+    removed: u64,
+}
+
+impl BufferedRetainLeafGroup {
+    pub(super) fn new(path: Vec<(PageImpl, usize)>, child_index: usize) -> Self {
+        Self {
+            path,
+            start_child_index: child_index,
+            end_child_index: child_index,
+            leaves: vec![],
+            retained_pairs: 0,
+            removed: 0,
+        }
+    }
+
+    pub(super) fn parent_page(&self) -> PageNumber {
+        self.path
+            .last()
+            .expect("buffered retain leaf groups require a parent branch")
+            .0
+            .get_page_number()
+    }
+
+    pub(super) fn push_leaf<K: Key, V: Value>(
+        &mut self,
+        page: PageImpl,
+        child_index: usize,
+        removed_indexes: &[usize],
+    ) {
+        debug_assert!(child_index >= self.start_child_index);
+        debug_assert!(self.leaves.is_empty() || child_index == self.end_child_index + 1);
+        self.end_child_index = child_index;
+        self.removed += removed_indexes.len() as u64;
+
+        let buffered_leaf = BufferedRetainLeaf::new::<K, V>(page, removed_indexes);
+        self.retained_pairs += buffered_leaf.retained_pairs;
+        self.leaves.push(buffered_leaf);
+    }
 }
 
 struct InsertionResult<'a, V: Value + 'static> {
@@ -252,6 +342,155 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
             result = self.apply_child_deletion_result(page, child_index, result)?;
         }
         self.finish_deletion(result, length - indexes.len() as u64)
+    }
+
+    pub(super) fn replace_buffered_retain_leaf_group(
+        &mut self,
+        mut group: BufferedRetainLeafGroup,
+    ) -> Result {
+        let replacement_leaves = self.build_retain_leaf_pages(&group)?;
+
+        let (parent_page, _) = group
+            .path
+            .pop()
+            .expect("buffered retain leaf groups require a parent branch");
+        let parent_page_number = parent_page.get_page_number();
+        let mut result = {
+            let accessor = BranchAccessor::new(&parent_page, K::fixed_width());
+            assert!(group.start_child_index <= group.end_child_index);
+            assert!(group.end_child_index < accessor.count_children());
+
+            let old_children = accessor.count_children();
+            let replaced_children = group.end_child_index - group.start_child_index + 1;
+            let new_children = old_children - replaced_children + replacement_leaves.len();
+            if new_children == 0 {
+                DeletedLeaf
+            } else {
+                let mut builder = BranchBuilder::new(
+                    &self.page_allocator,
+                    &self.allocated,
+                    new_children,
+                    K::fixed_width(),
+                );
+                let mut pushed = 0;
+                for i in 0..group.start_child_index {
+                    builder.push_child(
+                        accessor.child_page(i).unwrap(),
+                        accessor.child_checksum(i).unwrap(),
+                    );
+                    pushed += 1;
+                    if pushed < new_children {
+                        builder.push_key(accessor.key(i).unwrap());
+                    }
+                }
+                for (page, checksum, upper_key) in &replacement_leaves {
+                    builder.push_child(*page, *checksum);
+                    pushed += 1;
+                    if pushed < new_children {
+                        builder.push_key(upper_key);
+                    }
+                }
+                for i in (group.end_child_index + 1)..old_children {
+                    builder.push_child(
+                        accessor.child_page(i).unwrap(),
+                        accessor.child_checksum(i).unwrap(),
+                    );
+                    pushed += 1;
+                    if pushed < new_children {
+                        builder.push_key(accessor.key(i).unwrap());
+                    }
+                }
+                debug_assert_eq!(pushed, new_children);
+                Self::finalize_branch_builder(builder, self.page_allocator.get_page_size())?
+            }
+        };
+        drop(parent_page);
+        for leaf in group.leaves {
+            let page_number = leaf.page.get_page_number();
+            drop(leaf);
+            self.conditional_free(page_number);
+        }
+        self.conditional_free(parent_page_number);
+
+        for (page, child_index) in group.path.into_iter().rev() {
+            result = self.apply_child_deletion_result(page, child_index, result)?;
+        }
+
+        let Some(header) = *self.root else {
+            return Ok(());
+        };
+        let new_length = header
+            .length
+            .checked_sub(group.removed)
+            .expect("cursor removed more entries than the tree contains");
+        self.finish_deletion(result, new_length)
+    }
+
+    fn build_retain_leaf_pages(
+        &mut self,
+        group: &BufferedRetainLeafGroup,
+    ) -> Result<Vec<(PageNumber, Checksum, Vec<u8>)>> {
+        let mut leaves = vec![];
+        if group.retained_pairs == 0 {
+            return Ok(leaves);
+        }
+
+        let mut builder = self.new_retain_leaf_builder(group.retained_pairs);
+        let mut upper_key: Option<&[u8]> = None;
+        for leaf in &group.leaves {
+            let accessor =
+                LeafAccessor::new(leaf.page.memory(), K::fixed_width(), V::fixed_width());
+            for span in &leaf.retained_spans {
+                for entry_index in span.clone() {
+                    let entry = accessor.entry(entry_index).unwrap();
+                    if builder.would_split_with(entry.key(), entry.value()) {
+                        let leaf = builder.build()?;
+                        leaves.push((
+                            leaf.get_page_number(),
+                            DEFERRED,
+                            upper_key
+                                .expect("retain leaf builder cannot split before any entry")
+                                .to_vec(),
+                        ));
+                        builder = self.new_retain_leaf_builder(group.retained_pairs);
+                    }
+                    builder.push(entry.key(), entry.value());
+                    upper_key = Some(entry.key());
+                }
+            }
+        }
+        if let Some(upper_key) = upper_key {
+            let leaf = builder.build()?;
+            leaves.push((leaf.get_page_number(), DEFERRED, upper_key.to_vec()));
+        }
+        Ok(leaves)
+    }
+
+    fn new_retain_leaf_builder(&self, retained_pairs: usize) -> LeafBuilder<'_, '_> {
+        let mut min_pair_bytes = K::fixed_width().unwrap_or(0) + V::fixed_width().unwrap_or(0);
+        if K::fixed_width().is_none() {
+            min_pair_bytes += size_of::<u32>();
+        }
+        if V::fixed_width().is_none() {
+            min_pair_bytes += size_of::<u32>();
+        }
+
+        let capacity = if min_pair_bytes == 0 {
+            retained_pairs
+        } else {
+            let page_pairs = max(
+                1,
+                self.page_allocator.get_page_size().saturating_sub(4) / min_pair_bytes,
+            );
+            min(retained_pairs, page_pairs)
+        };
+        LeafBuilder::new(
+            &self.page_allocator,
+            &self.allocated,
+            min(capacity, usize::from(u16::MAX)),
+            K::fixed_width(),
+            V::fixed_width(),
+        )
     }
 
     #[allow(clippy::type_complexity)]
