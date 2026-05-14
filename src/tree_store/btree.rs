@@ -762,7 +762,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
                 cursor.remove_next_discard()?;
             }
         }
-        cursor.finish_pending_removals()
+        cursor.close()
     }
 
     fn before_upper_bound(bound: Bound<&[u8]>, key: &[u8]) -> bool {
