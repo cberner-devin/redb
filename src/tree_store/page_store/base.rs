@@ -276,6 +276,8 @@ impl Drop for PageMut<'_> {
 #[derive(Copy, Clone)]
 pub(crate) enum PageHint {
     None,
+    // The page is guaranteed not to be dirtied by the in-progress write transaction. It may
+    // still be in the write buffer, if a non-durable commit left committed pages there.
     Clean,
 }
 

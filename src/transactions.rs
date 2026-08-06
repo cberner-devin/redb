@@ -363,6 +363,10 @@ impl DatabaseStats {
 pub enum Durability {
     /// Commits with this durability level will not be persisted to disk unless followed by a
     /// commit with [`Durability::Immediate`].
+    ///
+    /// Such commits do not write to the file. The changes are held in the in-memory cache, where
+    /// other transactions see them, until they are written back by a durable commit, a clean
+    /// database close, or cache pressure.
     None,
     /// Commits with this durability level are guaranteed to be persistent as soon as
     /// [`WriteTransaction::commit`] returns.

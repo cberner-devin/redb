@@ -1,6 +1,9 @@
 # redb - Changelog
 
 ## 4.2.0 - 2026-XX-XX
+* Improve performance of `Durability::None` commits. They no longer write dirty pages to the file:
+  the pages are retained in the in-memory cache, where readers see them, and are written back by
+  the next durable commit or when evicted by cache pressure.
 * Fix `WriteTransaction::stats()` returning garbage statistics, or panicking when debug assertions
   are enabled, when called while a table is open and modified in the same transaction.
 * Fix a deadlock when a `Database` was dropped while a `WriteTransaction` was live. A live
