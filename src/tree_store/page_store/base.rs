@@ -178,15 +178,17 @@ pub(crate) trait Page {
     fn get_page_number(&self) -> PageNumber;
 }
 
+pub(crate) type PageData = Arc<Box<[u8]>>;
+
 pub struct PageImpl {
-    pub(super) mem: Arc<[u8]>,
+    pub(super) mem: PageData,
     pub(super) page_number: PageNumber,
     #[cfg(debug_assertions)]
     pub(super) open_pages: Arc<Mutex<HashMap<PageNumber, u64>>>,
 }
 
 impl PageImpl {
-    pub(crate) fn to_arc(&self) -> Arc<[u8]> {
+    pub(crate) fn to_arc(&self) -> PageData {
         self.mem.clone()
     }
 }
@@ -212,7 +214,7 @@ impl Drop for PageImpl {
 
 impl Page for PageImpl {
     fn memory(&self) -> &[u8] {
-        self.mem.as_ref()
+        self.mem.as_ref().as_ref()
     }
 
     fn get_page_number(&self) -> PageNumber {

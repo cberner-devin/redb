@@ -7,7 +7,7 @@ use crate::tree_store::btree_base::{
 use crate::tree_store::btree_mutator::DeletionResult::{
     DeletedBranch, DeletedSubtree, PartialBranch, PartialLeaf, Subtree,
 };
-use crate::tree_store::page_store::{Page, PageImpl, PageMut};
+use crate::tree_store::page_store::{Page, PageData, PageImpl, PageMut};
 use crate::tree_store::{
     AccessGuardMutInPlace, BtreeHeader, PageAllocator, PageHint, PageNumber, PageTrackerPolicy,
 };
@@ -27,7 +27,7 @@ enum DeletionResult {
     DeletedSubtree,
     // A leaf with fewer entries than desired
     PartialLeaf {
-        page: Arc<[u8]>,
+        page: PageData,
         deleted_pairs: DeletedPairs,
     },
     // A branch page subtree with fewer children than desired.

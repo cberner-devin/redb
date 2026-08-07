@@ -5,7 +5,7 @@ use crate::tree_store::btree_base::{
 };
 use crate::tree_store::btree_iters::EntryGuard;
 use crate::tree_store::btree_mutator::MutateHelper;
-use crate::tree_store::page_store::{Page, PageHint, PageImpl};
+use crate::tree_store::page_store::{Page, PageData, PageHint, PageImpl};
 use crate::tree_store::{BtreeHeader, PageAllocator, PageNumber, PageResolver, PageTrackerPolicy};
 use crate::types::{Key, Value};
 use crate::{Result, StorageError};
@@ -1188,7 +1188,7 @@ enum EndState {
 // in place.
 struct ParkedBatch {
     bound: Bound<Vec<u8>>,
-    leaf_bytes: Arc<[u8]>,
+    leaf_bytes: PageData,
     removed_indexes: Vec<usize>,
 }
 

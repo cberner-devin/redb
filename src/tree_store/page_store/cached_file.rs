@@ -1,4 +1,4 @@
-use crate::tree_store::page_store::base::PageHint;
+use crate::tree_store::page_store::base::{PageData, PageHint};
 use crate::tree_store::page_store::lru_cache::LRUCache;
 use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
 use std::ops::{Index, IndexMut};
@@ -8,17 +8,14 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-// Allocates an `Arc<[u8]>` in one step. `Arc::<[u8]>::from(vec![0; len])` would
-// allocate the Vec and then allocate a new Arc and memcpy into it.
-fn zero_filled_arc(len: usize) -> Arc<[u8]> {
-    // This is documented to do a single allocation: https://doc.rust-lang.org/std/sync/struct.Arc.html#iterators-of-known-length
-    std::iter::repeat_n(0u8, len).collect()
+fn zero_filled_arc(len: usize) -> PageData {
+    Arc::new(vec![0; len].into_boxed_slice())
 }
 
 pub(super) struct WritablePage {
     buffer: Arc<Mutex<LRUWriteCache>>,
     offset: u64,
-    data: Arc<[u8]>,
+    data: PageData,
 }
 
 impl WritablePage {
@@ -27,7 +24,7 @@ impl WritablePage {
     }
 
     pub(super) fn mem_mut(&mut self) -> &mut [u8] {
-        Arc::get_mut(&mut self.data).unwrap()
+        Arc::get_mut(&mut self.data).unwrap().as_mut()
     }
 }
 
@@ -56,7 +53,7 @@ impl<I: SliceIndex<[u8]>> IndexMut<I> for WritablePage {
 
 #[derive(Default)]
 struct LRUWriteCache {
-    cache: LRUCache<Option<Arc<[u8]>>>,
+    cache: LRUCache<Option<PageData>>,
 }
 
 impl LRUWriteCache {
@@ -66,15 +63,15 @@ impl LRUWriteCache {
         }
     }
 
-    fn insert(&mut self, key: u64, value: Arc<[u8]>) {
+    fn insert(&mut self, key: u64, value: PageData) {
         assert!(self.cache.insert(key, Some(value)).is_none());
     }
 
-    fn get(&self, key: u64) -> Option<&Arc<[u8]>> {
+    fn get(&self, key: u64) -> Option<&PageData> {
         self.cache.get(key).map(|x| x.as_ref().unwrap())
     }
 
-    fn remove(&mut self, key: u64) -> Option<Arc<[u8]>> {
+    fn remove(&mut self, key: u64) -> Option<PageData> {
         if let Some(value) = self.cache.remove(key) {
             assert!(value.is_some());
             return value;
@@ -82,11 +79,11 @@ impl LRUWriteCache {
         None
     }
 
-    fn return_value(&mut self, key: u64, value: Arc<[u8]>) {
+    fn return_value(&mut self, key: u64, value: PageData) {
         assert!(self.cache.get_mut(key).unwrap().replace(value).is_none());
     }
 
-    fn take_value(&mut self, key: u64) -> Option<Arc<[u8]>> {
+    fn take_value(&mut self, key: u64) -> Option<PageData> {
         if let Some(value) = self.cache.get_mut(key) {
             let result = value.take().unwrap();
             return Some(result);
@@ -94,7 +91,7 @@ impl LRUWriteCache {
         None
     }
 
-    fn pop_lowest_priority(&mut self) -> Option<(u64, Arc<[u8]>)> {
+    fn pop_lowest_priority(&mut self) -> Option<(u64, PageData)> {
         for _ in 0..self.cache.len() {
             if let Some((k, v)) = self.cache.pop_lowest_priority() {
                 if let Some(v_inner) = v {
@@ -250,7 +247,7 @@ pub(super) struct PagedCachedFile {
     writes_hits: AtomicU64,
     #[cfg(feature = "cache_metrics")]
     evictions: AtomicU64,
-    read_cache: Vec<RwLock<LRUCache<Arc<[u8]>>>>,
+    read_cache: Vec<RwLock<LRUCache<PageData>>>,
     // TODO: maybe move this cache to WriteTransaction?
     write_buffer: Arc<Mutex<LRUWriteCache>>,
 }
@@ -482,18 +479,19 @@ impl PagedCachedFile {
         Ok(buffer)
     }
 
-    // Like `read_direct`, but writes directly into an `Arc<[u8]>` instead of a
-    // `Vec<u8>` that is then copied into an `Arc`. The buffer is zero-filled
+    // Like `read_direct`, but writes directly into a `PageData` buffer instead
+    // of a `Vec<u8>` that is then copied. The buffer is zero-filled
     // because `StorageBackend::read` takes `&mut [u8]`.
-    fn read_direct_into_arc(&self, offset: u64, len: usize) -> Result<Arc<[u8]>> {
+    fn read_direct_into_arc(&self, offset: u64, len: usize) -> Result<PageData> {
         let mut arc = zero_filled_arc(len);
-        self.file.read(offset, Arc::get_mut(&mut arc).unwrap())?;
+        self.file
+            .read(offset, Arc::get_mut(&mut arc).unwrap().as_mut())?;
         Ok(arc)
     }
 
     // Read with caching. Caller must not read overlapping ranges without first calling invalidate_cache().
     // Doing so will not cause UB, but is a logic error.
-    pub(super) fn read(&self, offset: u64, len: usize, hint: PageHint) -> Result<Arc<[u8]>> {
+    pub(super) fn read(&self, offset: u64, len: usize, hint: PageHint) -> Result<PageData> {
         debug_assert_eq!(0, offset % self.page_size);
         #[cfg(feature = "cache_metrics")]
         self.reads_total.fetch_add(1, Ordering::AcqRel);
@@ -831,11 +829,19 @@ mod test {
         assert_eq!(writes.load(Ordering::SeqCst), 0);
 
         assert_eq!(
-            &*cached_file.read(0, 128, PageHint::Clean).unwrap(),
+            cached_file
+                .read(0, 128, PageHint::Clean)
+                .unwrap()
+                .as_ref()
+                .as_ref(),
             [0xAB; 128].as_slice()
         );
         assert_eq!(
-            &*cached_file.read(0, 128, PageHint::None).unwrap(),
+            cached_file
+                .read(0, 128, PageHint::None)
+                .unwrap()
+                .as_ref()
+                .as_ref(),
             [0xAB; 128].as_slice()
         );
         assert_eq!(cached_file.read_direct(0, 128).unwrap(), vec![0; 128]);
@@ -845,7 +851,11 @@ mod test {
         assert_eq!(writes.load(Ordering::SeqCst), 1);
         assert_eq!(cached_file.read_direct(0, 128).unwrap(), vec![0xAB; 128]);
         assert_eq!(
-            &*cached_file.read(0, 128, PageHint::Clean).unwrap(),
+            cached_file
+                .read(0, 128, PageHint::Clean)
+                .unwrap()
+                .as_ref()
+                .as_ref(),
             [0xAB; 128].as_slice()
         );
     }
@@ -864,7 +874,11 @@ mod test {
         cached_file.discard_write_buffer();
         assert_eq!(cached_file.write_buffer_bytes.load(Ordering::Acquire), 0);
         assert_eq!(
-            &*cached_file.read(0, 128, PageHint::None).unwrap(),
+            cached_file
+                .read(0, 128, PageHint::None)
+                .unwrap()
+                .as_ref()
+                .as_ref(),
             [0u8; 128].as_slice()
         );
         cached_file.flush().unwrap();
@@ -892,7 +906,11 @@ mod test {
         for i in 0..4u8 {
             let offset = u64::from(i) * 128;
             assert_eq!(
-                &*cached_file.read(offset, 128, PageHint::Clean).unwrap(),
+                cached_file
+                    .read(offset, 128, PageHint::Clean)
+                    .unwrap()
+                    .as_ref()
+                    .as_ref(),
                 [i; 128].as_slice()
             );
         }

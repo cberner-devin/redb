@@ -5,8 +5,8 @@ use crate::table::{OwnedAccessGuard, ReadableTableMetadata, TableStats};
 use crate::tree_store::{
     AllPageNumbersBtreeIter, BRANCH, Btree, BtreeCursorRange, BtreeHeader, BtreeMut,
     DynamicCollection, DynamicCollectionType, LEAF, LeafAccessor, MAX_PAIR_LENGTH,
-    MAX_VALUE_LENGTH, Page, PageAllocator, PageHint, PageNumber, PageResolver, PageTrackerPolicy,
-    RawBtree, RawLeafBuilder, multimap_btree_stats,
+    MAX_VALUE_LENGTH, Page, PageAllocator, PageData, PageHint, PageNumber, PageResolver,
+    PageTrackerPolicy, RawBtree, RawLeafBuilder, multimap_btree_stats,
 };
 use crate::types::{Key, Value};
 use crate::{AccessGuard, MultimapTableHandle, Result, StorageError, WriteTransaction};
@@ -20,7 +20,7 @@ pub(crate) struct LeafKeyIter<'a, V: Key + 'static> {
     // Kept alive so any Drop side-effects on `data` (e.g. `remove_on_drop`) still run.
     _inline_collection: AccessGuard<'a, &'static DynamicCollection<V>>,
     // Arc-backed view of the page holding the inline collection.
-    page_data: Arc<[u8]>,
+    page_data: PageData,
     // Byte range in `page_data` holding the inline leaf data for the collection.
     inline_range: Range<usize>,
     fixed_key_size: Option<usize>,
