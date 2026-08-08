@@ -7,7 +7,7 @@ use crate::tree_store::btree_base::{
 use crate::tree_store::btree_mutator::DeletionResult::{
     DeletedBranch, DeletedSubtree, PartialBranch, PartialLeaf, Subtree,
 };
-use crate::tree_store::page_store::{Page, PageImpl, PageMut};
+use crate::tree_store::page_store::{Page, PageData, PageImpl, PageMut};
 use crate::tree_store::{
     AccessGuardMutInPlace, BtreeHeader, PageAllocator, PageHint, PageNumber, PageTrackerPolicy,
 };
@@ -27,7 +27,7 @@ enum DeletionResult {
     DeletedSubtree,
     // A leaf with fewer entries than desired
     PartialLeaf {
-        page: Arc<[u8]>,
+        page: PageData,
         deleted_pairs: DeletedPairs,
     },
     // A branch page subtree with fewer children than desired.
@@ -653,11 +653,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     let existing_value = if found {
                         let (start, end) = accessor.value_range(position).unwrap();
                         if self.page_allocator.uncommitted(page_number) {
-                            let arc = page.to_arc();
+                            let page_data = page.page_data();
                             drop(page);
                             let mut allocated = self.allocated.lock().unwrap();
                             self.page_allocator.free(page_number, &mut allocated);
-                            Some(AccessGuard::with_arc_page(arc, start..end))
+                            Some(AccessGuard::with_page_data(page_data, start..end))
                         } else {
                             self.freed.push(page_number);
                             Some(AccessGuard::with_page(page, start..end))
@@ -695,11 +695,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
                     let existing_value = if found {
                         let (start, end) = accessor.value_range(position).unwrap();
                         if self.page_allocator.uncommitted(page_number) {
-                            let arc = page.to_arc();
+                            let page_data = page.page_data();
                             drop(page);
                             let mut allocated = self.allocated.lock().unwrap();
                             self.page_allocator.free(page_number, &mut allocated);
-                            Some(AccessGuard::with_arc_page(arc, start..end))
+                            Some(AccessGuard::with_page_data(page_data, start..end))
                         } else {
                             self.freed.push(page_number);
                             Some(AccessGuard::with_page(page, start..end))
@@ -963,7 +963,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         let result = match plan.disposition {
             LeafDeleteDisposition::Delete => DeletedSubtree,
             LeafDeleteDisposition::Merge => PartialLeaf {
-                page: page.to_arc(),
+                page: page.page_data(),
                 deleted_pairs: DeletedPairs::One(position),
             },
             LeafDeleteDisposition::Rebuild => Subtree(self.build_leaf_except_indexes(
@@ -975,12 +975,16 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         let (key_range, value_range) = accessor.entry_ranges(position).unwrap();
         let (key_guard, value_guard) = if uncommitted {
             let page_number = page.get_page_number();
-            let arc = page.to_arc();
+            let page_data = page.page_data();
             drop(page);
             let mut allocated = self.allocated.lock().unwrap();
             self.page_allocator.free(page_number, &mut allocated);
-            let key_guard = want_key.then(|| AccessGuard::with_arc_page(arc.clone(), key_range));
-            (key_guard, AccessGuard::with_arc_page(arc, value_range))
+            let key_guard =
+                want_key.then(|| AccessGuard::with_page_data(page_data.clone(), key_range));
+            (
+                key_guard,
+                AccessGuard::with_page_data(page_data, value_range),
+            )
         } else {
             // Won't be freed until the end of the transaction, so returning the page
             // in the AccessGuard below is still safe
@@ -1041,7 +1045,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
         let result = match plan.disposition {
             LeafDeleteDisposition::Delete => DeletedSubtree,
             LeafDeleteDisposition::Merge => PartialLeaf {
-                page: page.to_arc(),
+                page: page.page_data(),
                 deleted_pairs: DeletedPairs::Many(indexes.to_vec()),
             },
             LeafDeleteDisposition::Rebuild => {

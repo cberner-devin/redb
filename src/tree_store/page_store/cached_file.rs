@@ -1,4 +1,4 @@
-use crate::tree_store::page_store::base::PageHint;
+use crate::tree_store::page_store::base::{PageData, PageDataPool, PageHint};
 use crate::tree_store::page_store::lru_cache::LRUCache;
 use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
 use std::ops::{Index, IndexMut};
@@ -8,17 +8,14 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-// Allocates an `Arc<[u8]>` in one step. `Arc::<[u8]>::from(vec![0; len])` would
-// allocate the Vec and then allocate a new Arc and memcpy into it.
-fn zero_filled_arc(len: usize) -> Arc<[u8]> {
-    // This is documented to do a single allocation: https://doc.rust-lang.org/std/sync/struct.Arc.html#iterators-of-known-length
-    std::iter::repeat_n(0u8, len).collect()
+fn zero_filled_page(pool: &Arc<PageDataPool>, len: usize) -> PageData {
+    pool.allocate_zeroed(len)
 }
 
 pub(super) struct WritablePage {
     buffer: Arc<Mutex<LRUWriteCache>>,
     offset: u64,
-    data: Arc<[u8]>,
+    data: PageData,
 }
 
 impl WritablePage {
@@ -27,7 +24,7 @@ impl WritablePage {
     }
 
     pub(super) fn mem_mut(&mut self) -> &mut [u8] {
-        Arc::get_mut(&mut self.data).unwrap()
+        self.data.get_mut().unwrap()
     }
 }
 
@@ -56,7 +53,7 @@ impl<I: SliceIndex<[u8]>> IndexMut<I> for WritablePage {
 
 #[derive(Default)]
 struct LRUWriteCache {
-    cache: LRUCache<Option<Arc<[u8]>>>,
+    cache: LRUCache<Option<PageData>>,
 }
 
 impl LRUWriteCache {
@@ -66,15 +63,15 @@ impl LRUWriteCache {
         }
     }
 
-    fn insert(&mut self, key: u64, value: Arc<[u8]>) {
+    fn insert(&mut self, key: u64, value: PageData) {
         assert!(self.cache.insert(key, Some(value)).is_none());
     }
 
-    fn get(&self, key: u64) -> Option<&Arc<[u8]>> {
+    fn get(&self, key: u64) -> Option<&PageData> {
         self.cache.get(key).map(|x| x.as_ref().unwrap())
     }
 
-    fn remove(&mut self, key: u64) -> Option<Arc<[u8]>> {
+    fn remove(&mut self, key: u64) -> Option<PageData> {
         if let Some(value) = self.cache.remove(key) {
             assert!(value.is_some());
             return value;
@@ -82,11 +79,11 @@ impl LRUWriteCache {
         None
     }
 
-    fn return_value(&mut self, key: u64, value: Arc<[u8]>) {
+    fn return_value(&mut self, key: u64, value: PageData) {
         assert!(self.cache.get_mut(key).unwrap().replace(value).is_none());
     }
 
-    fn take_value(&mut self, key: u64) -> Option<Arc<[u8]>> {
+    fn take_value(&mut self, key: u64) -> Option<PageData> {
         if let Some(value) = self.cache.get_mut(key) {
             let result = value.take().unwrap();
             return Some(result);
@@ -94,7 +91,7 @@ impl LRUWriteCache {
         None
     }
 
-    fn pop_lowest_priority(&mut self) -> Option<(u64, Arc<[u8]>)> {
+    fn pop_lowest_priority(&mut self) -> Option<(u64, PageData)> {
         for _ in 0..self.cache.len() {
             if let Some((k, v)) = self.cache.pop_lowest_priority() {
                 if let Some(v_inner) = v {
@@ -237,6 +234,7 @@ pub(super) struct PagedCachedFile {
     // (and re-buffered) once no live read transaction can reference it. The flag therefore only
     // changes where committed pages are found, never which pages a reader observes.
     committed_pages_buffered: AtomicBool,
+    page_data_pool: Arc<PageDataPool>,
     max_cache_size: usize,
     // Rotates the starting stripe for read-cache eviction
     next_eviction_stripe: AtomicUsize,
@@ -250,7 +248,7 @@ pub(super) struct PagedCachedFile {
     writes_hits: AtomicU64,
     #[cfg(feature = "cache_metrics")]
     evictions: AtomicU64,
-    read_cache: Vec<RwLock<LRUCache<Arc<[u8]>>>>,
+    read_cache: Vec<RwLock<LRUCache<PageData>>>,
     // TODO: maybe move this cache to WriteTransaction?
     write_buffer: Arc<Mutex<LRUWriteCache>>,
 }
@@ -271,6 +269,7 @@ impl PagedCachedFile {
             read_cache_bytes: AtomicUsize::new(0),
             write_buffer_bytes: AtomicUsize::new(0),
             committed_pages_buffered: AtomicBool::new(false),
+            page_data_pool: Arc::default(),
             max_cache_size,
             next_eviction_stripe: AtomicUsize::new(0),
             #[cfg(feature = "cache_metrics")]
@@ -482,18 +481,18 @@ impl PagedCachedFile {
         Ok(buffer)
     }
 
-    // Like `read_direct`, but writes directly into an `Arc<[u8]>` instead of a
-    // `Vec<u8>` that is then copied into an `Arc`. The buffer is zero-filled
+    // Like `read_direct`, but writes directly into a `PageData` buffer instead
+    // of a `Vec<u8>` that is then copied. The buffer is zero-filled
     // because `StorageBackend::read` takes `&mut [u8]`.
-    fn read_direct_into_arc(&self, offset: u64, len: usize) -> Result<Arc<[u8]>> {
-        let mut arc = zero_filled_arc(len);
-        self.file.read(offset, Arc::get_mut(&mut arc).unwrap())?;
-        Ok(arc)
+    fn read_direct_into_page(&self, offset: u64, len: usize) -> Result<PageData> {
+        let mut page = zero_filled_page(&self.page_data_pool, len);
+        self.file.read(offset, page.get_mut().unwrap())?;
+        Ok(page)
     }
 
     // Read with caching. Caller must not read overlapping ranges without first calling invalidate_cache().
     // Doing so will not cause UB, but is a logic error.
-    pub(super) fn read(&self, offset: u64, len: usize, hint: PageHint) -> Result<Arc<[u8]>> {
+    pub(super) fn read(&self, offset: u64, len: usize, hint: PageHint) -> Result<PageData> {
         debug_assert_eq!(0, offset % self.page_size);
         #[cfg(feature = "cache_metrics")]
         self.reads_total.fetch_add(1, Ordering::AcqRel);
@@ -502,7 +501,7 @@ impl PagedCachedFile {
         // scalable than the buffer's single mutex. This order is sound because the two can never
         // hold different contents for an offset: write() removes the read cache entry when it
         // buffers a page, flush_write_buffer() empties the buffer when it repopulates the read
-        // cache, and the promotion below inserts a clone of the buffered Arc itself.
+        // cache, and the promotion below inserts a clone of the buffered page itself.
         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
         {
             let read_lock = self.read_cache[cache_slot].read().unwrap();
@@ -530,7 +529,7 @@ impl PagedCachedFile {
                 // Promote committed buffered pages into the read cache so that repeated reads
                 // reach them through the striped locks instead of contending on the buffer mutex.
                 // The page stays in the write buffer, which remains authoritative for flushing;
-                // the read cache holds a clone of the same Arc, and both entries are removed if
+                // the read cache holds a clone of the same page, and both entries are removed if
                 // the page is freed. Skipped when over budget: the page is still served from the
                 // buffer, and counting it against the read cache would evict pages that only
                 // exist in the read cache.
@@ -551,7 +550,7 @@ impl PagedCachedFile {
             }
         }
 
-        let buffer = self.read_direct_into_arc(offset, len)?;
+        let buffer = self.read_direct_into_page(offset, len)?;
         let cache_size = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
         let mut write_lock = self.read_cache[cache_slot].write().unwrap();
         let cache_size = if let Some(replaced) = write_lock.insert(offset, buffer.clone()) {
@@ -693,9 +692,9 @@ impl PagedCachedFile {
             } else if overwrite {
                 #[cfg(feature = "cache_metrics")]
                 self.writes_hits.fetch_add(1, Ordering::AcqRel);
-                zero_filled_arc(len)
+                zero_filled_page(&self.page_data_pool, len)
             } else {
-                self.read_direct_into_arc(offset, len)?
+                self.read_direct_into_page(offset, len)?
             };
             lock.insert(offset, result);
             lock.take_value(offset).unwrap()

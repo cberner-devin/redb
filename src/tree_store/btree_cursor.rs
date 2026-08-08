@@ -5,7 +5,7 @@ use crate::tree_store::btree_base::{
 };
 use crate::tree_store::btree_iters::EntryGuard;
 use crate::tree_store::btree_mutator::MutateHelper;
-use crate::tree_store::page_store::{Page, PageHint, PageImpl};
+use crate::tree_store::page_store::{Page, PageData, PageHint, PageImpl};
 use crate::tree_store::{BtreeHeader, PageAllocator, PageNumber, PageResolver, PageTrackerPolicy};
 use crate::types::{Key, Value};
 use crate::{Result, StorageError};
@@ -874,7 +874,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         &mut self,
         direction: Direction,
     ) -> (AccessGuard<'a, K>, AccessGuard<'a, V>) {
-        // The Arc-backed guards stay valid because the page store hands out a
+        // The shared guards stay valid because the page store hands out a
         // fresh buffer whenever a freed page number is reused, and no flush
         // that can run while these guards exist mutates leaf bytes in place:
         // the detached flush below and `RangeMut`'s batch resolution by key
@@ -891,10 +891,10 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
             LeafAccessor::new(leaf.page.memory(), K::fixed_width(), V::fixed_width())
                 .entry_ranges(index)
                 .expect("removed cursor entry must exist");
-        let page = leaf.page.to_arc();
+        let page = leaf.page.page_data();
         (
-            AccessGuard::with_arc_page(page.clone(), key_range),
-            AccessGuard::with_arc_page(page, value_range),
+            AccessGuard::with_page_data(page.clone(), key_range),
+            AccessGuard::with_page_data(page, value_range),
         )
     }
 
@@ -1188,7 +1188,7 @@ enum EndState {
 // in place.
 struct ParkedBatch {
     bound: Bound<Vec<u8>>,
-    leaf_bytes: Arc<[u8]>,
+    leaf_bytes: PageData,
     removed_indexes: Vec<usize>,
 }
 
@@ -1465,7 +1465,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
                 .expect("pending removals require a position");
             EndState::Pending(ParkedBatch {
                 bound,
-                leaf_bytes: position.leaf.page.to_arc(),
+                leaf_bytes: position.leaf.page.page_data(),
                 removed_indexes: std::mem::take(&mut state.removed_indexes),
             })
         };
