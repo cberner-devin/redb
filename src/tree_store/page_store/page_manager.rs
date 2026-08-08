@@ -931,6 +931,7 @@ impl TransactionalMemory {
 
         Ok(PageImpl {
             mem,
+            mem_len: len,
             page_number,
             #[cfg(debug_assertions)]
             open_pages: self.read_page_ref_counts.clone(),

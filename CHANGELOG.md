@@ -1,6 +1,8 @@
 # redb - Changelog
 
 ## 4.2.0 - 2026-XX-XX
+* Reduce page-cache memory overhead with allocators that round individually allocated shared page
+  buffers into larger size classes, without changing the database file format.
 * Improve performance of `Durability::None` commits. They no longer write dirty pages to the file:
   the pages are retained in the in-memory cache, where readers see them, and are written back by
   the next durable commit or when evicted by cache pressure.

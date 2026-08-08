@@ -5,8 +5,8 @@ use crate::table::{OwnedAccessGuard, ReadableTableMetadata, TableStats};
 use crate::tree_store::{
     AllPageNumbersBtreeIter, BRANCH, Btree, BtreeCursorRange, BtreeHeader, BtreeMut,
     DynamicCollection, DynamicCollectionType, LEAF, LeafAccessor, MAX_PAIR_LENGTH,
-    MAX_VALUE_LENGTH, Page, PageAllocator, PageHint, PageNumber, PageResolver, PageTrackerPolicy,
-    RawBtree, RawLeafBuilder, multimap_btree_stats,
+    MAX_VALUE_LENGTH, Page, PageAllocator, PageData, PageHint, PageNumber, PageResolver,
+    PageTrackerPolicy, RawBtree, RawLeafBuilder, multimap_btree_stats,
 };
 use crate::types::{Key, Value};
 use crate::{AccessGuard, MultimapTableHandle, Result, StorageError, WriteTransaction};
@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct LeafKeyIter<'a, V: Key + 'static> {
     // Kept alive so any Drop side-effects on `data` (e.g. `remove_on_drop`) still run.
     _inline_collection: AccessGuard<'a, &'static DynamicCollection<V>>,
-    // Arc-backed view of the page holding the inline collection.
-    page_data: Arc<[u8]>,
+    // Shared view of the page holding the inline collection.
+    page_data: PageData,
     // Byte range in `page_data` holding the inline leaf data for the collection.
     inline_range: Range<usize>,
     fixed_key_size: Option<usize>,
@@ -35,7 +35,7 @@ impl<'a, V: Key> LeafKeyIter<'a, V> {
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
     ) -> Self {
-        let (page_data, value_range) = data.arc_view();
+        let (page_data, value_range) = data.page_view();
         let inline_range = DynamicCollection::<V>::inline_range_within(value_range);
         let accessor = LeafAccessor::new(
             &page_data[inline_range.clone()],
@@ -76,7 +76,10 @@ impl<'a, V: Key> LeafKeyIter<'a, V> {
         let (key_range, _) = accessor.entry_ranges(n)?;
         let absolute =
             (self.inline_range.start + key_range.start)..(self.inline_range.start + key_range.end);
-        Some(AccessGuard::with_arc_page(self.page_data.clone(), absolute))
+        Some(AccessGuard::with_page_data(
+            self.page_data.clone(),
+            absolute,
+        ))
     }
 
     fn next_key(&mut self) -> Option<AccessGuard<'static, V>> {
