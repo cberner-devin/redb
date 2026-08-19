@@ -13,10 +13,19 @@ use core::borrow::Borrow;
 use core::cmp::Ordering;
 use core::marker::PhantomData;
 use core::mem::size_of;
-use core::ops::Range;
+use core::ops::{Deref, Range};
 
 pub(crate) const LEAF: u8 = 1;
 pub(crate) const BRANCH: u8 = 2;
+#[cfg(redb_branch_checksum_pages)]
+pub(crate) const BRANCH_CHECKSUMS: u8 = 3;
+
+#[cfg(redb_branch_checksum_pages)]
+const BRANCH_HEADER_SIZE: usize = 4 + PageNumber::serialized_size();
+#[cfg(not(redb_branch_checksum_pages))]
+const BRANCH_HEADER_SIZE: usize = 8;
+#[cfg(redb_branch_checksum_pages)]
+const BRANCH_CHECKSUM_HEADER_SIZE: usize = 4;
 
 // Descending a btree recurses once per level, so a corrupted file whose branch pages form a cycle,
 // or a crafted chain of them, overflows the stack -- which aborts rather than unwinding. No real
@@ -397,8 +406,13 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
 
             // Update parent branch page if it exists, otherwise update root
             if let Some((ref mut parent_page, parent_entry_index)) = self.parent {
-                let mut mutator = BranchMutator::new(parent_page.memory_mut());
-                mutator.write_child_page(parent_entry_index, new_page.get_page_number(), DEFERRED);
+                write_branch_child(
+                    &self.page_allocator,
+                    parent_page,
+                    parent_entry_index,
+                    new_page.get_page_number(),
+                    DEFERRED,
+                )?;
             } else {
                 self.root_ref.root = new_page.get_page_number();
                 self.root_ref.checksum = DEFERRED;
@@ -1805,10 +1819,13 @@ impl<'a> LeafPageMut<'a> {
 }
 
 // Provides a simple zero-copy way to access a branch page
-pub(super) struct BranchAccessor<'a: 'b, 'b, T: Page + 'a> {
+pub(crate) struct BranchAccessor<'a: 'b, 'b, T: Page + 'a> {
     page: &'b T,
     num_keys: usize,
     fixed_key_size: Option<usize>,
+    child_pages_start: usize,
+    key_offsets_start: usize,
+    key_section_start: usize,
     _page_lifetime: PhantomData<&'a ()>,
 }
 
@@ -1816,12 +1833,48 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
     pub(crate) fn new(page: &'b T, fixed_key_size: Option<usize>) -> Self {
         debug_assert_eq!(page.memory()[0], BRANCH);
         let num_keys = u16::from_le_bytes(page.memory()[2..4].try_into().unwrap()) as usize;
+        let count_children = num_keys + 1;
+        #[cfg(redb_branch_checksum_pages)]
+        let child_pages_start = BRANCH_HEADER_SIZE;
+        #[cfg(not(redb_branch_checksum_pages))]
+        let child_pages_start = BRANCH_HEADER_SIZE + size_of::<Checksum>() * count_children;
+        let key_offsets_start = child_pages_start + PageNumber::serialized_size() * count_children;
+        let key_section_start = if fixed_key_size.is_none() {
+            key_offsets_start + size_of::<u32>() * num_keys
+        } else {
+            key_offsets_start
+        };
         BranchAccessor {
             page,
             num_keys,
             fixed_key_size,
+            child_pages_start,
+            key_offsets_start,
+            key_section_start,
             _page_lifetime: PhantomData,
         }
+    }
+
+    pub(super) fn with_checksums<F>(
+        page: &'b T,
+        fixed_key_size: Option<usize>,
+        load_page: F,
+    ) -> Result<ChecksummedBranchAccessor<'a, 'b, T>>
+    where
+        F: FnOnce(PageNumber) -> Result<PageImpl>,
+    {
+        let accessor = Self::new(page, fixed_key_size);
+        #[cfg(redb_branch_checksum_pages)]
+        let checksum_page = load_page(accessor.checksum_page_number())?;
+        #[cfg(not(redb_branch_checksum_pages))]
+        {
+            let _ = load_page;
+        }
+        Ok(ChecksummedBranchAccessor {
+            accessor,
+            #[cfg(redb_branch_checksum_pages)]
+            checksum_page,
+        })
     }
 
     #[cfg(not(redb_no_std))]
@@ -1870,12 +1923,7 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
     }
 
     fn key_section_start(&self) -> usize {
-        if self.fixed_key_size.is_none() {
-            8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * self.count_children()
-                + size_of::<u32>() * self.num_keys()
-        } else {
-            8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * self.count_children()
-        }
+        self.key_section_start
     }
 
     fn key_offset(&self, n: usize) -> usize {
@@ -1890,13 +1938,11 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
         if let Some(fixed) = self.fixed_key_size {
             return Some(self.key_section_start() + fixed * (n + 1));
         }
-        let offset = 8
-            + (PageNumber::serialized_size() + size_of::<Checksum>()) * self.count_children()
-            + size_of::<u32>() * n;
+        let offset = self.key_offsets_start + size_of::<u32>() * n;
         Some(u32::from_le_bytes(
             self.page
                 .memory()
-                .get(offset..(offset + size_of::<u32>()))?
+                .get(offset..offset + size_of::<u32>())?
                 .try_into()
                 .unwrap(),
         ) as usize)
@@ -1906,8 +1952,28 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
         if n >= self.num_keys() {
             return None;
         }
-        let offset = self.key_offset(n);
-        let end = self.key_end(n)?;
+        if self.fixed_key_size.is_some() {
+            let offset = self.key_offset(n);
+            let end = self.key_end(n)?;
+            return Some(&self.page.memory()[offset..end]);
+        }
+
+        let data = self.page.memory();
+        let current = self.key_offsets_start + size_of::<u32>() * n;
+        let end = u32::from_le_bytes(
+            data[current..current + size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let offset = if n == 0 {
+            self.key_section_start
+        } else {
+            u32::from_le_bytes(
+                data[current - size_of::<u32>()..current]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        };
         Some(&self.page.memory()[offset..end])
     }
 
@@ -1915,17 +1981,13 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
         self.num_keys() + 1
     }
 
-    pub(crate) fn child_checksum(&self, n: usize) -> Option<Checksum> {
-        if n >= self.count_children() {
-            return None;
-        }
-
-        let offset = 8 + size_of::<Checksum>() * n;
-        Some(Checksum::from_le_bytes(
-            self.page.memory()[offset..(offset + size_of::<Checksum>())]
+    #[cfg(redb_branch_checksum_pages)]
+    pub(crate) fn checksum_page_number(&self) -> PageNumber {
+        PageNumber::from_le_bytes(
+            self.page.memory()[4..BRANCH_HEADER_SIZE]
                 .try_into()
                 .unwrap(),
-        ))
+        )
     }
 
     pub(crate) fn child_page(&self, n: usize) -> Option<PageNumber> {
@@ -1933,8 +1995,7 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
             return None;
         }
 
-        let offset =
-            8 + size_of::<Checksum>() * self.count_children() + PageNumber::serialized_size() * n;
+        let offset = self.child_pages_start + PageNumber::serialized_size() * n;
         Some(PageNumber::from_le_bytes(
             self.page.memory()[offset..(offset + PageNumber::serialized_size())]
                 .try_into()
@@ -1944,6 +2005,55 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
 
     fn num_keys(&self) -> usize {
         self.num_keys
+    }
+}
+
+pub(super) struct ChecksummedBranchAccessor<'a: 'b, 'b, T: Page + 'a> {
+    accessor: BranchAccessor<'a, 'b, T>,
+    #[cfg(redb_branch_checksum_pages)]
+    checksum_page: PageImpl,
+}
+
+impl<'a: 'b, 'b, T: Page + 'a> Deref for ChecksummedBranchAccessor<'a, 'b, T> {
+    type Target = BranchAccessor<'a, 'b, T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.accessor
+    }
+}
+
+impl<'a: 'b, 'b, T: Page + 'a> ChecksummedBranchAccessor<'a, 'b, T> {
+    pub(crate) fn child_checksum(&self, n: usize) -> Option<Checksum> {
+        if n >= self.count_children() {
+            return None;
+        }
+
+        #[cfg(redb_branch_checksum_pages)]
+        let memory = self.checksum_page.memory();
+        #[cfg(not(redb_branch_checksum_pages))]
+        let memory = self.accessor.page.memory();
+        #[cfg(redb_branch_checksum_pages)]
+        let offset = BRANCH_CHECKSUM_HEADER_SIZE + size_of::<Checksum>() * n;
+        #[cfg(not(redb_branch_checksum_pages))]
+        let offset = BRANCH_HEADER_SIZE + size_of::<Checksum>() * n;
+        Some(Checksum::from_le_bytes(
+            memory[offset..offset + size_of::<Checksum>()]
+                .try_into()
+                .unwrap(),
+        ))
+    }
+
+    pub(crate) fn release(self) {
+        #[cfg(redb_branch_checksum_pages)]
+        {
+            let Self {
+                accessor: _,
+                checksum_page,
+            } = self;
+            drop(checksum_page);
+        }
+        #[cfg(not(redb_branch_checksum_pages))]
+        let _ = self;
     }
 }
 
@@ -1987,7 +2097,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
         self.keys.push(key);
     }
 
-    pub(super) fn push_all<T: Page>(&mut self, accessor: &'a BranchAccessor<'_, '_, T>) {
+    pub(super) fn push_all<T: Page>(&mut self, accessor: &'a ChecksummedBranchAccessor<'_, '_, T>) {
         for i in 0..accessor.count_children() {
             let child = accessor.child_page(i).unwrap();
             let checksum = accessor.child_checksum(i).unwrap();
@@ -2022,9 +2132,14 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
             self.total_key_bytes,
             self.fixed_key_size,
         );
+        let checksum_page = self.build_checksum_page(&self.children)?;
         let mut page = self.page_allocator.allocate(size, self.allocated_pages)?;
-        let mut builder =
-            RawBranchBuilder::new(page.memory_mut(), self.keys.len(), self.fixed_key_size);
+        let mut builder = RawBranchBuilder::new(
+            page.memory_mut(),
+            self.keys.len(),
+            self.fixed_key_size,
+            checksum_page,
+        );
         builder.write_first_page(self.children[0].0, self.children[0].1);
         for i in 1..self.children.len() {
             let key = &self.keys[i - 1];
@@ -2057,8 +2172,14 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
 
         let size =
             RawBranchBuilder::required_bytes(division, first_split_key_len, self.fixed_key_size);
+        let checksum_page1 = self.build_checksum_page(&self.children[..=division])?;
         let mut page1 = self.page_allocator.allocate(size, self.allocated_pages)?;
-        let mut builder = RawBranchBuilder::new(page1.memory_mut(), division, self.fixed_key_size);
+        let mut builder = RawBranchBuilder::new(
+            page1.memory_mut(),
+            division,
+            self.fixed_key_size,
+            checksum_page1,
+        );
         builder.write_first_page(self.children[0].0, self.children[0].1);
         for i in 0..division {
             let key = &self.keys[i];
@@ -2076,11 +2197,13 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
             second_split_key_len,
             self.fixed_key_size,
         );
+        let checksum_page2 = self.build_checksum_page(&self.children[division + 1..])?;
         let mut page2 = self.page_allocator.allocate(size, self.allocated_pages)?;
         let mut builder = RawBranchBuilder::new(
             page2.memory_mut(),
             self.keys.len() - division - 1,
             self.fixed_key_size,
+            checksum_page2,
         );
         builder.write_first_page(self.children[division + 1].0, self.children[division + 1].1);
         for i in (division + 1)..self.keys.len() {
@@ -2096,6 +2219,32 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
 
         Ok((page1, division_key, page2))
     }
+
+    fn build_checksum_page(
+        &self,
+        children: &[(PageNumber, Checksum)],
+    ) -> Result<Option<PageNumber>> {
+        let _ = self.page_allocator;
+        #[cfg(redb_branch_checksum_pages)]
+        {
+            let size = BRANCH_CHECKSUM_HEADER_SIZE + size_of::<Checksum>() * children.len();
+            let mut page = self.page_allocator.allocate(size, self.allocated_pages)?;
+            page.memory_mut()[0] = BRANCH_CHECKSUMS;
+            page.memory_mut()[2..4]
+                .copy_from_slice(&u16::try_from(children.len() - 1).unwrap().to_le_bytes());
+            for (i, (_, checksum)) in children.iter().enumerate() {
+                let offset = BRANCH_CHECKSUM_HEADER_SIZE + size_of::<Checksum>() * i;
+                page.memory_mut()[offset..offset + size_of::<Checksum>()]
+                    .copy_from_slice(&checksum.to_le_bytes());
+            }
+            Ok(Some(page.get_page_number()))
+        }
+        #[cfg(not(redb_branch_checksum_pages))]
+        {
+            let _ = children;
+            Ok(None)
+        }
+    }
 }
 
 // Note the caller is responsible for ensuring that the buffer is large enough
@@ -2104,9 +2253,9 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
 // 1 byte: type
 // 1 byte: padding (padding to 16bits aligned)
 // 2 bytes: num_keys (number of keys)
-// 4 byte: padding (padding to 64bits aligned)
+// 4 byte: padding (padding to 64bits aligned), or an 8 byte checksum-page number starting at byte 4
 // repeating (num_keys + 1 times):
-// 16 bytes: child page checksum
+// 16 bytes: child page checksum (omitted when stored in a companion page)
 // repeating (num_keys + 1 times):
 // 8 bytes: page number
 // (optional) repeating (num_keys times):
@@ -2126,29 +2275,44 @@ impl<'b> RawBranchBuilder<'b> {
         size_of_keys: usize,
         fixed_key_size: Option<usize>,
     ) -> usize {
+        #[cfg(redb_branch_checksum_pages)]
+        let fixed_size = BRANCH_HEADER_SIZE + PageNumber::serialized_size() * (num_keys + 1);
+        #[cfg(not(redb_branch_checksum_pages))]
+        let fixed_size = BRANCH_HEADER_SIZE
+            + (PageNumber::serialized_size() + size_of::<Checksum>()) * (num_keys + 1);
         if fixed_key_size.is_none() {
-            let fixed_size = 8
-                + (PageNumber::serialized_size() + size_of::<Checksum>()) * (num_keys + 1)
-                + size_of::<u32>() * num_keys;
-            size_of_keys + fixed_size
+            size_of_keys + fixed_size + size_of::<u32>() * num_keys
         } else {
-            let fixed_size =
-                8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * (num_keys + 1);
             size_of_keys + fixed_size
         }
     }
 
     // Caller MUST write num_keys values
-    pub(super) fn new(page: &'b mut [u8], num_keys: usize, fixed_key_size: Option<usize>) -> Self {
+    pub(super) fn new(
+        page: &'b mut [u8],
+        num_keys: usize,
+        fixed_key_size: Option<usize>,
+        checksum_page: Option<PageNumber>,
+    ) -> Self {
         assert!(num_keys > 0);
         page[0] = BRANCH;
         page[2..4].copy_from_slice(&u16::try_from(num_keys).unwrap().to_le_bytes());
+        #[cfg(redb_branch_checksum_pages)]
+        page[4..BRANCH_HEADER_SIZE].copy_from_slice(
+            &checksum_page
+                .unwrap_or(PageNumber::new(0, 0, 0))
+                .to_le_bytes(),
+        );
+        #[cfg(not(redb_branch_checksum_pages))]
+        debug_assert!(checksum_page.is_none());
         #[cfg(debug_assertions)]
         {
             // Poison all the child pointers & key offsets, in case the caller forgets to write them
-            let start = 8 + size_of::<Checksum>() * (num_keys + 1);
-            let mut last =
-                8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * (num_keys + 1);
+            #[cfg(redb_branch_checksum_pages)]
+            let start = BRANCH_HEADER_SIZE;
+            #[cfg(not(redb_branch_checksum_pages))]
+            let start = BRANCH_HEADER_SIZE + size_of::<Checksum>() * (num_keys + 1);
+            let mut last = start + PageNumber::serialized_size() * (num_keys + 1);
             if fixed_key_size.is_none() {
                 last += size_of::<u32>() * num_keys;
             }
@@ -2165,17 +2329,27 @@ impl<'b> RawBranchBuilder<'b> {
     }
 
     pub(super) fn write_first_page(&mut self, page_number: PageNumber, checksum: Checksum) {
-        let offset = 8;
+        #[cfg(not(redb_branch_checksum_pages))]
+        let offset = BRANCH_HEADER_SIZE;
+        #[cfg(not(redb_branch_checksum_pages))]
         self.page[offset..(offset + size_of::<Checksum>())]
             .copy_from_slice(&checksum.to_le_bytes());
-        let offset = 8 + size_of::<Checksum>() * (self.num_keys + 1);
+        #[cfg(redb_branch_checksum_pages)]
+        let _ = checksum;
+        #[cfg(redb_branch_checksum_pages)]
+        let offset = BRANCH_HEADER_SIZE;
+        #[cfg(not(redb_branch_checksum_pages))]
+        let offset = BRANCH_HEADER_SIZE + size_of::<Checksum>() * (self.num_keys + 1);
         self.page[offset..(offset + PageNumber::serialized_size())]
             .copy_from_slice(&page_number.to_le_bytes());
     }
 
     fn key_section_start(&self) -> usize {
-        let mut offset =
-            8 + (PageNumber::serialized_size() + size_of::<Checksum>()) * (self.num_keys + 1);
+        #[cfg(redb_branch_checksum_pages)]
+        let mut offset = BRANCH_HEADER_SIZE + PageNumber::serialized_size() * (self.num_keys + 1);
+        #[cfg(not(redb_branch_checksum_pages))]
+        let mut offset = BRANCH_HEADER_SIZE
+            + (PageNumber::serialized_size() + size_of::<Checksum>()) * (self.num_keys + 1);
         if self.fixed_key_size.is_none() {
             offset += size_of::<u32>() * self.num_keys;
         }
@@ -2187,11 +2361,15 @@ impl<'b> RawBranchBuilder<'b> {
         if let Some(fixed) = self.fixed_key_size {
             return self.key_section_start() + fixed * (n + 1);
         }
-        let offset = 8
-            + (PageNumber::serialized_size() + size_of::<Checksum>()) * (self.num_keys + 1)
-            + size_of::<u32>() * n;
+        #[cfg(redb_branch_checksum_pages)]
+        let offsets_start =
+            BRANCH_HEADER_SIZE + PageNumber::serialized_size() * (self.num_keys + 1);
+        #[cfg(not(redb_branch_checksum_pages))]
+        let offsets_start = BRANCH_HEADER_SIZE
+            + (PageNumber::serialized_size() + size_of::<Checksum>()) * (self.num_keys + 1);
+        let offset = offsets_start + size_of::<u32>() * n;
         u32::from_le_bytes(
-            self.page[offset..(offset + size_of::<u32>())]
+            self.page[offset..offset + size_of::<u32>()]
                 .try_into()
                 .unwrap(),
         ) as usize
@@ -2209,12 +2387,18 @@ impl<'b> RawBranchBuilder<'b> {
         assert!(n < self.num_keys);
         assert_eq!(n, self.keys_written);
         self.keys_written += 1;
-        let offset = 8 + size_of::<Checksum>() * (n + 1);
+        #[cfg(not(redb_branch_checksum_pages))]
+        let offset = BRANCH_HEADER_SIZE + size_of::<Checksum>() * (n + 1);
+        #[cfg(not(redb_branch_checksum_pages))]
         self.page[offset..(offset + size_of::<Checksum>())]
             .copy_from_slice(&checksum.to_le_bytes());
-        let offset = 8
-            + size_of::<Checksum>() * (self.num_keys + 1)
-            + PageNumber::serialized_size() * (n + 1);
+        #[cfg(redb_branch_checksum_pages)]
+        let _ = checksum;
+        #[cfg(redb_branch_checksum_pages)]
+        let child_pages_start = BRANCH_HEADER_SIZE;
+        #[cfg(not(redb_branch_checksum_pages))]
+        let child_pages_start = BRANCH_HEADER_SIZE + size_of::<Checksum>() * (self.num_keys + 1);
+        let offset = child_pages_start + PageNumber::serialized_size() * (n + 1);
         self.page[offset..(offset + PageNumber::serialized_size())]
             .copy_from_slice(&page_number.to_le_bytes());
 
@@ -2224,10 +2408,10 @@ impl<'b> RawBranchBuilder<'b> {
             self.key_section_start()
         };
         if self.fixed_key_size.is_none() {
-            let offset = 8
-                + (PageNumber::serialized_size() + size_of::<Checksum>()) * (self.num_keys + 1)
+            let offset = child_pages_start
+                + PageNumber::serialized_size() * (self.num_keys + 1)
                 + size_of::<u32>() * n;
-            self.page[offset..(offset + size_of::<u32>())].copy_from_slice(
+            self.page[offset..offset + size_of::<u32>()].copy_from_slice(
                 &u32::try_from(data_offset + key.len())
                     .unwrap()
                     .to_le_bytes(),
@@ -2249,12 +2433,28 @@ impl Drop for RawBranchBuilder<'_> {
 
 pub(super) struct BranchMutator<'b> {
     page: &'b mut [u8],
+    #[cfg(redb_branch_checksum_pages)]
+    checksum_page: Option<&'b mut [u8]>,
 }
 
 impl<'b> BranchMutator<'b> {
     pub(crate) fn new(page: &'b mut [u8]) -> Self {
         assert_eq!(page[0], BRANCH);
-        Self { page }
+        Self {
+            page,
+            #[cfg(redb_branch_checksum_pages)]
+            checksum_page: None,
+        }
+    }
+
+    #[cfg(redb_branch_checksum_pages)]
+    pub(crate) fn with_checksum_page(page: &'b mut [u8], checksum_page: &'b mut [u8]) -> Self {
+        assert_eq!(page[0], BRANCH);
+        assert_eq!(checksum_page[0], BRANCH_CHECKSUMS);
+        Self {
+            page,
+            checksum_page: Some(checksum_page),
+        }
     }
 
     fn num_keys(&self) -> usize {
@@ -2268,19 +2468,117 @@ impl<'b> BranchMutator<'b> {
         checksum: Checksum,
     ) {
         debug_assert!(i <= self.num_keys());
-        let offset = 8 + size_of::<Checksum>() * i;
-        self.page[offset..(offset + size_of::<Checksum>())]
-            .copy_from_slice(&checksum.to_le_bytes());
-        let offset =
-            8 + size_of::<Checksum>() * (self.num_keys() + 1) + PageNumber::serialized_size() * i;
+        #[cfg(redb_branch_checksum_pages)]
+        if let Some(checksum_memory) = self.checksum_page.as_deref_mut() {
+            let offset = BRANCH_CHECKSUM_HEADER_SIZE + size_of::<Checksum>() * i;
+            checksum_memory[offset..(offset + size_of::<Checksum>())]
+                .copy_from_slice(&checksum.to_le_bytes());
+        } else {
+            debug_assert_eq!(checksum, DEFERRED);
+        }
+        #[cfg(not(redb_branch_checksum_pages))]
+        {
+            let offset = BRANCH_HEADER_SIZE + size_of::<Checksum>() * i;
+            self.page[offset..(offset + size_of::<Checksum>())]
+                .copy_from_slice(&checksum.to_le_bytes());
+        }
+        #[cfg(redb_branch_checksum_pages)]
+        let child_pages_start = BRANCH_HEADER_SIZE;
+        #[cfg(not(redb_branch_checksum_pages))]
+        let child_pages_start = BRANCH_HEADER_SIZE + size_of::<Checksum>() * (self.num_keys() + 1);
+        let offset = child_pages_start + PageNumber::serialized_size() * i;
         self.page[offset..(offset + PageNumber::serialized_size())]
             .copy_from_slice(&page_number.to_le_bytes());
     }
 }
 
+pub(super) fn write_branch_child(
+    page_allocator: &PageAllocator,
+    page: &mut PageMut<'_>,
+    i: usize,
+    page_number: PageNumber,
+    checksum: Checksum,
+) -> Result {
+    #[cfg(redb_branch_checksum_pages)]
+    {
+        if checksum == DEFERRED {
+            BranchMutator::new(page.memory_mut()).write_child_page(i, page_number, checksum);
+        } else {
+            let checksum_page_number = BranchAccessor::new(page, None).checksum_page_number();
+            let mut checksum_page = page_allocator.get_page_mut(checksum_page_number)?;
+            BranchMutator::with_checksum_page(page.memory_mut(), checksum_page.memory_mut())
+                .write_child_page(i, page_number, checksum);
+        }
+    }
+    #[cfg(not(redb_branch_checksum_pages))]
+    {
+        let _ = page_allocator;
+        BranchMutator::new(page.memory_mut()).write_child_page(i, page_number, checksum);
+    }
+    Ok(())
+}
+
+pub(super) fn clone_branch_page<'txn, T: Page>(
+    page_allocator: &PageAllocator,
+    allocated_pages: &PageTracker,
+    old_page: &T,
+) -> Result<PageMut<'txn>> {
+    debug_assert_eq!(old_page.memory()[0], BRANCH);
+    #[cfg(redb_branch_checksum_pages)]
+    let new_checksum_page = {
+        let old_checksum_page_number = BranchAccessor::new(old_page, None).checksum_page_number();
+        let old_checksum_page =
+            page_allocator.get_page(old_checksum_page_number, crate::tree_store::PageHint::None)?;
+        let mut new_checksum_page =
+            page_allocator.allocate(old_checksum_page.memory().len(), allocated_pages)?;
+        new_checksum_page
+            .memory_mut()
+            .copy_from_slice(old_checksum_page.memory());
+        new_checksum_page.get_page_number()
+    };
+
+    let mut new_page = page_allocator.allocate(old_page.memory().len(), allocated_pages)?;
+    new_page.memory_mut().copy_from_slice(old_page.memory());
+    #[cfg(redb_branch_checksum_pages)]
+    new_page.memory_mut()[4..BRANCH_HEADER_SIZE].copy_from_slice(&new_checksum_page.to_le_bytes());
+    Ok(new_page)
+}
+
+#[cfg(redb_branch_checksum_pages)]
+pub(super) fn copy_branch_checksum_page<T: Page>(
+    page_allocator: &PageAllocator,
+    allocated_pages: &PageTracker,
+    old_branch: &T,
+    new_branch: &mut PageMut<'_>,
+    target: Option<PageNumber>,
+) -> Result<PageNumber> {
+    let old_checksum_page_number = BranchAccessor::new(old_branch, None).checksum_page_number();
+    let old_checksum_page =
+        page_allocator.get_page(old_checksum_page_number, crate::tree_store::PageHint::None)?;
+    let new_checksum_page_number = if let Some(target) = target {
+        let mut new_checksum_page = page_allocator.get_page_mut(target)?;
+        new_checksum_page
+            .memory_mut()
+            .copy_from_slice(old_checksum_page.memory());
+        target
+    } else {
+        let mut new_checksum_page =
+            page_allocator.allocate(old_checksum_page.memory().len(), allocated_pages)?;
+        new_checksum_page
+            .memory_mut()
+            .copy_from_slice(old_checksum_page.memory());
+        new_checksum_page.get_page_number()
+    };
+    new_branch.memory_mut()[4..BRANCH_HEADER_SIZE]
+        .copy_from_slice(&new_checksum_page_number.to_le_bytes());
+    Ok(old_checksum_page_number)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(redb_branch_checksum_pages)]
+    use crate::tree_store::PageHint;
     use crate::tree_store::{AllocationPolicy, InMemoryBackend, PAGE_SIZE, TransactionalMemory};
 
     const MAX_PAIRS: usize = u16::MAX as usize;
@@ -2542,5 +2840,32 @@ mod tests {
         // num_keys == count_children - 1 must stay within u16.
         assert!(accessor1.count_children() - 1 <= MAX_PAIRS);
         assert!(accessor2.count_children() - 1 <= MAX_PAIRS);
+    }
+
+    #[cfg(redb_branch_checksum_pages)]
+    #[test]
+    fn branch_checksums_use_companion_page() {
+        let page_allocator = make_allocator();
+        let allocated_pages = PageTracker::new_tracking();
+        let mut builder = BranchBuilder::new(&page_allocator, &allocated_pages, 2, Some(8));
+        builder.push_child(PageNumber::new(0, 10, 0), 11);
+        let key = 42u64.to_le_bytes();
+        builder.push_key(&key);
+        builder.push_child(PageNumber::new(0, 20, 0), 22);
+        let page = builder.build().unwrap();
+
+        let checksum_page_number = BranchAccessor::new(&page, Some(8)).checksum_page_number();
+        let checksum_page = page_allocator
+            .get_page(checksum_page_number, PageHint::None)
+            .unwrap();
+        assert_eq!(checksum_page.memory()[0], BRANCH_CHECKSUMS);
+        drop(checksum_page);
+
+        let accessor = BranchAccessor::with_checksums(&page, Some(8), |number| {
+            page_allocator.get_page(number, PageHint::None)
+        })
+        .unwrap();
+        assert_eq!(accessor.child_checksum(0), Some(11));
+        assert_eq!(accessor.child_checksum(1), Some(22));
     }
 }

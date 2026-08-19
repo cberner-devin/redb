@@ -839,13 +839,26 @@ impl Database {
         self.drain_pending_free_pages(ShrinkPolicy::Maximum)?;
 
         let mut compacted = false;
+        #[cfg(redb_branch_checksum_pages)]
+        let mut relocation_history = alloc::vec::Vec::new();
         // Iteratively compact until no progress is made
         loop {
-            let mut progress = false;
-
             let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
-            if txn.compact_pages()? {
-                progress = true;
+            let outcome = txn.compact_pages()?;
+            #[cfg(redb_branch_checksum_pages)]
+            // A branch and its COW companion can otherwise exchange the same free slots forever.
+            // Abort before committing a relocation set already seen in either direction.
+            let repeated_relocation = outcome.relocation.is_some_and(|current| {
+                relocation_history
+                    .iter()
+                    .any(|previous| current.repeats(*previous))
+            });
+            #[cfg(not(redb_branch_checksum_pages))]
+            let repeated_relocation = false;
+            let progress = outcome.progress && !repeated_relocation;
+            if progress {
+                #[cfg(redb_branch_checksum_pages)]
+                relocation_history.push(outcome.relocation.unwrap());
                 txn.commit().map_err(|e| e.into_storage_error())?;
             } else {
                 txn.abort()?;
@@ -1762,6 +1775,35 @@ mod test {
             txn.open_table(table_definition).unwrap();
         }
         txn.commit().unwrap();
+    }
+
+    #[cfg(redb_branch_checksum_pages)]
+    #[test]
+    fn compact_small_pages_with_branch_checksum_pages() {
+        let tmpfile = crate::create_tempfile();
+        let mut db = Database::builder()
+            .set_page_size(512)
+            .set_region_size(1024 * 1024)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.delete_persistent_savepoint(id).unwrap();
+        assert_eq!(txn.list_persistent_savepoints().unwrap().count(), 0);
+        txn.commit().unwrap();
+        db.begin_write().unwrap().commit().unwrap();
+
+        let table_definition: TableDefinition<(), u64> = TableDefinition::new("counter");
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(table_definition).unwrap();
+            table.insert((), 0).unwrap();
+        }
+        txn.commit().unwrap();
+
+        db.compact().unwrap();
+        assert!(db.check_integrity().unwrap());
     }
 
     #[test]

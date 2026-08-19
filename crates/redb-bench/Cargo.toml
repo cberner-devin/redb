@@ -54,6 +54,10 @@ name = "redb_benchmark"
 harness = false
 
 [[bench]]
+name = "branch_page_benchmark"
+harness = false
+
+[[bench]]
 name = "large_values_benchmark"
 harness = false
 

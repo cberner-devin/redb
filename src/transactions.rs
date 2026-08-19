@@ -41,6 +41,73 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, warn};
 
 const MAX_PAGES_PER_COMPACTION: usize = 1_000_000;
+
+pub(crate) struct CompactionOutcome {
+    pub(crate) progress: bool,
+    #[cfg(redb_branch_checksum_pages)]
+    pub(crate) relocation: Option<RelocationSignature>,
+}
+
+#[cfg(redb_branch_checksum_pages)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct PageSetSignature {
+    count: u64,
+    xor: u64,
+    sum: u128,
+    sum_squared: u128,
+    min: u64,
+    max: u64,
+}
+
+#[cfg(redb_branch_checksum_pages)]
+impl PageSetSignature {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            xor: 0,
+            sum: 0,
+            sum_squared: 0,
+            min: u64::MAX,
+            max: 0,
+        }
+    }
+
+    fn insert(&mut self, page: PageNumber) {
+        let encoded = u64::from_le_bytes(page.to_le_bytes());
+        let wide = u128::from(encoded);
+        self.count += 1;
+        self.xor ^= encoded;
+        self.sum = self.sum.wrapping_add(wide);
+        self.sum_squared = self.sum_squared.wrapping_add(wide.wrapping_mul(wide));
+        self.min = self.min.min(encoded);
+        self.max = self.max.max(encoded);
+    }
+}
+
+#[cfg(redb_branch_checksum_pages)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub(crate) struct RelocationSignature {
+    sources: PageSetSignature,
+    targets: PageSetSignature,
+}
+
+#[cfg(redb_branch_checksum_pages)]
+impl RelocationSignature {
+    fn from_map(relocation_map: &PageNumberHashMap<PageNumber>) -> Self {
+        let mut sources = PageSetSignature::new();
+        let mut targets = PageSetSignature::new();
+        for (source, target) in relocation_map {
+            sources.insert(*source);
+            targets.insert(*target);
+        }
+        Self { sources, targets }
+    }
+
+    pub(crate) fn repeats(self, previous: Self) -> bool {
+        self == previous || (self.sources == previous.targets && self.targets == previous.sources)
+    }
+}
+
 const NEXT_SAVEPOINT_TABLE: SystemTableDefinition<(), SavepointId> =
     SystemTableDefinition::new("next_savepoint_id");
 pub(crate) const SAVEPOINT_TABLE: SystemTableDefinition<SavepointId, SerializedSavepoint> =
@@ -2225,10 +2292,8 @@ impl WriteTransaction {
     }
 
     // Relocate pages to lower number regions/pages
-    // Returns true if a page(s) was moved
-    pub(crate) fn compact_pages(&mut self) -> Result<bool> {
-        let mut progress = false;
-
+    // Reports whether any pages were moved
+    pub(crate) fn compact_pages(&mut self) -> Result<CompactionOutcome> {
         // Find the 1M highest pages
         let mut highest_pages = BTreeMap::new();
         let mut tables = self.tables.lock().unwrap();
@@ -2277,14 +2342,18 @@ impl WriteTransaction {
             }
         }
 
-        if !relocation_map.is_empty() {
-            progress = true;
-        }
+        let progress = !relocation_map.is_empty();
+        #[cfg(redb_branch_checksum_pages)]
+        let relocation = progress.then(|| RelocationSignature::from_map(&relocation_map));
 
         table_tree.relocate_tables(&relocation_map)?;
         system_table_tree.relocate_tables(&relocation_map)?;
 
-        Ok(progress)
+        Ok(CompactionOutcome {
+            progress,
+            #[cfg(redb_branch_checksum_pages)]
+            relocation,
+        })
     }
 
     // NOTE: must be called before store_system_freed_pages() during commit, since this can create

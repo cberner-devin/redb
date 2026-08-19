@@ -2681,7 +2681,12 @@ mod tests {
             let mut cursor: CursorMut<'_, '_, u64, u64> =
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor.seek_to(Position::End).unwrap();
-            for key in 0..60_000 {
+            let entries = if cfg!(redb_branch_checksum_pages) {
+                80_000
+            } else {
+                60_000
+            };
+            for key in 0..entries {
                 assert!(insert(&mut cursor, key, key));
                 if key % 1000 == 999 {
                     cursor.flush_insert_run(true).unwrap();
@@ -2700,7 +2705,7 @@ mod tests {
             .unwrap();
             assert!(stats.tree_height >= 3, "height {}", stats.tree_height);
 
-            let expected: Vec<_> = (0..60_000).map(|key| (key, key)).collect();
+            let expected: Vec<_> = (0..entries).map(|key| (key, key)).collect();
             assert_tree(root, &page_allocator, &expected);
         }
 
@@ -2765,7 +2770,12 @@ mod tests {
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor.seek_to(Position::End).unwrap();
             // Even keys, leaving gaps to insert into; enough for three levels
-            for key in 0..60_000 {
+            let entries = if cfg!(redb_branch_checksum_pages) {
+                80_000
+            } else {
+                60_000
+            };
+            for key in 0..entries {
                 assert!(insert(&mut cursor, key * 2, key * 2));
                 if key % 1000 == 999 {
                     cursor.flush_insert_run(true).unwrap();
@@ -2784,7 +2794,8 @@ mod tests {
             assert!(stats.tree_height >= 3, "height {}", stats.tree_height);
 
             // Gaps chosen to land under leaves in the interior of the tree
-            let mut expected: Vec<(u64, u64)> = (0..60_000).map(|key| (key * 2, key * 2)).collect();
+            let mut expected: Vec<(u64, u64)> =
+                (0..entries).map(|key| (key * 2, key * 2)).collect();
             for target in [1001u64, 30_001, 60_001, 90_001, 119_001] {
                 let mut cursor: CursorMut<'_, '_, u64, u64> =
                     CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
@@ -2816,7 +2827,12 @@ mod tests {
                 CursorMut::new(&mut root, &page_allocator, &mut freed, &allocated);
             cursor.seek_to(Position::End).unwrap();
             // Even keys, leaving gaps to insert into; enough for three levels
-            for key in 0..60_000 {
+            let entries = if cfg!(redb_branch_checksum_pages) {
+                80_000
+            } else {
+                60_000
+            };
+            for key in 0..entries {
                 assert!(insert(&mut cursor, key * 2, key * 2));
                 if key % 1000 == 999 {
                     cursor.flush_insert_run(true).unwrap();
@@ -2852,7 +2868,8 @@ mod tests {
                 }
             }
 
-            let mut expected: Vec<(u64, u64)> = (0..60_000).map(|key| (key * 2, key * 2)).collect();
+            let mut expected: Vec<(u64, u64)> =
+                (0..entries).map(|key| (key * 2, key * 2)).collect();
             expected.push((30_001, 30_001));
             expected.push((30_003, 30_003));
             expected.sort_unstable();

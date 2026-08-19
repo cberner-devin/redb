@@ -28,7 +28,12 @@ fn main() {
     let table = RedbBenchDatabase::new(&mut db);
     let results = benchmark(table, tmpfile.path());
 
-    print_results_table(&[("redb", results)]);
+    let checksums = std::env::var_os("REDB_BRANCH_CHECKSUM_PAGES").is_some();
+    let variant = match checksums {
+        false => "baseline",
+        true => "checksum pages",
+    };
+    print_results_table(&[(variant, results)]);
 
     fs::remove_dir_all(&tmpdir).unwrap();
 }
