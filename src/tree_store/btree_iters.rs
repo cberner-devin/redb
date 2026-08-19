@@ -1,4 +1,6 @@
 use crate::Result;
+#[cfg(redb_branch_checksum_pages)]
+use crate::tree_store::btree_base::BRANCH_CHECKSUMS;
 use crate::tree_store::btree_base::BranchAccessor;
 use crate::tree_store::btree_base::{BRANCH, LEAF};
 use crate::tree_store::page_store::{Page, PageHint, PageImpl};
@@ -88,11 +90,15 @@ impl Iterator for AllPageNumbersBtreeIter {
             LEAF => {}
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, self.fixed_key_size);
+                #[cfg(redb_branch_checksum_pages)]
+                self.pending.push(accessor.checksum_page_number());
                 // Push in reverse so children are popped left-to-right.
                 for child in (0..accessor.count_children()).rev() {
                     self.pending.push(accessor.child_page(child).unwrap());
                 }
             }
+            #[cfg(redb_branch_checksum_pages)]
+            BRANCH_CHECKSUMS => {}
             _ => unreachable!(),
         }
         Some(Ok(page_number))

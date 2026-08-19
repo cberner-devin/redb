@@ -2,8 +2,10 @@ use crate::Result;
 use crate::sync::Mutex;
 use crate::tree_store::btree::{PagePath, UntypedBtree, UntypedBtreeMut, btree_stats};
 use crate::tree_store::btree_base::{
-    BRANCH, BranchAccessor, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor, LeafPageMut,
+    BRANCH, BranchAccessor, Checksum, DEFERRED, LEAF, LeafAccessor, LeafPageMut, write_branch_child,
 };
+#[cfg(redb_branch_checksum_pages)]
+use crate::tree_store::btree_base::{BRANCH_CHECKSUMS, copy_branch_checksum_page};
 use crate::tree_store::multimap_btree::DynamicCollectionType::{Inline, SubtreeV2};
 use crate::tree_store::{
     AllPageNumbersBtreeIter, BtreeHeader, BtreeStats, Page, PageAllocator, PageHint, PageNumber,
@@ -125,6 +127,13 @@ fn multimap_stats_helper(
             let mut stored_leaf_bytes = 0;
             let mut metadata_bytes = accessor.total_length() as u64;
             let mut fragmented_bytes = (page.memory().len() - accessor.total_length()) as u64;
+            #[cfg(redb_branch_checksum_pages)]
+            {
+                let checksum_page = mem.get_page(accessor.checksum_page_number(), hint)?;
+                let used = 4 + size_of::<Checksum>() * accessor.count_children();
+                metadata_bytes += used as u64;
+                fragmented_bytes += (checksum_page.memory().len() - used) as u64;
+            }
             for i in 0..accessor.count_children() {
                 if let Some(child) = accessor.child_page(i) {
                     let stats =
@@ -214,6 +223,20 @@ pub(super) fn relocate_subtrees(
     let new_page_number = new_page.get_page_number();
     new_page.memory_mut().copy_from_slice(old_page.memory());
 
+    #[cfg(redb_branch_checksum_pages)]
+    let old_checksum_page = if old_page.memory()[0] == BRANCH {
+        let checksum_page = BranchAccessor::new(&old_page, None).checksum_page_number();
+        Some(copy_branch_checksum_page(
+            &page_allocator,
+            &PageTracker::ignore(),
+            &old_page,
+            &mut new_page,
+            relocation_map.get(&checksum_page).copied(),
+        )?)
+    } else {
+        None
+    };
+
     match old_page.memory()[0] {
         LEAF => {
             let mut leaf_page = LeafPageMut::new(
@@ -248,8 +271,9 @@ pub(super) fn relocate_subtrees(
             }
         }
         BRANCH => {
-            let accessor = BranchAccessor::new(&old_page, key_size);
-            let mut mutator = BranchMutator::new(new_page.memory_mut());
+            let accessor = BranchAccessor::with_checksums(&old_page, key_size, |number| {
+                page_allocator.get_page(number, PageHint::None)
+            })?;
             for i in 0..accessor.count_children() {
                 if let Some(child) = accessor.child_page(i) {
                     let child_checksum = accessor.child_checksum(i).unwrap();
@@ -261,7 +285,7 @@ pub(super) fn relocate_subtrees(
                         freed_pages.clone(),
                         relocation_map,
                     )?;
-                    mutator.write_child_page(i, new_child, new_checksum);
+                    write_branch_child(&page_allocator, &mut new_page, i, new_child, new_checksum)?;
                 }
             }
         }
@@ -273,6 +297,12 @@ pub(super) fn relocate_subtrees(
     // No need to track allocations, because this method is only called during compaction when
     // there can't be any savepoints
     let ignore = PageTracker::ignore();
+    #[cfg(redb_branch_checksum_pages)]
+    if let Some(old_checksum_page) = old_checksum_page
+        && !page_allocator.free_if_uncommitted(old_checksum_page, &ignore)
+    {
+        freed_pages.lock().unwrap().push(old_checksum_page);
+    }
     if !page_allocator.free_if_uncommitted(old_page_number, &ignore) {
         freed_pages.lock().unwrap().push(old_page_number);
     }
@@ -356,6 +386,8 @@ fn parse_subtree_roots<T: Page>(
 
             result
         }
+        #[cfg(redb_branch_checksum_pages)]
+        BRANCH_CHECKSUMS => vec![],
         _ => unreachable!(),
     }
 }
@@ -419,6 +451,8 @@ impl UntypedMultiBtree {
                 BRANCH => {
                     // No-op. The tree.visit_pages() call will process this sub-tree
                 }
+                #[cfg(redb_branch_checksum_pages)]
+                BRANCH_CHECKSUMS => {}
                 _ => unreachable!(),
             }
             Ok(())

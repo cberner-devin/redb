@@ -1,8 +1,11 @@
 use crate::db::TransactionGuard;
 use crate::sync::Mutex;
+#[cfg(redb_branch_checksum_pages)]
+use crate::tree_store::btree_base::copy_branch_checksum_page;
 use crate::tree_store::btree_base::{
-    AccessGuardMut, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF,
-    LeafAccessor, LeafPageMut, MAX_BTREE_DEPTH, branch_checksum, leaf_checksum,
+    AccessGuardMut, BRANCH, BranchAccessor, BtreeHeader, Checksum, DEFERRED, LEAF, LeafAccessor,
+    LeafPageMut, MAX_BTREE_DEPTH, branch_checksum, clone_branch_page, leaf_checksum,
+    write_branch_child,
 };
 #[cfg(feature = "experimental-api-5")]
 use crate::tree_store::btree_cursor::BtreeCursor;
@@ -25,6 +28,8 @@ use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::cmp::max;
 use core::marker::PhantomData;
+#[cfg(redb_branch_checksum_pages)]
+use core::mem::size_of;
 use core::ops::Bound;
 use core::ops::RangeBounds;
 #[cfg(feature = "logging")]
@@ -131,6 +136,8 @@ impl UntypedBtree {
             }
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, self.key_width);
+                #[cfg(redb_branch_checksum_pages)]
+                visitor(&path.with_child(accessor.checksum_page_number()))?;
                 for i in 0..accessor.count_children() {
                     let child_page = accessor.child_page(i).unwrap();
                     if path.parents().contains(&child_page) || path.page_number() == child_page {
@@ -218,11 +225,15 @@ impl UntypedBtreeMut {
                         new_children.push(None);
                     }
                 }
-
-                let mut mutator = BranchMutator::new(page.memory_mut());
                 for (child_index, child_page, child_checksum) in new_children.into_iter().flatten()
                 {
-                    mutator.write_child_page(child_index, child_page, child_checksum);
+                    write_branch_child(
+                        &self.page_allocator,
+                        &mut page,
+                        child_index,
+                        child_page,
+                        child_checksum,
+                    )?;
                 }
 
                 branch_checksum(&page, self.key_width)
@@ -312,20 +323,42 @@ impl UntypedBtreeMut {
         };
         new_page.memory_mut().copy_from_slice(old_page.memory());
 
+        #[cfg(redb_branch_checksum_pages)]
+        let old_checksum_page = if old_page.memory()[0] == BRANCH {
+            let checksum_page = BranchAccessor::new(&old_page, None).checksum_page_number();
+            Some(copy_branch_checksum_page(
+                &self.page_allocator,
+                &PageTracker::ignore(),
+                &old_page,
+                &mut new_page,
+                relocation_map.get(&checksum_page).copied(),
+            )?)
+        } else {
+            None
+        };
+
         let node_mem = old_page.memory();
         match node_mem[0] {
             LEAF => {
                 // No-op
             }
             BRANCH => {
-                let accessor = BranchAccessor::new(&old_page, self.key_width);
-                let mut mutator = BranchMutator::new(new_page.memory_mut());
+                let accessor =
+                    BranchAccessor::with_checksums(&old_page, self.key_width, |number| {
+                        self.page_allocator.get_page(number, PageHint::None)
+                    })?;
                 for i in 0..accessor.count_children() {
                     let child = accessor.child_page(i).unwrap();
                     if let Some((new_child, new_checksum)) =
                         self.relocate_helper(child, relocation_map)?
                     {
-                        mutator.write_child_page(i, new_child, new_checksum);
+                        write_branch_child(
+                            &self.page_allocator,
+                            &mut new_page,
+                            i,
+                            new_child,
+                            new_checksum,
+                        )?;
                     }
                 }
             }
@@ -336,6 +369,14 @@ impl UntypedBtreeMut {
         // No need to track allocations, because this method is only called during compaction when
         // there can't be any savepoints
         let ignore = PageTracker::ignore();
+        #[cfg(redb_branch_checksum_pages)]
+        if let Some(old_checksum_page) = old_checksum_page
+            && !self
+                .page_allocator
+                .free_if_uncommitted(old_checksum_page, &ignore)
+        {
+            freed_pages.push(old_checksum_page);
+        }
         if !self
             .page_allocator
             .free_if_uncommitted(page_number, &ignore)
@@ -600,16 +641,18 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
                 self.page_allocator.get_page_mut(root.root)?
             } else {
                 let mut freed_pages = self.freed_pages.lock().unwrap();
-                let required: usize = root
-                    .root
-                    .page_size_bytes(self.page_allocator.get_page_size().try_into().unwrap())
-                    .try_into()
-                    .unwrap();
-                let mut new_page = self
-                    .page_allocator
-                    .allocate(required, &self.allocated_pages)?;
                 let old_page = self.page_allocator.get_page(root.root, PageHint::None)?;
-                new_page.memory_mut().copy_from_slice(old_page.memory());
+                let new_page = if old_page.memory()[0] == BRANCH {
+                    #[cfg(redb_branch_checksum_pages)]
+                    freed_pages.push(BranchAccessor::new(&old_page, None).checksum_page_number());
+                    clone_branch_page(&self.page_allocator, &self.allocated_pages, &old_page)?
+                } else {
+                    let mut new_page = self
+                        .page_allocator
+                        .allocate(old_page.memory().len(), &self.allocated_pages)?;
+                    new_page.memory_mut().copy_from_slice(old_page.memory());
+                    new_page
+                };
                 drop(old_page);
                 freed_pages.push(root.root);
 
@@ -660,23 +703,37 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
                     self.page_allocator.get_page_mut(child_page)?
                 } else {
                     let mut freed_pages = self.freed_pages.lock().unwrap();
-                    let required: usize = child_page
-                        .page_size_bytes(self.page_allocator.get_page_size().try_into().unwrap())
-                        .try_into()
-                        .unwrap();
-                    let mut new_page = self
-                        .page_allocator
-                        .allocate(required, &self.allocated_pages)?;
                     let old_child_page =
                         self.page_allocator.get_page(child_page, PageHint::None)?;
-                    new_page
-                        .memory_mut()
-                        .copy_from_slice(old_child_page.memory());
+                    let new_page = if old_child_page.memory()[0] == BRANCH {
+                        #[cfg(redb_branch_checksum_pages)]
+                        freed_pages.push(
+                            BranchAccessor::new(&old_child_page, None).checksum_page_number(),
+                        );
+                        clone_branch_page(
+                            &self.page_allocator,
+                            &self.allocated_pages,
+                            &old_child_page,
+                        )?
+                    } else {
+                        let mut new_page = self
+                            .page_allocator
+                            .allocate(old_child_page.memory().len(), &self.allocated_pages)?;
+                        new_page
+                            .memory_mut()
+                            .copy_from_slice(old_child_page.memory());
+                        new_page
+                    };
                     drop(old_child_page);
                     freed_pages.push(child_page);
 
-                    let mut mutator = BranchMutator::new(page.memory_mut());
-                    mutator.write_child_page(child_index, new_page.get_page_number(), DEFERRED);
+                    write_branch_child(
+                        &self.page_allocator,
+                        &mut page,
+                        child_index,
+                        new_page.get_page_number(),
+                        DEFERRED,
+                    )?;
                     new_page
                 };
                 self.get_mut_helper(Some((page, child_index)), child_page_mut, query)
@@ -985,7 +1042,10 @@ impl RawBtree {
                 } else {
                     return Ok(false);
                 }
-                let accessor = BranchAccessor::new(&page, self.fixed_key_size);
+                let accessor =
+                    BranchAccessor::with_checksums(&page, self.fixed_key_size, |number| {
+                        self.mem.get_page(number, self.hint)
+                    })?;
                 for i in 0..accessor.count_children() {
                     if !self.verify_checksum_helper(
                         accessor.child_page(i).unwrap(),
@@ -1337,6 +1397,13 @@ fn stats_helper(
             let mut stored_leaf_bytes = 0;
             let mut metadata_bytes = accessor.total_length() as u64;
             let mut fragmented_bytes = (page.memory().len() - accessor.total_length()) as u64;
+            #[cfg(redb_branch_checksum_pages)]
+            {
+                let checksum_page = mem.get_page(accessor.checksum_page_number(), hint)?;
+                let used = 4 + size_of::<Checksum>() * accessor.count_children();
+                metadata_bytes += used as u64;
+                fragmented_bytes += (checksum_page.memory().len() - used) as u64;
+            }
             for i in 0..accessor.count_children() {
                 if let Some(child) = accessor.child_page(i) {
                     let stats = stats_helper(child, mem, fixed_key_size, fixed_value_size, hint)?;
@@ -1459,7 +1526,7 @@ mod tests {
 
         // Write p2 first, pointing to p1 with a dummy checksum (e.g. 0)
         {
-            let mut builder2 = RawBranchBuilder::new(p2_mut.memory_mut(), 1, Some(8));
+            let mut builder2 = RawBranchBuilder::new(p2_mut.memory_mut(), 1, Some(8), None);
             builder2.write_first_page(p1, 0);
             builder2.write_nth_key(b"key12345", p1, 0, 0);
         }
@@ -1469,7 +1536,7 @@ mod tests {
 
         // Write p1 pointing to p2 with p2_checksum
         {
-            let mut builder1 = RawBranchBuilder::new(p1_mut.memory_mut(), 1, Some(8));
+            let mut builder1 = RawBranchBuilder::new(p1_mut.memory_mut(), 1, Some(8), None);
             builder1.write_first_page(p2, p2_checksum);
             builder1.write_nth_key(b"key12345", p2, p2_checksum, 0);
         }
