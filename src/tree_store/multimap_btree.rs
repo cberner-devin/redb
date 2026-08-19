@@ -3,6 +3,7 @@ use crate::sync::Mutex;
 use crate::tree_store::btree::{PagePath, UntypedBtree, UntypedBtreeMut, btree_stats};
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor, LeafPageMut,
+    SLOTTED_LEAF,
 };
 use crate::tree_store::multimap_btree::DynamicCollectionType::{Inline, SubtreeV2};
 use crate::tree_store::{
@@ -49,7 +50,7 @@ fn multimap_stats_helper(
     let page = mem.get_page(page_number, hint)?;
     let node_mem = page.memory();
     match node_mem[0] {
-        LEAF => {
+        LEAF | SLOTTED_LEAF => {
             let accessor = LeafAccessor::new(
                 page.memory(),
                 fixed_key_size,
@@ -215,7 +216,7 @@ pub(super) fn relocate_subtrees(
     new_page.memory_mut().copy_from_slice(old_page.memory());
 
     match old_page.memory()[0] {
-        LEAF => {
+        LEAF | SLOTTED_LEAF => {
             let mut leaf_page = LeafPageMut::new(
                 new_page,
                 key_size,
@@ -339,7 +340,7 @@ fn parse_subtree_roots<T: Page>(
         BRANCH => {
             vec![]
         }
-        LEAF => {
+        LEAF | SLOTTED_LEAF => {
             let mut result = vec![];
             let accessor = LeafAccessor::new(
                 page.memory(),
@@ -401,7 +402,7 @@ impl UntypedMultiBtree {
             visitor(path)?;
             let page = self.mem.get_page(path.page_number(), self.hint)?;
             match page.memory()[0] {
-                LEAF => {
+                LEAF | SLOTTED_LEAF => {
                     for header in parse_subtree_roots(&page, self.key_width, self.value_width) {
                         let subtree = UntypedBtree::new(
                             Some(header),
@@ -438,7 +439,7 @@ pub(crate) enum DynamicCollectionType {
 impl From<u8> for DynamicCollectionType {
     fn from(value: u8) -> Self {
         match value {
-            LEAF => Inline,
+            LEAF | SLOTTED_LEAF => Inline,
             // 2 => Subtree,
             3 => SubtreeV2,
             _ => unreachable!(),

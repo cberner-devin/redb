@@ -67,9 +67,8 @@ fn corrupt_child_pointer(data: &mut [u8], offset: usize, child: usize) {
     let page = &mut data[offset..offset + PAGE_SIZE];
     let num_keys = u16::from_le_bytes([page[2], page[3]]) as usize;
     assert!(child <= num_keys);
-    // Child pointers follow the per-child checksums, which follow an 8 byte header
-    let children = 8 + 16 * (num_keys + 1);
-    let pointer = children + 8 * child;
+    // Child pointers follow the per-child checksums, which follow an 8 byte header.
+    let pointer = 8 + 16 * (num_keys + 1) + 8 * child;
     // The page order lives in the top bits of the 64 bit page number
     page[pointer + 7] |= 0xF8;
 }

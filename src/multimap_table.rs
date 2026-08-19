@@ -15,7 +15,7 @@ use crate::tree_store::{
     AllPageNumbersBtreeIter, BRANCH, Btree, BtreeCursorRange, BtreeHeader, BtreeMut,
     DynamicCollection, DynamicCollectionType, LEAF, LeafAccessor, MAX_PAIR_LENGTH,
     MAX_VALUE_LENGTH, Page, PageAllocator, PageHint, PageNumber, PageResolver, PageTracker,
-    RawBtree, RawLeafBuilder, multimap_btree_stats,
+    RawBtree, RawLeafBuilder, SLOTTED_LEAF, multimap_btree_stats,
 };
 use crate::types::{Key, Value};
 use crate::{AccessGuard, MultimapTableHandle, Result, StorageError, WriteTransaction};
@@ -634,7 +634,7 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                         let mut page = self
                             .page_allocator
                             .allocate(leaf_data.len(), &self.allocated_pages)?;
-                        page.memory_mut()[..leaf_data.len()].copy_from_slice(leaf_data);
+                        RawLeafBuilder::build_from(page.memory_mut(), &accessor);
                         let page_number = page.get_page_number();
                         drop(page);
                         drop(guard);
@@ -808,7 +808,7 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                 {
                     let page = self.page_allocator.get_page(new_root, PageHint::None)?;
                     match page.memory()[0] {
-                        LEAF => {
+                        LEAF | SLOTTED_LEAF => {
                             let accessor = LeafAccessor::new(
                                 page.memory(),
                                 V::fixed_width(),
@@ -816,8 +816,9 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                             );
                             let len = accessor.total_length();
                             if len < self.page_allocator.get_page_size() / 2 {
-                                let inline_data =
-                                    DynamicCollection::<V>::make_inline_data(&page.memory()[..len]);
+                                let mut data = vec![0; len];
+                                RawLeafBuilder::build_from(&mut data, &accessor);
+                                let inline_data = DynamicCollection::<V>::make_inline_data(&data);
                                 self.tree
                                     .insert(key.borrow(), &DynamicCollection::new(&inline_data))?;
                                 drop(page);

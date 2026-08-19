@@ -2,8 +2,8 @@
 use crate::tree_store::btree_base::RawBranchBuilder;
 use crate::tree_store::btree_base::{
     BRANCH, BranchAccessor, BranchBuilder, BranchMutator, Checksum, DEFERRED, LEAF, LeafAccessor,
-    LeafBuilder, LeafMutator, OwnedEntryBuffer, branch_separator, is_single_large_value,
-    leaf_below_merge_threshold, leaf_split_required, retained_after_removals,
+    LeafBuilder, LeafMutator, OwnedEntryBuffer, SLOTTED_LEAF, branch_separator,
+    is_single_large_value, leaf_below_merge_threshold, leaf_split_required, retained_leaf_size,
 };
 use crate::tree_store::btree_mutator::DeletionResult::{
     DeletedBranch, DeletedSubtree, PartialBranch, PartialLeaf, Subtree,
@@ -755,7 +755,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     ) -> Result<InsertionResult<'a, V>> {
         let node_mem = page.memory();
         Ok(match node_mem[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 let (position, found) = accessor.position::<K>(key);
 
@@ -1202,7 +1202,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
 
         let node_mem = page.memory();
         match node_mem[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 let (position, found) = accessor.position::<K>(key);
                 assert!(found);
@@ -1367,17 +1367,11 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     }
 
     fn plan_leaf_delete(&self, accessor: &LeafAccessor<'_>, indexes: &[usize]) -> LeafDeletePlan {
-        let (retained_pairs, retained_bytes) = retained_after_removals(accessor, indexes);
+        let (retained_pairs, retained_size) = retained_leaf_size(accessor, indexes);
 
         let disposition = if retained_pairs == 0 {
             LeafDeleteDisposition::Delete
-        } else if leaf_below_merge_threshold(
-            retained_pairs,
-            retained_bytes,
-            K::fixed_width(),
-            V::fixed_width(),
-            self.page_allocator.get_page_size(),
-        ) {
+        } else if retained_size < self.page_allocator.get_page_size() / 3 {
             LeafDeleteDisposition::Merge
         } else {
             LeafDeleteDisposition::Rebuild
@@ -1821,7 +1815,7 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> MutateHelper<'a, 'b, K, V> {
     ) -> Result<(DeletionResult, Option<AccessGuard<'a, V>>)> {
         let node_mem = page.memory();
         match node_mem[0] {
-            LEAF => self.delete_leaf_helper(page, key, allow_in_place),
+            LEAF | SLOTTED_LEAF => self.delete_leaf_helper(page, key, allow_in_place),
             BRANCH => self.delete_branch_helper(page, key, allow_in_place),
             _ => unreachable!(),
         }

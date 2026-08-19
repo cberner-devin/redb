@@ -8,10 +8,10 @@ use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker}
 #[cfg(all(debug_assertions, not(redb_no_std)))]
 use crate::tree_store::PageNumberHashSet;
 use crate::tree_store::{
-    AllocationPolicy, Btree, BtreeHeader, BtreeMut, InternalTableDefinition, MAX_PAIR_LENGTH,
-    MAX_VALUE_LENGTH, Page, PageAllocator, PageHint, PageListMut, PageNumber, PageNumberHashMap,
-    PageResolver, PageTracker, SerializedSavepoint, ShrinkPolicy, TableTree, TableTreeMut,
-    TableType, TransactionalMemory,
+    AllocationPolicy, Btree, BtreeHeader, BtreeMut, FILE_FORMAT_VERSION3, FILE_FORMAT_VERSION4,
+    InternalTableDefinition, MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page, PageAllocator, PageHint,
+    PageListMut, PageNumber, PageNumberHashMap, PageResolver, PageTracker, SerializedSavepoint,
+    ShrinkPolicy, TableTree, TableTreeMut, TableType, TransactionalMemory,
 };
 use crate::types::{Key, Value};
 use crate::{
@@ -1342,9 +1342,13 @@ impl WriteTransaction {
             savepoint.get_id(),
             self.transaction_id
         );
-        // Restoring a savepoint that reverted a file format or checksum type change could corrupt
-        // the database
-        assert_eq!(self.mem.get_version(), savepoint.get_version());
+        // Version 4 deliberately supports version 3 roots so existing savepoints survive the lazy
+        // page-layout upgrade. Other format transitions must still match exactly.
+        assert!(
+            self.mem.get_version() == savepoint.get_version()
+                || (self.mem.get_version() == FILE_FORMAT_VERSION4
+                    && savepoint.get_version() == FILE_FORMAT_VERSION3)
+        );
         self.dirty.store(true, Ordering::Release);
 
         // From the root swap onward the transaction holds half-restored state which must not be

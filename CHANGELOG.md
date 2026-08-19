@@ -1,6 +1,9 @@
 # redb - Changelog
 
 ## 5.0.0 - 2026-XX-XX
+* Btree leaf pages now use a slotted layout, avoiding key/value copies for repeated changes to
+  uncommitted pages. This introduces file format version 4; version 3 databases remain readable and
+  are upgraded lazily on their next commit.
 * Under the `experimental-api-5` feature flag, turning off the `std` feature now builds redb as a
   `no_std` crate, for embedded targets. `alloc` is still required, as is `panic = "abort"` and a
   target with atomic compare-and-swap -- Cortex-M3 and above, but not Cortex-M0. The file backend

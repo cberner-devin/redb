@@ -1,6 +1,6 @@
 use crate::io;
 use crate::sync::PoisonError;
-use crate::tree_store::{FILE_FORMAT_VERSION3, MAX_VALUE_LENGTH};
+use crate::tree_store::{FILE_FORMAT_VERSION4, MAX_VALUE_LENGTH};
 use crate::{ReadTransaction, TypeName};
 use alloc::boxed::Box;
 use alloc::format;
@@ -263,7 +263,7 @@ impl Display for DatabaseError {
             DatabaseError::UpgradeRequired(actual) => {
                 write!(
                     f,
-                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION3}, but file is version {actual}"
+                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION4}, but file is version {actual}"
                 )
             }
             DatabaseError::RepairAborted => {
@@ -616,7 +616,7 @@ impl Display for Error {
             Error::UpgradeRequired(actual) => {
                 write!(
                     f,
-                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION3}, but file is version {actual}"
+                    "Manual upgrade required. Expected file format version {FILE_FORMAT_VERSION4}, but file is version {actual}"
                 )
             }
             Error::ValueTooLarge(len) => {

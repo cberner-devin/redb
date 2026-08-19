@@ -3,7 +3,8 @@ use crate::tree_store::btree_base::{BtreeHeader, Checksum};
 use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, MAX_REGIONS};
 use crate::tree_store::page_store::layout::{DatabaseLayout, RegionLayout};
 use crate::tree_store::page_store::page_manager::{
-    FILE_FORMAT_VERSION1, FILE_FORMAT_VERSION2, FILE_FORMAT_VERSION3, xxh3_checksum,
+    FILE_FORMAT_VERSION1, FILE_FORMAT_VERSION2, FILE_FORMAT_VERSION3, FILE_FORMAT_VERSION4,
+    xxh3_checksum,
 };
 use crate::{DatabaseError, Result, StorageError};
 use alloc::format;
@@ -413,6 +414,7 @@ impl DatabaseHeader {
         system_root: Option<BtreeHeader>,
     ) {
         let slot = &mut self.transaction_slots[self.primary_slot ^ 1];
+        slot.version = FILE_FORMAT_VERSION4;
         slot.transaction_id = transaction_id;
         slot.user_root = user_root;
         slot.system_root = system_root;
@@ -470,7 +472,7 @@ pub(super) struct TransactionHeader {
 impl TransactionHeader {
     fn new(transaction_id: TransactionId) -> Self {
         Self {
-            version: FILE_FORMAT_VERSION3,
+            version: FILE_FORMAT_VERSION4,
             user_root: None,
             system_root: None,
             transaction_id,
@@ -485,10 +487,10 @@ impl TransactionHeader {
             FILE_FORMAT_VERSION1 | FILE_FORMAT_VERSION2 => {
                 return Err(DatabaseError::UpgradeRequired(version));
             }
-            FILE_FORMAT_VERSION3 => {}
+            FILE_FORMAT_VERSION3 | FILE_FORMAT_VERSION4 => {}
             _ => {
                 return Err(StorageError::Corrupted(format!(
-                    "Expected file format version <= {FILE_FORMAT_VERSION3}, found {version}",
+                    "Expected file format version <= {FILE_FORMAT_VERSION4}, found {version}",
                 ))
                 .into());
             }
@@ -540,7 +542,10 @@ impl TransactionHeader {
         if let Some(bytes) = self.corrupt_bytes {
             return bytes;
         }
-        assert_eq!(self.version, FILE_FORMAT_VERSION3);
+        assert!(matches!(
+            self.version,
+            FILE_FORMAT_VERSION3 | FILE_FORMAT_VERSION4
+        ));
         let mut result = [0; TRANSACTION_SIZE];
         result[VERSION_OFFSET] = self.version;
         if let Some(header) = self.user_root {

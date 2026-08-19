@@ -17,6 +17,71 @@ use core::ops::Range;
 
 pub(crate) const LEAF: u8 = 1;
 pub(crate) const BRANCH: u8 = 2;
+pub(crate) const SLOTTED_LEAF: u8 = LEAF | 1 << 7;
+
+const HAS_REUSABLE_SLOT: u8 = 1;
+const SLOT_OFFSET_SIZE: usize = size_of::<u32>();
+const SLOT_FRONTIER_OFFSET: usize = 4;
+const GARBAGE_BYTES_OFFSET: usize = 8;
+const SLOTTED_HEADER_SIZE: usize = 12;
+
+fn read_slot_offset(input: &[u8]) -> Option<usize> {
+    Some(u32::from_le_bytes(input.get(..SLOT_OFFSET_SIZE)?.try_into().unwrap()) as usize)
+}
+
+fn write_slot_offset(output: &mut [u8], offset: usize) {
+    output[..SLOT_OFFSET_SIZE].copy_from_slice(&u32::try_from(offset).unwrap().to_le_bytes());
+}
+
+fn varint_len(value: usize) -> usize {
+    if value < 254 {
+        1
+    } else if u16::try_from(value).is_ok() {
+        3
+    } else {
+        5
+    }
+}
+
+fn write_varint(value: usize, output: &mut [u8]) -> usize {
+    let length = varint_len(value);
+    match length {
+        1 => output[0] = value.try_into().unwrap(),
+        3 => {
+            output[0] = 254;
+            output[1..3].copy_from_slice(&u16::try_from(value).unwrap().to_le_bytes());
+        }
+        5 => {
+            output[0] = 255;
+            output[1..5].copy_from_slice(&u32::try_from(value).unwrap().to_le_bytes());
+        }
+        _ => unreachable!(),
+    }
+    length
+}
+
+fn read_varint(input: &[u8]) -> Option<(usize, usize)> {
+    match *input.first()? {
+        0..=253 => Some((usize::from(input[0]), 1)),
+        254 => Some((
+            usize::from(u16::from_le_bytes(input.get(1..3)?.try_into().unwrap())),
+            3,
+        )),
+        255 => Some((
+            u32::from_le_bytes(input.get(1..5)?.try_into().unwrap()) as usize,
+            5,
+        )),
+    }
+}
+
+// Maximum encoded bytes for `fields` lengths whose payload bytes sum to `total`. This keeps
+// aggregate sizing callers safe without pessimistically charging five bytes for every varint.
+fn aggregate_varint_bytes(fields: usize, total: usize) -> usize {
+    let medium_fields = fields.min(total / 254);
+    let remaining = total - medium_fields * 254;
+    let large_fields = medium_fields.min(remaining / (usize::from(u16::MAX) + 1 - 254));
+    fields + 2 * medium_fields + 2 * large_fields
+}
 
 // Descending a btree recurses once per level, so a corrupted file whose branch pages form a cycle,
 // or a crafted chain of them, overflows the stack -- which aborts rather than unwinding. No real
@@ -56,6 +121,9 @@ pub(super) fn leaf_checksum<T: Page>(
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
 ) -> Result<Checksum, StorageError> {
+    if page.memory()[0] == SLOTTED_LEAF {
+        return Ok(xxh3_checksum(page.memory()));
+    }
     let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
     let last_pair = accessor.num_pairs().checked_sub(1).ok_or_else(|| {
         StorageError::Corrupted(format!(
@@ -489,6 +557,7 @@ pub(crate) struct LeafAccessor<'a> {
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     num_pairs: usize,
+    slotted: bool,
 }
 
 impl<'a> LeafAccessor<'a> {
@@ -497,13 +566,14 @@ impl<'a> LeafAccessor<'a> {
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
     ) -> Self {
-        debug_assert_eq!(page[0], LEAF);
+        debug_assert!(matches!(page[0], LEAF | SLOTTED_LEAF));
         let num_pairs = u16::from_le_bytes(page[2..4].try_into().unwrap()) as usize;
         LeafAccessor {
             page,
             fixed_key_size,
             fixed_value_size,
             num_pairs,
+            slotted: page[0] == SLOTTED_LEAF,
         }
     }
 
@@ -549,6 +619,7 @@ impl<'a> LeafAccessor<'a> {
     }
 
     fn key_section_start(&self) -> usize {
+        debug_assert!(!self.slotted);
         let mut offset = 4;
         if self.fixed_key_size.is_none() {
             offset += size_of::<u32>() * self.num_pairs;
@@ -561,6 +632,9 @@ impl<'a> LeafAccessor<'a> {
     }
 
     fn key_start(&self, n: usize) -> Option<usize> {
+        if self.slotted {
+            return Some(self.slotted_entry_ranges(n)?.0.start);
+        }
         if n == 0 {
             Some(self.key_section_start())
         } else {
@@ -569,6 +643,9 @@ impl<'a> LeafAccessor<'a> {
     }
 
     fn key_end(&self, n: usize) -> Option<usize> {
+        if self.slotted {
+            return Some(self.slotted_entry_ranges(n)?.0.end);
+        }
         if n >= self.num_pairs() {
             None
         } else {
@@ -587,6 +664,9 @@ impl<'a> LeafAccessor<'a> {
     }
 
     fn value_start(&self, n: usize) -> Option<usize> {
+        if self.slotted {
+            return Some(self.slotted_entry_ranges(n)?.1.start);
+        }
         if n == 0 {
             self.key_end(self.num_pairs() - 1)
         } else {
@@ -595,6 +675,9 @@ impl<'a> LeafAccessor<'a> {
     }
 
     fn value_end(&self, n: usize) -> Option<usize> {
+        if self.slotted {
+            return Some(self.slotted_entry_ranges(n)?.1.end);
+        }
         if n >= self.num_pairs() {
             None
         } else {
@@ -619,6 +702,85 @@ impl<'a> LeafAccessor<'a> {
         self.num_pairs
     }
 
+    #[inline]
+    fn slot_offset(&self, n: usize) -> Option<usize> {
+        if !self.slotted || n >= self.num_pairs {
+            return None;
+        }
+        let offset = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * n;
+        read_slot_offset(self.page.get(offset..offset + SLOT_OFFSET_SIZE)?)
+    }
+
+    fn slot_offset_unchecked(&self, n: usize) -> usize {
+        debug_assert!(n < self.num_pairs);
+        let offset = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * n;
+        u32::from_le_bytes(
+            self.page[offset..offset + SLOT_OFFSET_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    }
+
+    fn slot_range(&self, n: usize) -> Option<Range<usize>> {
+        self.slot_range_at(self.slot_offset(n)?)
+    }
+
+    fn slot_range_at(&self, start: usize) -> Option<Range<usize>> {
+        Some(start..self.slotted_entry_ranges_at(start)?.1.end)
+    }
+
+    fn garbage_bytes(&self) -> usize {
+        u32::from_le_bytes(
+            self.page[GARBAGE_BYTES_OFFSET..SLOTTED_HEADER_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    }
+
+    fn reusable_slot(&self, required_len: usize) -> Option<usize> {
+        if self.page[1] & HAS_REUSABLE_SLOT == 0 {
+            return None;
+        }
+        let pointer = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * self.num_pairs;
+        let offset = read_slot_offset(self.page.get(pointer..pointer + SLOT_OFFSET_SIZE)?)?;
+        (self.slot_range_at(offset)?.len() == required_len).then_some(offset)
+    }
+
+    #[inline]
+    fn slotted_entry_ranges(&self, n: usize) -> Option<(Range<usize>, Range<usize>)> {
+        self.slotted_entry_ranges_at(self.slot_offset(n)?)
+    }
+
+    #[inline]
+    fn slotted_entry_ranges_at(&self, slot_start: usize) -> Option<(Range<usize>, Range<usize>)> {
+        let key_tag = *self.page.get(slot_start)?;
+        if key_tag < 254 {
+            let value_tag = *self.page.get(slot_start + 1)?;
+            if value_tag < 254 {
+                let key_start = slot_start + 2;
+                let value_start = key_start.checked_add(usize::from(key_tag))?;
+                let value_end = value_start.checked_add(usize::from(value_tag))?;
+                return (value_end <= self.page.len())
+                    .then_some((key_start..value_start, value_start..value_end));
+            }
+        }
+        let (key_len, key_varint) = read_varint(self.page.get(slot_start..)?)?;
+        let value_varint_offset = slot_start.checked_add(key_varint)?;
+        let (value_len, value_varint) = read_varint(self.page.get(value_varint_offset..)?)?;
+        let key_start = value_varint_offset + value_varint;
+        let value_start = key_start + key_len;
+        let value_end = value_start.checked_add(value_len)?;
+        (value_end <= self.page.len()).then_some((key_start..value_start, value_start..value_end))
+    }
+
+    fn slot_frontier(&self) -> usize {
+        u32::from_le_bytes(
+            self.page[SLOT_FRONTIER_OFFSET..GARBAGE_BYTES_OFFSET]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    }
+
     pub(super) fn offset_of_first_value(&self) -> usize {
         self.offset_of_value(0).unwrap()
     }
@@ -633,10 +795,23 @@ impl<'a> LeafAccessor<'a> {
 
     // Returns the length of all keys and values between [start, end)
     pub(crate) fn length_of_pairs(&self, start: usize, end: usize) -> usize {
+        if self.slotted {
+            return (start..end)
+                .map(|i| {
+                    let (key, value) = self.slotted_entry_ranges(i).unwrap();
+                    key.len() + value.len()
+                })
+                .sum();
+        }
         self.length_of_values(start, end) + self.length_of_keys(start, end)
     }
 
     fn length_of_values(&self, start: usize, end: usize) -> usize {
+        if self.slotted {
+            return (start..end)
+                .map(|i| self.slotted_entry_ranges(i).unwrap().1.len())
+                .sum();
+        }
         if end == 0 {
             return 0;
         }
@@ -647,6 +822,11 @@ impl<'a> LeafAccessor<'a> {
 
     // Returns the length of all keys between [start, end)
     pub(crate) fn length_of_keys(&self, start: usize, end: usize) -> usize {
+        if self.slotted {
+            return (start..end)
+                .map(|i| self.slotted_entry_ranges(i).unwrap().0.len())
+                .sum();
+        }
         if end == 0 {
             return 0;
         }
@@ -656,21 +836,46 @@ impl<'a> LeafAccessor<'a> {
     }
 
     pub(crate) fn total_length(&self) -> usize {
+        if self.slotted {
+            let slot_bytes = self.page.len() - self.slot_frontier() - self.garbage_bytes();
+            return SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * self.num_pairs + slot_bytes;
+        }
         // Values are stored last
         self.value_end(self.num_pairs() - 1).unwrap()
     }
 
     fn key_unchecked(&self, n: usize) -> &[u8] {
+        if self.slotted {
+            let slot_start = self.slot_offset_unchecked(n);
+            let key_tag = self.page[slot_start];
+            if key_tag < 254 && self.page[slot_start + 1] < 254 {
+                let key_start = slot_start + 2;
+                return &self.page[key_start..key_start + usize::from(key_tag)];
+            }
+            let (key_len, key_varint) = read_varint(&self.page[slot_start..]).unwrap();
+            let value_varint_offset = slot_start + key_varint;
+            let (_, value_varint) = read_varint(&self.page[value_varint_offset..]).unwrap();
+            let key_start = value_varint_offset + value_varint;
+            return &self.page[key_start..key_start + key_len];
+        }
         &self.page[self.key_start(n).unwrap()..self.key_end(n).unwrap()]
     }
 
     pub(crate) fn entry(&self, n: usize) -> Option<EntryAccessor<'a>> {
+        if self.slotted {
+            let (key, value) = self.slotted_entry_ranges(n)?;
+            return Some(EntryAccessor::new(&self.page[key], &self.page[value]));
+        }
         let key = &self.page[self.key_start(n)?..self.key_end(n)?];
         let value = &self.page[self.value_start(n)?..self.value_end(n)?];
         Some(EntryAccessor::new(key, value))
     }
 
+    #[inline]
     pub(crate) fn entry_ranges(&self, n: usize) -> Option<(Range<usize>, Range<usize>)> {
+        if self.slotted {
+            return self.slotted_entry_ranges(n);
+        }
         let key = self.key_start(n)?..self.key_end(n)?;
         let value = self.value_start(n)?..self.value_end(n)?;
         Some((key, value))
@@ -823,13 +1028,18 @@ impl OwnedEntryBuffer {
 }
 
 impl<'a, 'b> LeafBuilder<'a, 'b> {
-    pub(super) fn required_bytes(&self, num_pairs: usize, keys_values_bytes: usize) -> usize {
-        RawLeafBuilder::required_bytes(
-            num_pairs,
-            keys_values_bytes,
-            self.fixed_key_size,
-            self.fixed_value_size,
-        )
+    fn required_bytes(pairs: &[(&[u8], &[u8])]) -> usize {
+        SLOTTED_HEADER_SIZE
+            + pairs
+                .iter()
+                .map(|(key, value)| {
+                    SLOT_OFFSET_SIZE
+                        + varint_len(key.len())
+                        + varint_len(value.len())
+                        + key.len()
+                        + value.len()
+                })
+                .sum::<usize>()
     }
 
     pub(super) fn new(
@@ -888,13 +1098,9 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
     }
 
     pub(super) fn should_split(&self) -> bool {
-        leaf_split_required(
-            self.pairs.len(),
-            self.total_key_bytes + self.total_value_bytes,
-            self.fixed_key_size,
-            self.fixed_value_size,
-            self.page_allocator.get_page_size(),
-        )
+        (Self::required_bytes(&self.pairs) > self.page_allocator.get_page_size()
+            || self.pairs.len() > usize::from(u16::MAX))
+            && self.pairs.len() > 1
     }
 
     // Returns the two halves, and the separator to store between them in their parent
@@ -923,11 +1129,9 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         if clamped != division {
             division = clamped;
             first_split_key_bytes = self.pairs[..division].iter().map(|(k, _)| k.len()).sum();
-            first_split_value_bytes = self.pairs[..division].iter().map(|(_, v)| v.len()).sum();
         }
 
-        let required_size =
-            self.required_bytes(division, first_split_key_bytes + first_split_value_bytes);
+        let required_size = Self::required_bytes(&self.pairs[..division]);
         let mut page1 = self
             .page_allocator
             .allocate(required_size, self.allocated_pages)?;
@@ -938,17 +1142,12 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.fixed_value_size,
             first_split_key_bytes,
         );
-        for (key, value) in self.pairs.iter().take(division) {
-            builder.append(key, value);
+        for (key, value) in self.pairs[..division].iter().rev() {
+            builder.prepend(key, value);
         }
         drop(builder);
 
-        let required_size = self.required_bytes(
-            self.pairs.len() - division,
-            self.total_key_bytes + self.total_value_bytes
-                - first_split_key_bytes
-                - first_split_value_bytes,
-        );
+        let required_size = Self::required_bytes(&self.pairs[division..]);
         let mut page2 = self
             .page_allocator
             .allocate(required_size, self.allocated_pages)?;
@@ -959,8 +1158,8 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.fixed_value_size,
             self.total_key_bytes - first_split_key_bytes,
         );
-        for (key, value) in &self.pairs[division..] {
-            builder.append(key, value);
+        for (key, value) in self.pairs[division..].iter().rev() {
+            builder.prepend(key, value);
         }
         drop(builder);
 
@@ -969,10 +1168,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
     }
 
     pub(super) fn build<'txn>(self) -> Result<PageMut<'txn>> {
-        let required_size = self.required_bytes(
-            self.pairs.len(),
-            self.total_key_bytes + self.total_value_bytes,
-        );
+        let required_size = Self::required_bytes(&self.pairs);
         let mut page = self
             .page_allocator
             .allocate(required_size, self.allocated_pages)?;
@@ -983,8 +1179,8 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.fixed_value_size,
             self.total_key_bytes,
         );
-        for (key, value) in self.pairs {
-            builder.append(key, value);
+        for (key, value) in self.pairs.into_iter().rev() {
+            builder.prepend(key, value);
         }
         drop(builder);
         Ok(page)
@@ -1059,64 +1255,91 @@ pub(super) fn is_single_large_value(accessor: &LeafAccessor<'_>, page_size: usiz
     accessor.num_pairs() == 1 && accessor.total_length() >= page_size
 }
 
-// The pair count and key-value bytes a leaf retains after removing `removed_indexes`. Shared
-// by the mutator's delete planning and the cursor's run-opening decision, which must agree on
-// the resulting disposition.
-pub(super) fn retained_after_removals(
+// The pair count and serialized size a rebuilt leaf has after removing `removed_indexes`.
+pub(super) fn retained_leaf_size(
     accessor: &LeafAccessor<'_>,
     removed_indexes: &[usize],
 ) -> (usize, usize) {
-    let removed_bytes: usize = removed_indexes
+    let retained_pairs = accessor.num_pairs() - removed_indexes.len();
+    if accessor.slotted {
+        let removed_bytes = removed_indexes
+            .iter()
+            .map(|&index| SLOT_OFFSET_SIZE + accessor.slot_range(index).unwrap().len())
+            .sum::<usize>();
+        return (retained_pairs, accessor.total_length() - removed_bytes);
+    }
+    let removed_bytes = removed_indexes
         .iter()
         .map(|&index| accessor.length_of_pairs(index, index + 1))
-        .sum();
-    let retained_pairs = accessor.num_pairs() - removed_indexes.len();
+        .sum::<usize>();
     let retained_bytes = accessor.length_of_pairs(0, accessor.num_pairs()) - removed_bytes;
-    (retained_pairs, retained_bytes)
+    (
+        retained_pairs,
+        RawLeafBuilder::required_bytes(
+            retained_pairs,
+            retained_bytes,
+            accessor.fixed_key_size,
+            accessor.fixed_value_size,
+        ),
+    )
 }
 
-// Note the caller is responsible for ensuring that the buffer is large enough
-// and rewriting all fields if any dynamically sized fields are written
+// Note the caller is responsible for ensuring that the buffer is large enough.
 // Layout is:
 // 1 byte: type
-// 1 byte: reserved (padding to 32bits aligned)
+// 1 byte: flags
 // 2 bytes: num_entries (number of pairs)
-// (optional) repeating (num_entries times):
-// 4 bytes: key_end
-// (optional) repeating (num_entries times):
-// 4 bytes: value_end
-// repeating (num_entries times):
-// * n bytes: key data
-// repeating (num_entries times):
-// * n bytes: value data
+// repeating (num_entries times): 4 byte slot offset
+// free space
+// slots growing backward from the end of the page, each containing:
+// * varint key length
+// * varint value length
+// * key data
+// * value data
 pub(crate) struct RawLeafBuilder<'a> {
     page: &'a mut [u8],
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     num_pairs: usize,
-    provisioned_key_bytes: usize,
+    slot_cursor: usize,
     pairs_written: usize, // used for debugging
 }
 
 impl<'a> RawLeafBuilder<'a> {
+    pub(crate) fn build_from(page: &'a mut [u8], accessor: &LeafAccessor<'_>) {
+        let mut builder = Self::new(
+            page,
+            accessor.num_pairs(),
+            accessor.fixed_key_size,
+            accessor.fixed_value_size,
+            accessor.length_of_keys(0, accessor.num_pairs()),
+        );
+        for i in (0..accessor.num_pairs()).rev() {
+            let entry = accessor.entry(i).unwrap();
+            builder.prepend(entry.key(), entry.value());
+        }
+    }
+
     pub(crate) fn required_bytes(
         num_pairs: usize,
         keys_values_bytes: usize,
         key_size: Option<usize>,
         value_size: Option<usize>,
     ) -> usize {
-        // Page id & header;
-        let mut result = 4;
-        // key & value lengths
-        if key_size.is_none() {
-            result += num_pairs * size_of::<u32>();
-        }
-        if value_size.is_none() {
-            result += num_pairs * size_of::<u32>();
-        }
-        result += keys_values_bytes;
-
-        result
+        // LeafBuilder has the individual pairs and uses the exact size instead.
+        let varint_bytes = match (key_size, value_size) {
+            (Some(key), Some(value)) => num_pairs * (varint_len(key) + varint_len(value)),
+            (Some(key), None) => {
+                num_pairs * varint_len(key)
+                    + aggregate_varint_bytes(num_pairs, keys_values_bytes - num_pairs * key)
+            }
+            (None, Some(value)) => {
+                num_pairs * varint_len(value)
+                    + aggregate_varint_bytes(num_pairs, keys_values_bytes - num_pairs * value)
+            }
+            (None, None) => aggregate_varint_bytes(2 * num_pairs, keys_values_bytes),
+        };
+        SLOTTED_HEADER_SIZE + keys_values_bytes + num_pairs * SLOT_OFFSET_SIZE + varint_bytes
     }
 
     pub(crate) fn new(
@@ -1124,113 +1347,71 @@ impl<'a> RawLeafBuilder<'a> {
         num_pairs: usize,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
-        key_bytes: usize,
+        _key_bytes: usize,
     ) -> Self {
-        page[0] = LEAF;
+        page[0] = SLOTTED_LEAF;
+        page[1] = 0;
         page[2..4].copy_from_slice(&u16::try_from(num_pairs).unwrap().to_le_bytes());
+        page[GARBAGE_BYTES_OFFSET..SLOTTED_HEADER_SIZE].fill(0);
         #[cfg(debug_assertions)]
         {
-            // Poison all the key & value offsets, in case the caller forgets to write them
-            let mut last = 4;
-            if fixed_key_size.is_none() {
-                last += size_of::<u32>() * num_pairs;
-            }
-            if fixed_value_size.is_none() {
-                last += size_of::<u32>() * num_pairs;
-            }
-            for x in &mut page[4..last] {
+            // Poison all slot offsets, in case the caller forgets to write them.
+            for x in
+                &mut page[SLOTTED_HEADER_SIZE..SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * num_pairs]
+            {
                 *x = 0xFF;
             }
         }
+        let slot_cursor = page.len();
         RawLeafBuilder {
             page,
             fixed_key_size,
             fixed_value_size,
             num_pairs,
-            provisioned_key_bytes: key_bytes,
+            slot_cursor,
             pairs_written: 0,
         }
     }
 
-    fn value_end(&self, n: usize) -> usize {
-        if let Some(fixed) = self.fixed_value_size {
-            return self.key_section_start() + self.provisioned_key_bytes + fixed * (n + 1);
-        }
-        let mut offset = 4 + size_of::<u32>() * n;
-        if self.fixed_key_size.is_none() {
-            offset += size_of::<u32>() * self.num_pairs;
-        }
-        u32::from_le_bytes(
-            self.page[offset..(offset + size_of::<u32>())]
-                .try_into()
-                .unwrap(),
-        ) as usize
-    }
-
-    fn key_section_start(&self) -> usize {
-        let mut offset = 4;
-        if self.fixed_key_size.is_none() {
-            offset += size_of::<u32>() * self.num_pairs;
-        }
-        if self.fixed_value_size.is_none() {
-            offset += size_of::<u32>() * self.num_pairs;
-        }
-
-        offset
-    }
-
-    fn key_end(&self, n: usize) -> usize {
-        if let Some(fixed) = self.fixed_key_size {
-            return self.key_section_start() + fixed * (n + 1);
-        }
-        let offset = 4 + size_of::<u32>() * n;
-        u32::from_le_bytes(
-            self.page[offset..(offset + size_of::<u32>())]
-                .try_into()
-                .unwrap(),
-        ) as usize
-    }
-
     pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
+        self.write(self.pairs_written, key, value);
+    }
+
+    fn prepend(&mut self, key: &[u8], value: &[u8]) {
+        self.write(self.num_pairs - self.pairs_written - 1, key, value);
+    }
+
+    fn write(&mut self, index: usize, key: &[u8], value: &[u8]) {
         if let Some(key_width) = self.fixed_key_size {
             assert_eq!(key_width, key.len());
         }
         if let Some(value_width) = self.fixed_value_size {
             assert_eq!(value_width, value.len());
         }
-        let key_offset = if self.pairs_written == 0 {
-            self.key_section_start()
-        } else {
-            self.key_end(self.pairs_written - 1)
-        };
-        let value_offset = if self.pairs_written == 0 {
-            self.key_section_start() + self.provisioned_key_bytes
-        } else {
-            self.value_end(self.pairs_written - 1)
-        };
+        let key_varint = varint_len(key.len());
+        let value_varint = varint_len(value.len());
+        let slot_len = key_varint + value_varint + key.len() + value.len();
+        self.slot_cursor -= slot_len;
+        assert!(self.slot_cursor >= SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * self.num_pairs);
 
-        let n = self.pairs_written;
-        if self.fixed_key_size.is_none() {
-            let offset = 4 + size_of::<u32>() * n;
-            self.page[offset..(offset + size_of::<u32>())]
-                .copy_from_slice(&u32::try_from(key_offset + key.len()).unwrap().to_le_bytes());
-        }
-        self.page[key_offset..(key_offset + key.len())].copy_from_slice(key);
-        let written_key_len = key_offset + key.len() - self.key_section_start();
-        assert!(written_key_len <= self.provisioned_key_bytes);
+        let pointer = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * index;
+        write_slot_offset(
+            &mut self.page[pointer..pointer + SLOT_OFFSET_SIZE],
+            self.slot_cursor,
+        );
 
-        if self.fixed_value_size.is_none() {
-            let mut offset = 4 + size_of::<u32>() * n;
-            if self.fixed_key_size.is_none() {
-                offset += size_of::<u32>() * self.num_pairs;
-            }
-            self.page[offset..(offset + size_of::<u32>())].copy_from_slice(
-                &u32::try_from(value_offset + value.len())
-                    .unwrap()
-                    .to_le_bytes(),
-            );
+        let mut cursor = self.slot_cursor;
+        if key_varint == 1 && value_varint == 1 {
+            self.page[cursor] = key.len().try_into().unwrap();
+            self.page[cursor + 1] = value.len().try_into().unwrap();
+            cursor += 2;
+        } else {
+            cursor += write_varint(key.len(), &mut self.page[cursor..]);
+            cursor += write_varint(value.len(), &mut self.page[cursor..]);
         }
-        self.page[value_offset..(value_offset + value.len())].copy_from_slice(value);
+        self.page[cursor..cursor + key.len()].copy_from_slice(key);
+        cursor += key.len();
+        self.page[cursor..cursor + value.len()].copy_from_slice(value);
         self.pairs_written += 1;
     }
 }
@@ -1239,10 +1420,8 @@ impl Drop for RawLeafBuilder<'_> {
     fn drop(&mut self) {
         if !crate::panicking() {
             assert_eq!(self.pairs_written, self.num_pairs);
-            assert_eq!(
-                self.key_section_start() + self.provisioned_key_bytes,
-                self.key_end(self.num_pairs - 1)
-            );
+            self.page[SLOT_FRONTIER_OFFSET..GARBAGE_BYTES_OFFSET]
+                .copy_from_slice(&u32::try_from(self.slot_cursor).unwrap().to_le_bytes());
         }
     }
 }
@@ -1269,12 +1448,76 @@ impl<'b> LeafMutator<'b> {
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
     ) -> Self {
-        assert_eq!(page[0], LEAF);
+        assert!(matches!(page[0], LEAF | SLOTTED_LEAF));
         Self {
             page,
             fixed_key_size,
             fixed_value_size,
         }
+    }
+
+    fn slotted(&self) -> bool {
+        self.page[0] == SLOTTED_LEAF
+    }
+
+    fn set_garbage_bytes(&mut self, bytes: usize) {
+        self.page[GARBAGE_BYTES_OFFSET..SLOTTED_HEADER_SIZE]
+            .copy_from_slice(&u32::try_from(bytes).unwrap().to_le_bytes());
+    }
+
+    fn set_reusable_slot(&mut self, num_pairs: usize, offset: usize) {
+        self.page[1] |= HAS_REUSABLE_SLOT;
+        let pointer = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * num_pairs;
+        write_slot_offset(&mut self.page[pointer..pointer + SLOT_OFFSET_SIZE], offset);
+    }
+
+    fn slotted_slot_len(key: &[u8], value: &[u8]) -> usize {
+        varint_len(key.len()) + varint_len(value.len()) + key.len() + value.len()
+    }
+
+    fn write_slotted_slot(page: &mut [u8], start: usize, key: &[u8], value: &[u8]) {
+        let mut cursor = start;
+        cursor += write_varint(key.len(), &mut page[cursor..]);
+        cursor += write_varint(value.len(), &mut page[cursor..]);
+        page[cursor..cursor + key.len()].copy_from_slice(key);
+        cursor += key.len();
+        page[cursor..cursor + value.len()].copy_from_slice(value);
+    }
+
+    fn compact_slotted(&mut self) {
+        let source = self.page.to_vec();
+        let accessor = LeafAccessor::new(&source, self.fixed_key_size, self.fixed_value_size);
+        let mut cursor = self.page.len();
+        for i in (0..accessor.num_pairs()).rev() {
+            let slot = accessor.slot_range(i).unwrap();
+            cursor -= slot.len();
+            self.page[cursor..cursor + slot.len()].copy_from_slice(&source[slot]);
+            let pointer = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * i;
+            write_slot_offset(&mut self.page[pointer..pointer + SLOT_OFFSET_SIZE], cursor);
+        }
+        self.page[SLOT_FRONTIER_OFFSET..GARBAGE_BYTES_OFFSET]
+            .copy_from_slice(&u32::try_from(cursor).unwrap().to_le_bytes());
+        self.page[1] = 0;
+        self.page[GARBAGE_BYTES_OFFSET..SLOTTED_HEADER_SIZE].fill(0);
+    }
+
+    fn replace_and_compact_slotted(&mut self, position: usize, value: &[u8]) {
+        let source = self.page.to_vec();
+        let accessor = LeafAccessor::new(&source, self.fixed_key_size, self.fixed_value_size);
+        let mut cursor = self.page.len();
+        for i in (0..accessor.num_pairs()).rev() {
+            let entry = accessor.entry(i).unwrap();
+            let replacement = if i == position { value } else { entry.value() };
+            let slot_len = Self::slotted_slot_len(entry.key(), replacement);
+            cursor -= slot_len;
+            Self::write_slotted_slot(self.page, cursor, entry.key(), replacement);
+            let pointer = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * i;
+            write_slot_offset(&mut self.page[pointer..pointer + SLOT_OFFSET_SIZE], cursor);
+        }
+        self.page[SLOT_FRONTIER_OFFSET..GARBAGE_BYTES_OFFSET]
+            .copy_from_slice(&u32::try_from(cursor).unwrap().to_le_bytes());
+        self.page[1] = 0;
+        self.page[GARBAGE_BYTES_OFFSET..SLOTTED_HEADER_SIZE].fill(0);
     }
 
     // Returns true if there is enough space to replace the value at `position` in-place.
@@ -1287,6 +1530,15 @@ impl<'b> LeafMutator<'b> {
         new_value: &[u8],
     ) -> bool {
         let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
+        if accessor.slotted {
+            let entry = accessor.entry(position).unwrap();
+            if entry.value().len() == new_value.len() {
+                return true;
+            }
+            let old_slot_len = accessor.slot_range(position).unwrap().len();
+            let new_slot_len = Self::slotted_slot_len(entry.key(), new_value);
+            return accessor.total_length() - old_slot_len + new_slot_len <= page.memory().len();
+        }
         let remaining = page.memory().len() - accessor.total_length();
         let existing_value_len = accessor
             .value_range(position)
@@ -1317,6 +1569,10 @@ impl<'b> LeafMutator<'b> {
         if accessor.num_pairs() >= usize::from(u16::MAX) {
             return false;
         }
+        if accessor.slotted {
+            let required = SLOT_OFFSET_SIZE + Self::slotted_slot_len(new_key, new_value);
+            return accessor.total_length() + required <= page.memory().len();
+        }
         // If this is a large page, only allow in-place appending to avoid write amplification
         if page.get_page_number().page_order > 0 && position < accessor.num_pairs() {
             return false;
@@ -1339,6 +1595,40 @@ impl<'b> LeafMutator<'b> {
 
     // Replace the value at index `i` with `value`, leaving the key unchanged.
     pub(super) fn replace(&mut self, i: usize, value: &[u8]) {
+        if self.slotted() {
+            let (key, old_value_range, old_slot, frontier, num_pairs, garbage_bytes) = {
+                let accessor =
+                    LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
+                let entry = accessor.entry(i).unwrap();
+                (
+                    entry.key().to_vec(),
+                    accessor.entry_ranges(i).unwrap().1,
+                    accessor.slot_range(i).unwrap(),
+                    accessor.slot_frontier(),
+                    accessor.num_pairs(),
+                    accessor.garbage_bytes(),
+                )
+            };
+            if old_value_range.len() == value.len() {
+                self.page[old_value_range].copy_from_slice(value);
+                return;
+            }
+
+            let slot_len = Self::slotted_slot_len(&key, value);
+            let offsets_end = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * num_pairs;
+            if frontier - offsets_end < slot_len {
+                self.replace_and_compact_slotted(i, value);
+                return;
+            }
+            let start = frontier - slot_len;
+            Self::write_slotted_slot(self.page, start, &key, value);
+            let pointer = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * i;
+            write_slot_offset(&mut self.page[pointer..pointer + SLOT_OFFSET_SIZE], start);
+            self.page[SLOT_FRONTIER_OFFSET..GARBAGE_BYTES_OFFSET]
+                .copy_from_slice(&u32::try_from(start).unwrap().to_le_bytes());
+            self.set_garbage_bytes(garbage_bytes + old_slot.len());
+            return;
+        }
         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
         let num_pairs = accessor.num_pairs();
         let last_value_end = accessor.value_end(num_pairs - 1).unwrap();
@@ -1374,6 +1664,46 @@ impl<'b> LeafMutator<'b> {
 
     // Insert the given key, value pair at index i and shift all following pairs to the right
     pub(super) fn insert(&mut self, i: usize, key: &[u8], value: &[u8]) {
+        if self.slotted() {
+            let (num_pairs, mut frontier, mut garbage_bytes, reusable) = {
+                let accessor =
+                    LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
+                let slot_len = Self::slotted_slot_len(key, value);
+                (
+                    accessor.num_pairs(),
+                    accessor.slot_frontier(),
+                    accessor.garbage_bytes(),
+                    accessor.reusable_slot(slot_len),
+                )
+            };
+            assert!(i <= num_pairs);
+            let slot_len = Self::slotted_slot_len(key, value);
+            let new_offsets_end = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * (num_pairs + 1);
+            if reusable.is_none() && frontier - new_offsets_end < slot_len {
+                self.compact_slotted();
+                frontier = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size)
+                    .slot_frontier();
+                garbage_bytes = 0;
+            }
+            assert!(reusable.is_some() || frontier - new_offsets_end >= slot_len);
+
+            let start = reusable.unwrap_or(frontier - slot_len);
+            Self::write_slotted_slot(self.page, start, key, value);
+            let source = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * i;
+            let old_offsets_end = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * num_pairs;
+            self.page
+                .copy_within(source..old_offsets_end, source + SLOT_OFFSET_SIZE);
+            write_slot_offset(&mut self.page[source..source + SLOT_OFFSET_SIZE], start);
+            if reusable.is_some() {
+                self.set_garbage_bytes(garbage_bytes - slot_len);
+            } else {
+                self.page[SLOT_FRONTIER_OFFSET..GARBAGE_BYTES_OFFSET]
+                    .copy_from_slice(&u32::try_from(start).unwrap().to_le_bytes());
+            }
+            self.page[1] &= !HAS_REUSABLE_SLOT;
+            self.page[2..4].copy_from_slice(&u16::try_from(num_pairs + 1).unwrap().to_le_bytes());
+            return;
+        }
         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
         let required_delta = {
             let mut delta = key.len() + value.len();
@@ -1478,6 +1808,33 @@ impl<'b> LeafMutator<'b> {
     }
 
     pub(super) fn remove(&mut self, i: usize) {
+        if self.slotted() {
+            let (num_pairs, slot, frontier, garbage_bytes) = {
+                let accessor =
+                    LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
+                (
+                    accessor.num_pairs(),
+                    accessor.slot_range(i).unwrap(),
+                    accessor.slot_frontier(),
+                    accessor.garbage_bytes(),
+                )
+            };
+            assert!(i < num_pairs);
+            assert!(num_pairs > 1);
+            let pointer = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * i;
+            let offsets_end = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * num_pairs;
+            self.page
+                .copy_within(pointer + SLOT_OFFSET_SIZE..offsets_end, pointer);
+            self.page[2..4].copy_from_slice(&u16::try_from(num_pairs - 1).unwrap().to_le_bytes());
+            if slot.start == frontier {
+                self.page[SLOT_FRONTIER_OFFSET..GARBAGE_BYTES_OFFSET]
+                    .copy_from_slice(&u32::try_from(slot.end).unwrap().to_le_bytes());
+            } else {
+                self.set_garbage_bytes(garbage_bytes + slot.len());
+                self.set_reusable_slot(num_pairs - 1, slot.start);
+            }
+            return;
+        }
         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
         let num_pairs = accessor.num_pairs();
         assert!(i < num_pairs);
@@ -1559,6 +1916,43 @@ impl<'b> LeafMutator<'b> {
 
     // `indices` must contain valid leaf indices in strictly ascending order.
     pub(super) fn remove_indices(&mut self, indices: &[usize]) {
+        if self.slotted() {
+            let (num_pairs, garbage_bytes, reusable) = {
+                let accessor =
+                    LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
+                assert!(!indices.is_empty());
+                assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+                assert!(*indices.last().unwrap() < accessor.num_pairs());
+                assert!(indices.len() < accessor.num_pairs());
+                let removed_bytes = indices
+                    .iter()
+                    .map(|&i| accessor.slot_range(i).unwrap().len())
+                    .sum::<usize>();
+                let reusable = accessor.slot_offset(*indices.last().unwrap()).unwrap();
+                (
+                    accessor.num_pairs(),
+                    accessor.garbage_bytes() + removed_bytes,
+                    reusable,
+                )
+            };
+            let mut removed = 0;
+            for i in 0..num_pairs {
+                if indices.get(removed) == Some(&i) {
+                    removed += 1;
+                } else if removed > 0 {
+                    let source = SLOTTED_HEADER_SIZE + SLOT_OFFSET_SIZE * i;
+                    self.page.copy_within(
+                        source..source + SLOT_OFFSET_SIZE,
+                        source - SLOT_OFFSET_SIZE * removed,
+                    );
+                }
+            }
+            let retained = num_pairs - indices.len();
+            self.page[2..4].copy_from_slice(&u16::try_from(retained).unwrap().to_le_bytes());
+            self.set_garbage_bytes(garbage_bytes);
+            self.set_reusable_slot(retained, reusable);
+            return;
+        }
         let (key_ranges, value_ranges, key_bytes, value_bytes, old_total_len, num_pairs) = {
             let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
             assert!(!indices.is_empty());
@@ -1777,7 +2171,7 @@ impl<'a> LeafPageMut<'a> {
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
     ) -> Self {
-        debug_assert_eq!(page.memory()[0], LEAF);
+        debug_assert!(matches!(page.memory()[0], LEAF | SLOTTED_LEAF));
         Self {
             page,
             fixed_key_size,
@@ -2105,10 +2499,8 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
 // 1 byte: padding (padding to 16bits aligned)
 // 2 bytes: num_keys (number of keys)
 // 4 byte: padding (padding to 64bits aligned)
-// repeating (num_keys + 1 times):
-// 16 bytes: child page checksum
-// repeating (num_keys + 1 times):
-// 8 bytes: page number
+// repeating (num_keys + 1 times): 16 byte child checksum
+// repeating (num_keys + 1 times): 8 byte child page number
 // (optional) repeating (num_keys times):
 // * 4 bytes: key end. Ending offset of the key, exclusive
 // repeating (num_keys times):
@@ -2323,6 +2715,66 @@ mod tests {
 
     fn ascending_keys(n: usize) -> Vec<[u8; 8]> {
         (0..n as u64).map(|i| i.to_le_bytes()).collect()
+    }
+
+    fn slotted_page(keys: &[&[u8]], len: usize) -> Vec<u8> {
+        let mut page = vec![0; len];
+        let mut builder = RawLeafBuilder::new(&mut page, keys.len(), None, None, keys.len());
+        for key in keys {
+            builder.append(key, b"1");
+        }
+        drop(builder);
+        page
+    }
+
+    fn slotted_keys<'a>(accessor: &LeafAccessor<'a>) -> Vec<&'a [u8]> {
+        (0..accessor.num_pairs())
+            .map(|i| accessor.entry(i).unwrap().key())
+            .collect()
+    }
+
+    #[test]
+    fn slotted_leaf_insert_compacts_deleted_slot_data() {
+        let mut page = slotted_page(&[b"a", b"b", b"c"], 40);
+        LeafMutator::new(&mut page, None, None).remove(1);
+        assert_ne!(page[1] & HAS_REUSABLE_SLOT, 0);
+
+        // The contiguous gap is too small, but reclaiming the deleted slot makes this fit.
+        LeafMutator::new(&mut page, None, None).insert(1, b"abcd", b"x");
+        let accessor = LeafAccessor::new(&page, None, None);
+        assert_eq!(slotted_keys(&accessor), [b"a".as_slice(), b"abcd", b"c"]);
+        assert_eq!(page[1] & HAS_REUSABLE_SLOT, 0);
+        assert_eq!(accessor.garbage_bytes(), 0);
+    }
+
+    #[test]
+    fn slotted_leaf_reuses_equal_sized_deleted_slot() {
+        let mut page = slotted_page(&[b"a", b"b", b"c", b"d"], 64);
+        let (original_length, deleted_offset) = {
+            let accessor = LeafAccessor::new(&page, None, None);
+            (accessor.total_length(), accessor.slot_offset(1).unwrap())
+        };
+        LeafMutator::new(&mut page, None, None).remove(1);
+        let accessor = LeafAccessor::new(&page, None, None);
+        assert_eq!(accessor.garbage_bytes(), 4);
+        assert_eq!(accessor.reusable_slot(4), Some(deleted_offset));
+        assert!(accessor.total_length() < original_length);
+
+        LeafMutator::new(&mut page, None, None).insert(1, b"b", b"1");
+        let accessor = LeafAccessor::new(&page, None, None);
+        assert_eq!(accessor.slot_offset(1), Some(deleted_offset));
+        assert_eq!(accessor.total_length(), original_length);
+        assert_eq!(page[1] & HAS_REUSABLE_SLOT, 0);
+    }
+
+    #[test]
+    fn slotted_leaf_bulk_remove_tracks_garbage_bytes() {
+        let mut page = slotted_page(&[b"a", b"b", b"c", b"d", b"e", b"f"], 96);
+        LeafMutator::new(&mut page, None, None).remove(1);
+        LeafMutator::new(&mut page, None, None).remove_indices(&[1, 3]);
+        let accessor = LeafAccessor::new(&page, None, None);
+        assert_eq!(accessor.garbage_bytes(), 12);
+        assert_eq!(slotted_keys(&accessor), [b"a".as_slice(), b"d", b"f"]);
     }
 
     // num_pairs is stored as a u16. A leaf at u16::MAX pairs must reject in-place

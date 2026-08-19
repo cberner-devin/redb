@@ -57,6 +57,9 @@ pub(crate) const FILE_FORMAT_VERSION2: u8 = 2;
 //   This is a system table. It is only written when a savepoint exists
 // * New persistent savepoint format
 pub(crate) const FILE_FORMAT_VERSION3: u8 = 3;
+// Btree pages use forward-growing slot offsets and backward-growing slot data. Version 3 pages
+// remain readable and are replaced lazily as copy-on-write mutations reach them.
+pub(crate) const FILE_FORMAT_VERSION4: u8 = 4;
 
 #[derive(Copy, Clone)]
 pub(crate) enum ShrinkPolicy {

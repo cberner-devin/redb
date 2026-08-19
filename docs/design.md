@@ -278,40 +278,41 @@ described below:
 
 ### Leaf page:
 * 1 byte: type
-* 1 byte: reserved (padding to 16bits aligned)
+* 1 byte: flags
 * 2 bytes: num_entries (number of pairs)
-* (optional) repeating (num_entries times):
-* * 4 bytes: key_end
-* (optional) repeating (num_entries times):
-* * 4 bytes: value_end
-* repeating (num_entries times):
+* 4 bytes: lowest allocated slot offset
+* 4 bytes: garbage byte count
+* repeating (num_entries times): 4 byte slot offset
+* free space
+* slots grow backward from the end of the page, each containing:
+* * varint: key length
+* * varint: value length
 * * n bytes: key data
-* repeating (num_entries times):
 * * n bytes: value data
 ```
-<-------------------------------------------- 8 bytes ------------------------------------------->
+<------------------------------------------- 12 bytes ------------------------------------------->
 ==================================================================================================
-| type     | padding   | number of entries      | (optional) key end (repeated entries times)    |
+| type     | flags     | number of entries      | lowest slot offset                              |
 --------------------------------------------------------------------------------------------------
-| (optional) value end (repeated entries times) | (optional) key alignment padding               |
-==================================================================================================
-| Key data                                      | (optional) value alignment padding             |
-==================================================================================================
-| Value data                                                                                     |
+| garbage byte count                                                                             |
+--------------------------------------------------------------------------------------------------
+| slot offset (repeated num_entries times)                                                       |
+--------------------------------------------------------------------------------------------------
+| free space                                                                                      |
+--------------------------------------------------------------------------------------------------
+|                                         backward-growing slots                                 |
 ==================================================================================================
 ```
 
-`type` is `1` for a leaf page
+`type` is `129` for a slotted leaf page. Legacy version 3 leaf pages use type `1` and retain their
+original forward-growing encoding; version 4 readers support both during lazy migration.
 
 `num_entries` specifies the number of key-value pairs in the leaf
 
-`key_end` is an array of ending offsets for the keys. It is optional, MUST NOT be stored for fixed width key types
-
-`value_end` is an array of ending offsets for the values. It is optional, MUST NOT be stored for fixed width value types
-
-`key alignment padding` optional padding so that the key data begins at a multiple of the key type's required alignment
-
-`value alignment padding` optional padding so that the value data begins at a multiple of the value type's required alignment
+`garbage byte count` tracks deleted slot data. Bit zero of `flags` indicates that the first unused
+offset-array cell contains one deleted slot offset, allowing an equal-sized insert to reuse it.
+Dead data is compacted only when it prevents an insertion. Slotted pages are checksummed over the
+entire allocation, including unused and garbage bytes.
 
 # Commit strategies
 

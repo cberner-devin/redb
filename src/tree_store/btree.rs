@@ -2,7 +2,7 @@ use crate::db::TransactionGuard;
 use crate::sync::Mutex;
 use crate::tree_store::btree_base::{
     AccessGuardMut, BRANCH, BranchAccessor, BranchMutator, BtreeHeader, Checksum, DEFERRED, LEAF,
-    LeafAccessor, LeafPageMut, MAX_BTREE_DEPTH, branch_checksum, leaf_checksum,
+    LeafAccessor, LeafPageMut, MAX_BTREE_DEPTH, SLOTTED_LEAF, branch_checksum, leaf_checksum,
 };
 #[cfg(feature = "experimental-api-5")]
 use crate::tree_store::btree_cursor::BtreeCursor;
@@ -126,7 +126,7 @@ impl UntypedBtree {
         let page = self.mem.get_page(path.page_number(), self.hint)?;
 
         match page.memory()[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 // No-op
             }
             BRANCH => {
@@ -204,7 +204,7 @@ impl UntypedBtreeMut {
         let mut page = self.page_allocator.get_page_mut(page_number)?;
 
         match page.memory()[0] {
-            LEAF => leaf_checksum(&page, self.key_width, self.value_width),
+            LEAF | SLOTTED_LEAF => leaf_checksum(&page, self.key_width, self.value_width),
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, self.key_width);
                 let mut new_children = vec![];
@@ -244,7 +244,7 @@ impl UntypedBtreeMut {
 
             let page = self.page_allocator.get_page_mut(page_number)?;
             match page.memory()[0] {
-                LEAF => {
+                LEAF | SLOTTED_LEAF => {
                     visitor(LeafPageMut::new(page, self.key_width, self.value_width))?;
                 }
                 BRANCH => {
@@ -266,7 +266,7 @@ impl UntypedBtreeMut {
         let page = self.page_allocator.get_page_mut(page_number)?;
 
         match page.memory()[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 visitor(LeafPageMut::new(page, self.key_width, self.value_width))?;
             }
             BRANCH => {
@@ -314,7 +314,7 @@ impl UntypedBtreeMut {
 
         let node_mem = old_page.memory();
         match node_mem[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 // No-op
             }
             BRANCH => {
@@ -631,7 +631,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<K, V> {
     ) -> Result<Option<AccessGuardMut<'txn, V>>> {
         let node_mem = page.memory();
         match node_mem[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 if let Some(entry_index) = accessor.find_key::<K>(query) {
                     let (start, end) = accessor.value_range(entry_index).unwrap();
@@ -968,7 +968,7 @@ impl RawBtree {
         let page = self.mem.get_page(page_number, self.hint)?;
         let node_mem = page.memory();
         let result = Ok(match node_mem[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 if let Ok(computed) =
                     leaf_checksum(&page, self.fixed_key_size, self.fixed_value_size)
                 {
@@ -1097,7 +1097,7 @@ impl<K: Key, V: Value> Btree<K, V> {
         for _ in 0..MAX_BTREE_DEPTH {
             let page = descended.as_ref().unwrap_or(page);
             let child_page = match page.memory()[0] {
-                LEAF => {
+                LEAF | SLOTTED_LEAF => {
                     let accessor =
                         LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                     return Ok(accessor.find_key::<K>(query).map(|entry_index| {
@@ -1143,7 +1143,7 @@ impl<K: Key, V: Value> Btree<K, V> {
         }
         let node_mem = page.memory();
         match node_mem[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 let (key_range, value_range) = accessor.entry_ranges(0).unwrap();
                 let key_guard = AccessGuard::with_page(page.clone(), key_range);
@@ -1182,7 +1182,7 @@ impl<K: Key, V: Value> Btree<K, V> {
         }
         let node_mem = page.memory();
         match node_mem[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 let accessor = LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
                 let (key_range, value_range) =
                     accessor.entry_ranges(accessor.num_pairs() - 1).unwrap();
@@ -1249,7 +1249,7 @@ impl<K: Key, V: Value> Btree<K, V> {
                 for page in pages.drain(..) {
                     let node_mem = page.memory();
                     match node_mem[0] {
-                        LEAF => {
+                        LEAF | SLOTTED_LEAF => {
                             eprint!("Leaf[ (page={:?})", page.get_page_number());
                             LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width())
                                 .print_node::<K, V>(include_values);
@@ -1315,7 +1315,7 @@ fn stats_helper(
     let page = mem.get_page(page_number, hint)?;
     let node_mem = page.memory();
     match node_mem[0] {
-        LEAF => {
+        LEAF | SLOTTED_LEAF => {
             let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
             let leaf_bytes = accessor.length_of_pairs(0, accessor.num_pairs());
             let overhead_bytes = accessor.total_length() - leaf_bytes;

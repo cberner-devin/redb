@@ -1,8 +1,8 @@
 use crate::AccessGuard;
 use crate::sync::Mutex;
 use crate::tree_store::btree_base::{
-    BRANCH, BranchAccessor, LEAF, LeafAccessor, MAX_BTREE_DEPTH, OwnedEntryBuffer,
-    leaf_below_merge_threshold, leaf_fits_one_page, retained_after_removals,
+    BRANCH, BranchAccessor, LEAF, LeafAccessor, MAX_BTREE_DEPTH, OwnedEntryBuffer, SLOTTED_LEAF,
+    retained_leaf_size,
 };
 use crate::tree_store::btree_iters::EntryGuard;
 use crate::tree_store::btree_mutator::MutateHelper;
@@ -145,7 +145,7 @@ where
     let mut page = page;
     loop {
         let (child_index, child_page) = match page.memory()[0] {
-            LEAF => {
+            LEAF | SLOTTED_LEAF => {
                 let (leaf_position, len) = {
                     let accessor =
                         LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width());
@@ -1037,20 +1037,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
         Ok(true)
     }
 
-    /// Removes and returns the next entry, deferring the leaf rewrite until the
-    /// cursor leaves the leaf.
-    ///
-    /// The returned guards are backed by the leaf's current memory and remain
-    /// valid after the deferred rewrite happens.
-    pub(super) fn remove_next_deferred(
-        &mut self,
-    ) -> Result<Option<(AccessGuard<'a, K>, AccessGuard<'a, V>)>> {
-        if !self.ensure_has_entry(Direction::Next)? {
-            return Ok(None);
-        }
-        Ok(Some(self.record_removal_deferred(Direction::Next)))
-    }
-
     /// Removes and returns the previous entry.
     ///
     /// The returned guards must be dropped before mutating the tree again.
@@ -1068,20 +1054,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
             .expect("cursor must be positioned");
         let index = position.leaf.position - 1;
         self.remove_leaf_entry(position.leaf.page, position.path, index)
-    }
-
-    /// Removes and returns the previous entry, deferring the leaf rewrite until
-    /// the cursor leaves the leaf.
-    ///
-    /// The returned guards are backed by the leaf's current memory and remain
-    /// valid after the deferred rewrite happens.
-    pub(super) fn remove_prev_deferred(
-        &mut self,
-    ) -> Result<Option<(AccessGuard<'a, K>, AccessGuard<'a, V>)>> {
-        if !self.ensure_has_entry(Direction::Previous)? {
-            return Ok(None);
-        }
-        Ok(Some(self.record_removal_deferred(Direction::Previous)))
     }
 
     /// Removes the entry after the gap, returning it with a copy of its key.
@@ -1160,13 +1132,14 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
     fn record_removal_deferred(
         &mut self,
         direction: Direction,
+        (key_range, value_range): (Range<usize>, Range<usize>),
     ) -> (AccessGuard<'a, K>, AccessGuard<'a, V>) {
         // The Arc-backed guards stay valid because the page store hands out a
         // fresh buffer whenever a freed page number is reused, and no flush
         // that can run while these guards exist mutates leaf bytes in place:
         // the detached flush below and `RangeMut`'s batch resolution by key
         // both rewrite leaves instead.
-        let index = self.record_removal(direction);
+        self.record_removal(direction);
         self.state.detached_guards = true;
         let leaf = &self
             .state
@@ -1174,10 +1147,6 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
             .as_ref()
             .expect("cursor must be positioned")
             .leaf;
-        let (key_range, value_range) =
-            LeafAccessor::new(leaf.page.memory(), K::fixed_width(), V::fixed_width())
-                .entry_ranges(index)
-                .expect("removed cursor entry must exist");
         let page = leaf.page.to_arc();
         (
             AccessGuard::with_arc_page(page.clone(), key_range),
@@ -1300,27 +1269,14 @@ impl<'a, 'b, K: Key + 'static, V: Value + 'static> CursorMut<'a, 'b, K, V> {
                     K::fixed_width(),
                     V::fixed_width(),
                 );
-                let (retained_pairs, retained_bytes) =
-                    retained_after_removals(&accessor, &self.state.removed_indexes);
+                let (retained_pairs, retained_size) =
+                    retained_leaf_size(&accessor, &self.state.removed_indexes);
                 let page_size = self.page_allocator.get_page_size();
                 // Matches `MutateHelper::plan_leaf_delete`'s Merge disposition.
-                let underfilling = retained_pairs == 0
-                    || leaf_below_merge_threshold(
-                        retained_pairs,
-                        retained_bytes,
-                        K::fixed_width(),
-                        V::fixed_width(),
-                        page_size,
-                    );
+                let underfilling = retained_pairs == 0 || retained_size < page_size / 3;
                 // An underfilling leaf's survivors trivially share a page.
                 let packs = underfilling
-                    || leaf_fits_one_page(
-                        retained_pairs,
-                        retained_bytes,
-                        K::fixed_width(),
-                        V::fixed_width(),
-                        page_size,
-                    );
+                    || (retained_size <= page_size && u16::try_from(retained_pairs).is_ok());
                 (underfilling, packs, !position.path.is_empty())
             };
             if !(underfilling || run_open) || !has_parent {
@@ -2043,9 +1999,9 @@ pub(super) struct RangeMut<'a, K: Key + 'static, V: Value + 'static> {
     tree: CursorTree<'a, K, V>,
     front: EndState,
     back: EndState,
-    // Which end, if any, is known to be live and positioned at an in-range
-    // entry. Cleared whenever the gap moves or the tree is mutated.
-    settled: Option<Direction>,
+    // The live end and its current in-range entry. Cleared whenever the gap moves or the tree is
+    // mutated.
+    settled: Option<(Direction, Range<usize>, Range<usize>)>,
     // Set when an error interrupted removals that were already yielded to the
     // caller: they may remain in the tree, so the transaction must not
     // commit. Every range operation re-raises instead of touching the tree.
@@ -2151,10 +2107,14 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
             unreachable!("settled end must be live");
         };
         let position = state.position.as_ref().expect("settled end is positioned");
-        Ok(Some(entry_ref(
-            &position.leaf,
-            position.entry_index(direction),
-        )))
+        let (_, key_range, value_range) = self.settled.as_ref().unwrap();
+        Ok(Some(EntryRef {
+            page: &position.leaf.page,
+            key_range: key_range.clone(),
+            value_range: value_range.clone(),
+            _key_type: PhantomData,
+            _value_type: PhantomData,
+        }))
     }
 
     fn advance(&mut self, direction: Direction) -> Result<bool> {
@@ -2180,19 +2140,22 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
         if !self.settle(direction)? {
             return Ok(None);
         }
-        self.settled = None;
-        let result = self.with_live_cursor(direction, |cursor| match direction {
-            Direction::Next => cursor.remove_next_deferred(),
-            Direction::Previous => cursor.remove_prev_deferred(),
+        let (_, key_range, value_range) = self.settled.take().unwrap();
+        let result = self.with_live_cursor(direction, |cursor| {
+            Ok(cursor.record_removal_deferred(direction, (key_range, value_range)))
         })?;
-        Ok(Some(result.expect("settled entry must be removable")))
+        Ok(Some(result))
     }
 
     // Ensures the cursor for `direction` is live and positioned at an entry,
     // and that the entry is within the range left between the two ends.
     fn settle(&mut self, direction: Direction) -> Result<bool> {
         self.check_not_poisoned()?;
-        if self.settled == Some(direction) {
+        if self
+            .settled
+            .as_ref()
+            .is_some_and(|(settled, _, _)| *settled == direction)
+        {
             return Ok(true);
         }
         self.activate(direction)?;
@@ -2203,10 +2166,10 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
         if !has_entry {
             return Ok(false);
         }
-        if !self.entry_in_range(direction) {
+        let Some((key, value)) = self.entry_in_range(direction) else {
             return Ok(false);
-        }
-        self.settled = Some(direction);
+        };
+        self.settled = Some((direction, key, value));
         Ok(true)
     }
 
@@ -2371,7 +2334,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
 
     // Whether the live end's current entry is still inside the range bounded
     // by the parked end.
-    fn entry_in_range(&self, direction: Direction) -> bool {
+    fn entry_in_range(&self, direction: Direction) -> Option<(Range<usize>, Range<usize>)> {
         let EndState::Live(state) = self.end_ref(direction) else {
             unreachable!("end must be live");
         };
@@ -2383,7 +2346,7 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
             EndState::Pending(batch) => &batch.bound,
             EndState::Live(_) => unreachable!("peer end must be parked while this end is live"),
         };
-        match direction {
+        let in_range = match direction {
             Direction::Next => match bound {
                 Included(bound) => K::compare(key, bound).is_le(),
                 Excluded(bound) => K::compare(key, bound).is_lt(),
@@ -2394,7 +2357,8 @@ impl<'a, K: Key + 'static, V: Value + 'static> RangeMut<'a, K, V> {
                 Excluded(bound) => K::compare(key, bound).is_gt(),
                 Unbounded => true,
             },
-        }
+        };
+        in_range.then_some((entry.key_range, entry.value_range))
     }
 
     fn end_ref(&self, direction: Direction) -> &EndState {

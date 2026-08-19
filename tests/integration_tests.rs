@@ -958,13 +958,13 @@ fn corrupted_persistent_savepoint_record() {
         id
     };
 
-    // Find the serialized savepoint record: version 3, the savepoint id, a plausible
+    // Find the serialized savepoint record: version 4, the savepoint id, a plausible
     // transaction id, and a non-null user root
     let mut data = fs::read(path).unwrap();
     let mut offsets = vec![];
     for i in 0..data.len() - 18 {
         let transaction_id = u64::from_le_bytes(data[i + 9..i + 17].try_into().unwrap());
-        if data[i] == 3
+        if data[i] == 4
             && u64::from_le_bytes(data[i + 1..i + 9].try_into().unwrap()) == savepoint_id
             && transaction_id > 0
             && transaction_id < 100

@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::tree_store::btree_base::BranchAccessor;
-use crate::tree_store::btree_base::{BRANCH, LEAF};
+use crate::tree_store::btree_base::{BRANCH, LEAF, SLOTTED_LEAF};
 use crate::tree_store::page_store::{Page, PageHint, PageImpl};
 use crate::tree_store::{PageNumber, PageResolver};
 use crate::types::{Key, Value};
@@ -85,7 +85,7 @@ impl Iterator for AllPageNumbersBtreeIter {
             Err(err) => return Some(Err(err)),
         };
         match page.memory()[0] {
-            LEAF => {}
+            LEAF | SLOTTED_LEAF => {}
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, self.fixed_key_size);
                 // Push in reverse so children are popped left-to-right.
