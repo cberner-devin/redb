@@ -43,6 +43,8 @@
   and a write transaction begins from the file as another process last committed it, as do the
   close and `Database::check_integrity()`, which waits for a write transaction in another process
   to end.
+* In `MultiWriterProcess`, existing handles recover automatically after another process exits
+  during compaction or repair. They can resume writing without reopening the database.
 
 ### redb-derive (unreleased)
 * Fix `#[derive(Value)]` and `#[derive(Key)]` failing to compile on structs whose lifetimes are
