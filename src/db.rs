@@ -896,8 +896,8 @@ impl Database {
         } else {
             Some(own_allocator_hash)
         };
-        // Every multi-writer commit records the allocator state, so one that did not is a commit
-        // the next writer refuses: not clean, so the repair below records it
+        // An interrupted compaction or repair may leave no allocator snapshot. Record one so
+        // the next writer can load it without rebuilding again.
         #[cfg(feature = "experimental-multiprocess")]
         if peer_committed
             && allocator_hash.is_none()
@@ -1501,21 +1501,35 @@ impl Database {
         root.map(|header| BtreeHeader::new(header.root, header.checksum, length))
     }
 
-    /// Loads the allocator state that the file's latest commit recorded. In multi-writer mode
-    /// every commit records one, including the repair an open performs, so a commit that
-    /// recorded none has broken the protocol and is refused as corruption.
+    /// Loads the latest allocator snapshot, or rebuilds it if compaction or repair stopped before
+    /// recording one. The caller holds the write slot and writer byte throughout.
     #[cfg(feature = "experimental-multiprocess")]
-    fn load_synced_allocator_state(mem: &Arc<TransactionalMemory>) -> Result {
-        let Some(tree) = Self::get_allocator_state_table(mem)? else {
-            return Err(StorageError::Corrupted(
-                "The latest commit recorded no allocator state, which every commit in multi-writer mode does".to_string(),
-            ));
-        };
-        mem.load_allocator_state(&tree)?;
-        #[cfg(debug_assertions)]
-        Self::mark_allocated_page_for_debug(mem)?;
-        // This allocator state came from the file, so it holds none of the pages leaked by a
-        // transaction that was dropped while a panic unwound. Commits may record again.
+    fn load_synced_allocator_state(
+        mem: &Arc<TransactionalMemory>,
+        _writer_lock: &WriterLock,
+    ) -> Result {
+        if let Some(tree) = Self::get_allocator_state_table(mem)? {
+            mem.load_allocator_state(&tree)?;
+            #[cfg(debug_assertions)]
+            Self::mark_allocated_page_for_debug(mem)?;
+        } else {
+            if !Self::verify_primary_checksums(mem.clone())? {
+                return Err(StorageError::Corrupted(
+                    "Cannot rebuild allocator state: committed trees are corrupted".to_string(),
+                ));
+            }
+            // Freed-page tables retain the pages that readers and persistent savepoints still
+            // reference. Rebuilding must keep those allocated as well as the current trees.
+            let roots = Self::rebuild_allocator_state(mem, &|_| {})
+                .map_err(DatabaseError::into_storage_error_or_corrupted)?;
+            if roots != [mem.get_data_root(), mem.get_system_root()] {
+                return Err(StorageError::Corrupted(
+                    "Committed table counts do not match the database trees".to_string(),
+                ));
+            }
+        }
+        // Loaded or rebuilt, this state holds none of the pages leaked by a transaction that
+        // was dropped while a panic unwound. The next commit can record it again.
         mem.clear_needs_repair();
 
         Ok(())
@@ -1759,7 +1773,7 @@ fn sync_to_latest_commit(
     // Armed before the load, because a load that stops part way leaves an allocator state that
     // describes neither the commit it came from nor the one it was going to
     let latch = AllocatorStateLatch::arm(mem.clone());
-    Database::load_synced_allocator_state(mem)?;
+    Database::load_synced_allocator_state(mem, writer_lock)?;
     // Loading the allocator state cleared the recovery flag that a live writer keeps set, and a
     // peer's close may have cleared it in the file as well. Set it again, so that the next
     // commit writes it back and a crash of this handle is still recovered from.
@@ -2740,26 +2754,173 @@ mod writer_byte_test {
         );
     }
 
-    /// Every commit in multi-writer mode records the allocator state. A sync that finds a
-    /// commit without one refuses it as corruption.
+    /// Rebuilding keeps live readers and the peer's persistent savepoints usable, even if the
+    /// first transaction using that allocator aborts.
     #[test]
-    fn a_sync_refuses_a_commit_without_an_allocator_state() {
-        use crate::{StorageError, TransactionError};
+    fn a_sync_rebuilds_a_missing_allocator_state() {
+        use crate::{ReadableDatabase, ReadableTable};
 
         let tmpfile = crate::create_tempfile();
-        let db = create(tmpfile.path(), ConcurrencyMode::MultiWriterProcess);
         let mut builder = Database::builder();
-        builder.set_concurrency_mode(ConcurrencyMode::MultiWriterProcess);
+        builder
+            .set_concurrency_mode(ConcurrencyMode::MultiWriterProcess)
+            .set_cache_size(0);
+        let db = builder.create(tmpfile.path()).unwrap();
+        commit_one(&db);
+        let old_read = db.begin_read().unwrap();
         let peer = builder.open(tmpfile.path()).unwrap();
         let mut write = peer.begin_write().unwrap();
+        let savepoint_id = write.persistent_savepoint().unwrap();
         write.skip_allocator_state_record();
-        write.open_table(TABLE).unwrap().insert(0, 0).unwrap();
+        write.open_table(TABLE).unwrap().insert(0, 1).unwrap();
         write.commit().unwrap();
 
-        assert!(matches!(
-            db.begin_write(),
-            Err(TransactionError::Storage(StorageError::Corrupted(_)))
-        ));
+        let mut write = db.begin_write().unwrap();
+        {
+            let table = write.open_table(TABLE).unwrap();
+            assert_eq!(table.get(0).unwrap().unwrap().value(), 1);
+        }
+        let savepoint = write.get_persistent_savepoint(savepoint_id).unwrap();
+        write.restore_savepoint(&savepoint).unwrap();
+        write.abort().unwrap();
+
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            assert_eq!(table.get(0).unwrap().unwrap().value(), 1);
+            table.insert(0, 2).unwrap();
+        }
+        write.commit().unwrap();
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+        let old_table = old_read.open_table(TABLE).unwrap();
+        assert_eq!(old_table.get(0).unwrap().unwrap().value(), 0);
+
+        let mut write = peer.begin_write().unwrap();
+        let savepoint = write.get_persistent_savepoint(savepoint_id).unwrap();
+        write.restore_savepoint(&savepoint).unwrap();
+        write.commit().unwrap();
+        let read = peer.begin_read().unwrap();
+        let table = read.open_table(TABLE).unwrap();
+        assert_eq!(table.get(0).unwrap().unwrap().value(), 0);
+    }
+
+    /// Exit after compaction's initial drain, before its final allocator snapshot. The surviving
+    /// writer must resume without reopening, including while a peer reads the published commit.
+    #[test]
+    fn a_writer_recovers_after_interrupted_compaction() {
+        use crate::tree_store::ShrinkPolicy;
+        use crate::{ReadableDatabase, ReadableTable};
+        use std::process::Command;
+
+        const CHILD_PATH: &str = "REDB_TEST_INTERRUPTED_COMPACTION_PATH";
+        let mut builder = Database::builder();
+        builder
+            .set_concurrency_mode(ConcurrencyMode::MultiWriterProcess)
+            .set_cache_size(0);
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let db = builder.open(path).unwrap();
+            let write = db.begin_write().unwrap();
+            write.open_table(TABLE).unwrap().insert(1, 1).unwrap();
+            write.commit().unwrap();
+            let writer = db.mem.lock_writer().unwrap();
+            let header = db.mem.lock_header_exclusive().unwrap();
+            db.drain_pending_free_pages(ShrinkPolicy::Maximum, Some(&writer), Some(&header))
+                .unwrap();
+            assert!(
+                Database::get_allocator_state_table(&db.mem)
+                    .unwrap()
+                    .is_none()
+            );
+            std::process::exit(42);
+        }
+
+        let tmpfile = crate::create_tempfile();
+        let db = builder.create(tmpfile.path()).unwrap();
+        commit_one(&db);
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::writer_byte_test::a_writer_recovers_after_interrupted_compaction",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, tmpfile.path())
+            .output()
+            .unwrap();
+        assert_eq!(child.status.code(), Some(42), "{child:?}");
+
+        let reader = builder.open_read_only(tmpfile.path()).unwrap();
+        let old_read = reader.begin_read().unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(TABLE).unwrap();
+            assert_eq!(table.get(1).unwrap().unwrap().value(), 1);
+            table.insert(2, 2).unwrap();
+        }
+        write.commit().unwrap();
+        assert!(
+            Database::get_allocator_state_table(&db.mem)
+                .unwrap()
+                .is_some()
+        );
+        let old_table = old_read.open_table(TABLE).unwrap();
+        assert_eq!(old_table.get(1).unwrap().unwrap().value(), 1);
+        assert!(old_table.get(2).unwrap().is_none());
+
+        builder
+            .set_repair_callback(|_| panic!("the recovered writer did not record its allocator"));
+        let peer = builder.open(tmpfile.path()).unwrap();
+        let read = peer.begin_read().unwrap();
+        let table = read.open_table(TABLE).unwrap();
+        for key in 0..3u64 {
+            assert_eq!(table.get(key).unwrap().unwrap().value(), key);
+        }
+    }
+
+    /// A missing snapshot permits rebuilding the allocator, but never trusting damaged roots.
+    #[test]
+    fn a_sync_refuses_corruption_without_an_allocator_snapshot() {
+        use crate::tree_store::ShrinkPolicy;
+        use crate::{StorageError, TransactionError};
+
+        for corrupt_checksum in [true, false] {
+            let tmpfile = crate::create_tempfile();
+            let db = create(tmpfile.path(), ConcurrencyMode::MultiWriterProcess);
+            let peer = create(tmpfile.path(), ConcurrencyMode::MultiWriterProcess);
+            commit_one(&peer);
+            let writer = peer.mem.lock_writer().unwrap();
+            let mut root = peer.mem.get_data_root().unwrap();
+            if corrupt_checksum {
+                root.checksum ^= 1;
+            } else {
+                root.length += 1;
+            }
+            peer.mem
+                .commit(
+                    Some(root),
+                    peer.mem.get_system_root(),
+                    peer.mem.get_last_committed_transaction_id().unwrap().next(),
+                    true,
+                    ShrinkPolicy::Never,
+                    None,
+                )
+                .unwrap();
+            peer.mem.invalidate_allocator_state();
+            drop(writer);
+
+            assert!(matches!(
+                db.begin_write(),
+                Err(TransactionError::Storage(StorageError::Corrupted(_)))
+            ));
+            assert!(!db.mem.allocator_state_loaded());
+            assert!(matches!(
+                db.begin_write(),
+                Err(TransactionError::Storage(StorageError::Corrupted(_)))
+            ));
+        }
     }
 
     /// A transaction dropped while a panic unwinds leaks its pages, which latches a repair.
@@ -2790,9 +2951,8 @@ mod writer_byte_test {
         );
     }
 
-    /// A commit made while a repair is latched records no allocator state, and a peer that
-    /// syncs to such a commit refuses it. So the first transaction after the panic releases the
-    /// latch itself, without waiting for a peer to commit.
+    /// The first transaction after a panic releases the repair latch, so its commit records the
+    /// allocator state without making a peer rebuild it.
     #[test]
     fn a_transaction_releases_the_repair_a_panic_latched_without_a_peers_commit() {
         let tmpfile = crate::create_tempfile();
@@ -3403,9 +3563,8 @@ mod active_transaction_test {
         write.commit().unwrap();
     }
 
-    /// A process that crashed between a repair's commit and the commit recording the allocator
-    /// state leaves a commit the next writer refuses. The check records it rather than passing a
-    /// file no peer can write to.
+    /// An interrupted repair may leave no allocator snapshot. The check records it so the next
+    /// writer can load it without rebuilding again.
     #[test]
     fn an_integrity_check_records_a_peers_unrecorded_commit() {
         let tmpfile = crate::create_tempfile();
